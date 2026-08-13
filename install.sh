@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
+#  - Pure server<->client tunnel — NO web dashboard / NO panel
 #  - Always fetches the LATEST release from GitHub automatically
 #  - Works on Ubuntu 18.04 / 20.04 / 22.04 / 24.04+ (any systemd distro)
 #  - Supports amd64 / arm64 / armv7
-#  - Generates a ready-to-use config with ALL proxy types
-#    (tcp, udp, http, https, stcp, xtcp, sudp, tcpmux)
+#  - Auto-fixes the common immutable /etc/resolv.conf / resolvconf dpkg bug
+#  - Interactively asks which ports to forward (like the original script)
+#  - Menu: install server / install client / status / full uninstall
 #  - Creates a self-healing systemd service (auto-restart)
 #
 #  USAGE (just run it, it will ask you what to do):
-#     curl -fsSL <raw-url-of-this-script> | sudo bash
-#  or:
 #     sudo bash frp_setup.sh
 # =====================================================================
 set -euo pipefail
@@ -25,6 +25,16 @@ fail()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # --------------------------- pre-flight -----------------------------
 [[ $EUID -eq 0 ]] || fail "Please run this script as root (sudo bash frp_setup.sh)"
 
+# Known VPS bug: some cloud images ship /etc/resolv.conf as immutable
+# (chattr +i), which makes ANY apt-get install/upgrade fail the moment
+# it touches the resolvconf package (postinst script aborts, dpkg breaks,
+# and every apt command after that fails too). Fix it up-front, before
+# touching apt at all, so it never blocks install/update/uninstall.
+if [[ -e /etc/resolv.conf ]] && command -v chattr >/dev/null 2>&1; then
+  chattr -i /etc/resolv.conf 2>/dev/null || true
+fi
+dpkg --configure -a >/dev/null 2>&1 || true
+
 echo -e "${CYAN}"
 echo "==================================================="
 echo "        FRP Reverse Tunnel - One-Click Setup"
@@ -34,15 +44,59 @@ echo -e "${NC}"
 echo "What do you want to do?"
 echo "  1) Install / Update Server  (frps - runs on the machine with a public IP)"
 echo "  2) Install / Update Client  (frpc - runs on the machine behind NAT/firewall)"
-echo "  3) Uninstall               (completely remove everything FRP-related from this machine)"
-read -rp "Choose [1-3]: " ROLE_CHOICE
+echo "  3) Status                  (show whether the tunnel is up and working)"
+echo "  4) Uninstall               (completely remove everything FRP-related from this machine)"
+read -rp "Choose [1-4]: " ROLE_CHOICE
 
 case "$ROLE_CHOICE" in
   1) ROLE="server"; BIN_NAME="frps" ;;
   2) ROLE="client"; BIN_NAME="frpc" ;;
-  3) ROLE="uninstall" ;;
+  3) ROLE="status" ;;
+  4) ROLE="uninstall" ;;
   *) fail "Invalid choice" ;;
 esac
+
+# ===================================================================
+#                              STATUS
+# ===================================================================
+if [[ "$ROLE" == "status" ]]; then
+  FOUND=0
+  for SVC in frps frpc; do
+    if [[ -f "/usr/local/bin/${SVC}" ]] || systemctl list-unit-files 2>/dev/null | grep -q "^${SVC}.service"; then
+      FOUND=1
+      echo ""
+      echo -e "${CYAN}=====================================================${NC}"
+      echo -e "${CYAN} ${SVC}${NC}"
+      echo -e "${CYAN}=====================================================${NC}"
+
+      if systemctl is-active --quiet "${SVC}" 2>/dev/null; then
+        ok "Service state : RUNNING"
+      else
+        warn "Service state : NOT RUNNING"
+      fi
+      systemctl --no-pager status "${SVC}" 2>/dev/null | sed -n '1,5p' || true
+
+      echo ""
+      echo "Config file: /etc/frp/${SVC}.toml"
+      [[ -f "/etc/frp/${SVC}.toml" ]] && ok "Config present" || warn "Config missing"
+
+      echo ""
+      echo "Listening ports for ${SVC}:"
+      ss -tulpn 2>/dev/null | grep "${SVC}" || echo "  (none found — process may not be running)"
+
+      echo ""
+      echo "Last 10 log lines:"
+      journalctl -u "${SVC}" -n 10 --no-pager 2>/dev/null || echo "  (no logs yet)"
+    fi
+  done
+
+  if [[ "$FOUND" -eq 0 ]]; then
+    warn "Neither frps nor frpc is installed on this machine."
+  fi
+  echo ""
+  echo "For a live view: journalctl -u frps -f   (or frpc)"
+  exit 0
+fi
 
 # ===================================================================
 #                          UNINSTALL EVERYTHING
@@ -85,7 +139,7 @@ if [[ "$ROLE" == "uninstall" ]]; then
   if command -v ufw >/dev/null 2>&1; then
     info "Removing firewall rules added by this script..."
     for RULE in \
-      "7000/tcp" "7000/udp" "7500/tcp" "8080/tcp" "8443/tcp" "7005/tcp" \
+      "7000/tcp" "7000/udp" "8080/tcp" "8443/tcp" "7005/tcp" \
       "2000:65000/tcp" "2000:65000/udp"
     do
       ufw delete allow "$RULE" >/dev/null 2>&1 || true
@@ -102,10 +156,25 @@ if [[ "$ROLE" == "uninstall" ]]; then
 fi
 
 # ------------------------- install deps -----------------------------
-info "Installing dependencies (curl, tar, jq)..."
+info "Installing required dependencies (curl, tar, jq)..."
 apt-get update -y -qq
-apt-get install -y -qq curl tar jq ufw >/dev/null 2>&1 || apt-get install -y -qq curl tar jq
-ok "Dependencies ready"
+if ! apt-get install -y -qq curl tar jq; then
+  warn "First attempt failed, retrying after a dpkg repair..."
+  chattr -i /etc/resolv.conf 2>/dev/null || true
+  dpkg --configure -a >/dev/null 2>&1 || true
+  apt-get install -f -y -qq >/dev/null 2>&1 || true
+  apt-get install -y -qq curl tar jq || fail "Could not install required packages (curl/tar/jq). Fix apt manually and re-run."
+fi
+ok "Required dependencies ready"
+
+# ---- optional firewall rules via ufw, only if it's already installed.
+#      We never install ufw ourselves anymore — this script's only job
+#      is the tunnel itself (frps <-> frpc), not managing your firewall
+#      or pulling in extra packages like resolvconf. ----
+UFW_OK=0
+if command -v ufw >/dev/null 2>&1; then
+  UFW_OK=1
+fi
 
 # ------------------------- detect arch -------------------------------
 ARCH_RAW="$(uname -m)"
@@ -156,24 +225,18 @@ if [[ "$ROLE" == "server" ]]; then
     BIND_PORT="${BIND_PORT:-7000}"
     AUTH_TOKEN="123"
     warn "Auth token is set to the default value: 123 (change it later in ${CONFIG_PATH} for real security)"
-    read -rp "Dashboard admin password [auto-generate]: " DASH_PASS
-    [[ -z "$DASH_PASS" ]] && DASH_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
 
     cat > "$CONFIG_PATH" <<EOF
 # ===================== frps.toml (server) =====================
+# Pure tunnel: no web dashboard / no panel — just server<->client traffic passthrough.
 bindAddr = "0.0.0.0"
 bindPort = ${BIND_PORT}
 kcpBindPort = ${BIND_PORT}          # enables KCP (UDP) on same port for unstable networks
 quicBindPort = ${BIND_PORT}         # enables QUIC on same port (faster / more resilient)
 
-vhostHTTPPort = 8080                # for proxies of type = http
-vhostHTTPSPort = 8443               # for proxies of type = https
-tcpmuxHTTPConnectPort = 7005        # for proxies of type = tcpmux
-
-webServer.addr = "0.0.0.0"
-webServer.port = 7500
-webServer.user = "admin"
-webServer.password = "${DASH_PASS}"
+vhostHTTPPort = 8080                # only used if you enable a proxy of type = http
+vhostHTTPSPort = 8443               # only used if you enable a proxy of type = https
+tcpmuxHTTPConnectPort = 7005        # only used if you enable a proxy of type = tcpmux
 
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
@@ -198,23 +261,23 @@ detailedErrorsToClient = true
 EOF
     ok "Config generated at $CONFIG_PATH"
     echo -e "${YELLOW}--------------------------------------------------${NC}"
-    echo -e "  Auth token:        ${GREEN}${AUTH_TOKEN}${NC}  (use this on the client!)"
-    echo -e "  Dashboard user:    admin"
-    echo -e "  Dashboard pass:    ${GREEN}${DASH_PASS}${NC}"
-    echo -e "  Dashboard URL:     http://YOUR_SERVER_IP:7500"
+    echo -e "  Auth token:  ${GREEN}${AUTH_TOKEN}${NC}  (use this on the client!)"
     echo -e "${YELLOW}--------------------------------------------------${NC}"
   fi
 
-  info "Opening firewall ports (ufw)..."
-  ufw allow "${BIND_PORT:-7000}"/tcp  >/dev/null 2>&1 || true
-  ufw allow "${BIND_PORT:-7000}"/udp  >/dev/null 2>&1 || true
-  ufw allow 7500/tcp  >/dev/null 2>&1 || true
-  ufw allow 8080/tcp  >/dev/null 2>&1 || true
-  ufw allow 8443/tcp  >/dev/null 2>&1 || true
-  ufw allow 7005/tcp  >/dev/null 2>&1 || true
-  ufw allow 2000:65000/tcp >/dev/null 2>&1 || true
-  ufw allow 2000:65000/udp >/dev/null 2>&1 || true
-  ok "Firewall rules applied (if ufw is active) — full 2000-65000 range opened for forwarded ports"
+  if [[ "$UFW_OK" -eq 1 ]]; then
+    info "Opening firewall ports (ufw)..."
+    ufw allow "${BIND_PORT:-7000}"/tcp  >/dev/null 2>&1 || true
+    ufw allow "${BIND_PORT:-7000}"/udp  >/dev/null 2>&1 || true
+    ufw allow 8080/tcp  >/dev/null 2>&1 || true
+    ufw allow 8443/tcp  >/dev/null 2>&1 || true
+    ufw allow 7005/tcp  >/dev/null 2>&1 || true
+    ufw allow 2000:65000/tcp >/dev/null 2>&1 || true
+    ufw allow 2000:65000/udp >/dev/null 2>&1 || true
+    ok "Firewall rules applied — full 2000-65000 range opened for forwarded ports"
+  else
+    warn "ufw is not installed on this machine — skipping firewall rules. Open the needed ports manually (iptables / cloud provider security group / etc)."
+  fi
 fi
 
 # ===================================================================
@@ -410,8 +473,6 @@ echo -e "${GREEN}=====================================================${NC}"
 echo "  Config file : ${CONFIG_PATH}"
 echo "  Live logs   : journalctl -u ${BIN_NAME} -f"
 echo "  Restart     : systemctl restart ${BIN_NAME}"
-if [[ "$ROLE" == "server" ]]; then
-  echo "  Dashboard   : http://YOUR_SERVER_IP:7500"
-fi
+echo "  Status      : sudo bash frp_setup.sh   (choose option 3)"
 echo ""
 echo "Run this same script again anytime to auto-update to the latest FRP release."
