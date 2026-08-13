@@ -31,16 +31,75 @@ echo "        FRP Reverse Tunnel - One-Click Setup"
 echo "==================================================="
 echo -e "${NC}"
 
-echo "What do you want to install/update?"
-echo "  1) Server  (frps - runs on the machine with a public IP)"
-echo "  2) Client  (frpc - runs on the machine behind NAT/firewall)"
-read -rp "Choose [1-2]: " ROLE_CHOICE
+echo "What do you want to do?"
+echo "  1) Install / Update Server  (frps - runs on the machine with a public IP)"
+echo "  2) Install / Update Client  (frpc - runs on the machine behind NAT/firewall)"
+echo "  3) Uninstall               (completely remove everything FRP-related from this machine)"
+read -rp "Choose [1-3]: " ROLE_CHOICE
 
 case "$ROLE_CHOICE" in
   1) ROLE="server"; BIN_NAME="frps" ;;
   2) ROLE="client"; BIN_NAME="frpc" ;;
+  3) ROLE="uninstall" ;;
   *) fail "Invalid choice" ;;
 esac
+
+# ===================================================================
+#                          UNINSTALL EVERYTHING
+# ===================================================================
+if [[ "$ROLE" == "uninstall" ]]; then
+  echo ""
+  warn "This will completely remove frps AND frpc from this machine:"
+  echo "    - stop & disable both systemd services"
+  echo "    - delete service unit files"
+  echo "    - delete binaries (/usr/local/bin/frps, /usr/local/bin/frpc)"
+  echo "    - delete configs (/etc/frp)"
+  echo "    - delete logs (/var/log/frp)"
+  echo "    - remove the firewall rules this script added"
+  read -rp "Are you sure? Type 'yes' to confirm: " CONFIRM
+  [[ "$CONFIRM" == "yes" ]] || fail "Uninstall cancelled."
+
+  for SVC in frps frpc; do
+    if systemctl list-unit-files | grep -q "^${SVC}.service"; then
+      info "Stopping and disabling ${SVC}..."
+      systemctl stop "${SVC}" >/dev/null 2>&1 || true
+      systemctl disable "${SVC}" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/${SVC}.service"
+      ok "${SVC} service removed"
+    else
+      warn "${SVC} service was not installed, skipping"
+    fi
+  done
+  systemctl daemon-reload
+  systemctl reset-failed >/dev/null 2>&1 || true
+
+  info "Removing binaries..."
+  rm -f /usr/local/bin/frps /usr/local/bin/frpc
+  ok "Binaries removed"
+
+  info "Removing config and log directories..."
+  rm -rf /etc/frp
+  rm -rf /var/log/frp
+  ok "Config and logs removed"
+
+  if command -v ufw >/dev/null 2>&1; then
+    info "Removing firewall rules added by this script..."
+    for RULE in \
+      "7000/tcp" "7000/udp" "7500/tcp" "8080/tcp" "8443/tcp" "7005/tcp" \
+      "2000:65000/tcp" "2000:65000/udp"
+    do
+      ufw delete allow "$RULE" >/dev/null 2>&1 || true
+    done
+    # also remove a possible custom bind port rule (best-effort, safe no-op if not found)
+    ok "Firewall rules cleaned up (default set — remove any custom port manually if you changed it)"
+  fi
+
+  echo ""
+  echo -e "${GREEN}=====================================================${NC}"
+  echo -e "${GREEN} FRP has been completely removed from this machine.${NC}"
+  echo -e "${GREEN}=====================================================${NC}"
+  exit 0
+fi
 
 # ------------------------- install deps -----------------------------
 info "Installing dependencies (curl, tar, jq)..."
