@@ -224,8 +224,8 @@ transport.tcpKeepalive = 30
 transport.maxPoolCount = 200
 transport.heartbeatTimeout = 90
 
-# ---- TLS ----
-transport.tls.force = ${TLS_ENABLE}
+# ---- TLS (v0.57.0 uses tls_enable, not transport.tls.force) ----
+tls_enable = ${TLS_ENABLE}
 
 allowPorts = [ { start = 1, end = 65535 } ]
 maxPortsPerClient = 0
@@ -288,6 +288,7 @@ transport.useCompression = false
 "
     done
 
+    # Write config and verify
     cat > "$CONFIG_PATH" <<EOF
 # ===================== frpc.toml (client) =====================
 serverAddr = "${SERVER_ADDR}"
@@ -305,8 +306,8 @@ transport.heartbeatTimeout = 90
 transport.dialServerTimeout = 20
 transport.dialServerKeepAlive = 30
 
-# ---- TLS ----
-transport.tls.force = ${TLS_ENABLE}
+# ---- TLS (v0.57.0 uses tls_enable, not transport.tls.force) ----
+tls_enable = ${TLS_ENABLE}
 
 log.to = "console"
 log.level = "info"
@@ -314,7 +315,12 @@ log.level = "info"
 # ============= Auto-generated proxies (TCP only) =============
 ${PROXIES_BLOCK}
 EOF
-    ok "Client config created."
+
+    # Verify file was created
+    if [[ ! -f "$CONFIG_PATH" ]]; then
+      fail "Failed to write config file at $CONFIG_PATH. Check disk space or permissions."
+    fi
+    ok "Client config created at $CONFIG_PATH."
 
     # Test connectivity
     info "Testing reachability to ${SERVER_ADDR}:${SERVER_PORT}..."
