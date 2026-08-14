@@ -2,7 +2,7 @@
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
 #  - Pure server<->client tunnel — NO web dashboard / NO panel
-#  - Always fetches the LATEST release from GitHub automatically
+#  - Pins frp core binaries to v0.68.0 for reproducible/stable installs
 #  - Works on Ubuntu 18.04 / 20.04 / 22.04 / 24.04+ (any systemd distro)
 #  - Supports amd64 / arm64 / armv7
 #  - Auto-fixes immutable /etc/resolv.conf (resolvconf dpkg bug)
@@ -283,11 +283,10 @@ ok "Detected architecture: $FRP_ARCH"
 
 # --------------------- fetch latest release ---------------------------
 fix_dns_if_needed   # safety net: re-check right before we need real network access
-info "Fetching the latest FRP release from GitHub..."
-LATEST_TAG="$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)"
-[[ -n "$LATEST_TAG" && "$LATEST_TAG" != "null" ]] || fail "Could not fetch latest release. DNS/network to github.com is still not working on this machine — fix connectivity and re-run."
-VERSION="${LATEST_TAG#v}"
-ok "Latest version: $LATEST_TAG"
+FRP_VERSION="0.68.0"
+LATEST_TAG="v${FRP_VERSION}"
+VERSION="${FRP_VERSION}"
+ok "Pinned FRP version: ${LATEST_TAG}"
 
 FILENAME="frp_${VERSION}_linux_${FRP_ARCH}.tar.gz"
 DOWNLOAD_URL="https://github.com/fatedier/frp/releases/download/${LATEST_TAG}/${FILENAME}"
@@ -361,7 +360,6 @@ auth.token = "${AUTH_TOKEN}"
 # ---- stability / performance tuning (fixes common disconnect bugs) ----
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
-# Explicit mux keepalive on the server; client uses the same interval.
 # tcpKeepalive is the OS-level TCP keepalive probe interval in seconds.
 # The old default (7200s = 2 hours) is the Linux kernel default and is
 # useless for catching a tunnel that drops within seconds — the OS would
@@ -460,13 +458,6 @@ if [[ "$ROLE" == "client" ]]; then
       if [[ "$ENABLE_COMP" =~ ^[Yy]$ ]]; then USE_COMPRESSION="true"; fi
     fi
 
-    # IMPORTANT: do not enable healthCheck by default. A TCP health check tests
-    # the LOCAL backend at 127.0.0.1:<port>, not the frps<->frpc tunnel. If the
-    # local service is not listening (connection refused), FRP marks that proxy
-    # unhealthy. This is exactly what the supplied logs show for 2053/7070/23902.
-    # Health checks can be added manually later when the backend is guaranteed to be
-    # continuously available or when using a load-balancing/HA design.
-
     # build the [[proxies]] blocks dynamically from user input
     PROXIES_BLOCK=""
     IFS=',' read -ra PORT_ARR <<< "$PORTS_INPUT"
@@ -488,6 +479,10 @@ localPort = ${PORT}
 remotePort = ${PORT}
 transport.useEncryption = ${USE_ENCRYPTION}
 transport.useCompression = ${USE_COMPRESSION}
+# Health checks are intentionally disabled by default. A TCP health check
+# probes 127.0.0.1:<localPort>; if the backend service is stopped or starts
+# late, FRP marks the proxy unhealthy even though frpc<->frps is healthy.
+# Add healthCheck.* manually only for backends that are guaranteed to listen.
 "
       fi
 
@@ -533,7 +528,7 @@ transport.heartbeatTimeout = 90
 # catch a dropped tunnel for hours. 30s lets a dead connection get noticed
 # and re-dialed quickly instead of sitting silently broken.
 transport.dialServerTimeout = 10
-transport.dialServerKeepAlive = 30
+transport.dialServerKeepalive = 30
 
 log.to = "console"
 log.level = "info"
@@ -679,4 +674,4 @@ echo "  Live logs   : journalctl -u ${BIN_NAME} -f"
 echo "  Restart     : systemctl restart ${BIN_NAME}"
 echo "  Status      : sudo bash frp_setup.sh   (choose option 3)"
 echo ""
-echo "Run this same script again anytime to auto-update to the latest FRP release."
+echo "FRP core is pinned to v0.68.0; re-run this script to reinstall/repair that exact version."
