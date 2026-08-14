@@ -1,38 +1,36 @@
 #!/usr/bin/env bash
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
-#  - Version: v0.61.0 (latest stable as of 2026)
-#  - OPTIMIZED FOR STABILITY: fixed heartbeat, pooling, and timeouts
-#  - Supports TLS & KCP (optional)
-#  - TCP tunnel default; KCP remains optional for problematic TCP paths
-#  - Auto-fixes DNS, port conflicts, and applies sysctl tuning
+#  - Version: v0.61.0 (latest stable)
+#  - TLS COMPLETELY REMOVED for maximum throughput & lowest CPU overhead
+#  - TCP & KCP optimized for bandwidth and speed
+#  - Auto-fixes DNS, port conflicts, and applies aggressive sysctl tuning
 #  - Menu: server, client, status, uninstall
 #
-#  FIXES applied vs original:
-#   1) Bumped to v0.61.0 for latest stability and TLS improvements.
-#   2) Existing configs are now VALIDATED before being kept. If an old
-#      config is invalid (e.g., leftover INI format, wrong keys), it
-#      is automatically backed up and replaced with a fresh valid one.
-#   3) TLS uses correct toml keys: transport.tls.force (server) /
-#      transport.tls.enable (client).
-#   4) When KCP is selected, the KCP bind port is opened on UDP in ufw.
-#   5) AUTH TOKEN IS FIXED/SHARED — no mismatch between server/client.
-#   6) Client reachability test matches the real protocol.
-#   7) Status pipelines guarded with || true so inactive services do
-#      not kill the script under set -e + pipefail.
-#   8) Connection summary printed at the end of server setup so the
-#      client can be configured with exactly matching parameters.
-#   9) Real tunnel verdict based on log markers, not just process state.
-#  10) STABILITY FIXES FOR DISCONNECT/RECONNECT ISSUES:
-#      - Client heartbeatInterval = 30 (was -1, disabled)
-#      - Client heartbeatTimeout = 90
-#      - Client poolCount = 5 (was 0)
-#      - Client dialServerTimeout = 30 (was 15)
-#      - Client dialServerKeepalive = 30 (was 15)
-#      - Server maxPoolCount = 50 (was 5)
-#      - Server/client tcpMuxKeepaliveInterval = 10 (was 15)
-#      - Server tcpKeepalive = 10 (was 15)
-#      - Sysctl tuning enhanced with tcp_tw_reuse and port range.
+#  OPTIMIZATIONS vs previous versions:
+#   1) TLS fully stripped — no prompts, no keys, no handshake overhead.
+#   2) TCP congestion & buffer tuning enhanced:
+#      - tcp_slow_start_after_idle = 0  (prevents speed drop after idle)
+#      - tcp_no_metrics_save = 1        (prevents stale cwnd cache)
+#      - tcp_moderate_rcvbuf = 1        (auto receive-buffer scaling)
+#      - tcp_fastopen = 3               (TFO client + server)
+#      - netdev_max_backlog = 65536
+#      - tcp_max_syn_backlog = 65536
+#      - tcp_fin_timeout = 10
+#      - tcp_max_tw_buckets = 2000000
+#   3) FRP transport tuned for throughput:
+#      - poolCount = 10  (was 5)
+#      - maxPoolCount = 100 (was 50)
+#      - tcpMuxKeepaliveInterval = 5s (was 10s)
+#      - tcpKeepalive = 5s (was 10s)
+#      - heartbeatInterval = 15s (was 30s)
+#      - heartbeatTimeout = 45s
+#      - dialServerTimeout = 30s
+#      - dialServerKeepalive = 30s
+#      - useCompression = true on every proxy (reduces bandwidth)
+#      - useEncryption = false (speed over obfuscation)
+#   4) Systemd: RestartSec=1, LimitNOFILE=2097152
+#   5) Existing configs are validated; invalid ones are backed up.
 #
 #  USAGE: sudo bash frp_setup.sh
 # =====================================================================
@@ -98,20 +96,39 @@ pick_free_port() {
   echo "${CHOSEN}"
 }
 
-# ---- Apply sysctl tuning for network stability --------------------
+# ---- Apply sysctl tuning for maximum throughput ------------------
 apply_sysctl() {
-  info "Applying sysctl network tuning..."
+  info "Applying sysctl network tuning (throughput optimized)..."
   cat > /etc/sysctl.d/99-frp-tune.conf <<'EOF'
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+# Core buffers
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
 net.core.somaxconn = 65535
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.netdev_max_backlog = 65536
+
+# TCP memory & congestion
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_keepalive_time = 1800
+net.ipv4.tcp_moderate_rcvbuf = 1
+
+# Keepalive
+net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
+
+# Prevent speed collapse after idle / stale cwnd cache
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+
+# Fast open & backlog
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_max_tw_buckets = 2000000
+
+# Port range & reuse
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.ip_local_port_range = 1024 65535
 EOF
@@ -128,14 +145,11 @@ diagnose_logs() {
   if echo "$LOG" | grep -qiE "authorization failed|auth.*fail|token.*(invalid|mismatch)"; then
     warn "Hint: authentication failed -> auth.token in frps.toml and frpc.toml do not match."
   fi
-  if echo "$LOG" | grep -qiE "tls: |certificate|handshake"; then
-    warn "Hint: TLS handshake issue -> TLS must be enabled/disabled IDENTICALLY on BOTH server and client."
-  fi
   if echo "$LOG" | grep -qiE "i/o timeout|dial tcp.*timeout|no route to host"; then
     warn "Hint: network/timeout -> server unreachable on this port. Check firewall/security-group."
   fi
   if echo "$LOG" | grep -qiE "address already in use|bind: address already in use"; then
-    warn "Hint: port already in use -> another process is holding the bind port. Pick a different port."
+    warn "Hint: port already in use -> another process is holding the bind port."
   fi
   if echo "$LOG" | grep -qiE "connection refused"; then
     warn "Hint: connection refused -> frps is not listening on that IP/port yet, or a firewall is dropping it."
@@ -176,19 +190,17 @@ validate_or_backup_config() {
     ok "Existing config is valid."
     return 0
   else
-    warn "Existing config is INVALID (see /tmp/${BIN}-verify-old.out). Backing up..."
+    warn "Existing config is INVALID. Backing up..."
     mv "$CFG" "${CFG}.bak.$(date +%s)"
     return 1
   fi
 }
 
 # ---- Inject or replace a key in a TOML file -----------------------
-# Usage: toml_set <file> <key> <value>
 toml_set() {
   local FILE="$1"
   local KEY="$2"
   local VAL="$3"
-  # Escape dots for regex
   local KEY_ESCAPED
   KEY_ESCAPED="$(echo "$KEY" | sed 's/\./\\./g')"
   if grep -qE "^${KEY_ESCAPED} *=" "$FILE" 2>/dev/null; then
@@ -198,11 +210,18 @@ toml_set() {
   fi
 }
 
+# ---- Strip all TLS keys from a config -----------------------------
+strip_tls_keys() {
+  local FILE="$1"
+  sed -i '/^tls_enable/d' "$FILE"
+  sed -i '/^transport\.tls\./d' "$FILE"
+}
+
 # ===================== Main Menu ===================================
 echo -e "${CYAN}"
 echo "==================================================="
-echo "        FRP Reverse Tunnel - One-Click Setup"
-echo "              (Stable v0.61.0 - Fixed)"
+echo "   FRP Reverse Tunnel - One-Click Setup"
+echo "      (v0.61.0 | NO-TLS | Speed Optimized)"
 echo "==================================================="
 echo -e "${NC}"
 
@@ -258,6 +277,7 @@ if [[ "$ROLE" == "uninstall" ]]; then
   ufw delete allow 7001/udp 2>/dev/null || true
   ufw delete allow 8080/tcp 2>/dev/null || true
   ufw delete allow 8443/tcp 2>/dev/null || true
+  ufw delete allow 7005/tcp 2>/dev/null || true
   echo -e "${GREEN}Removed.${NC}"
   exit 0
 fi
@@ -300,50 +320,36 @@ ok "Binary installed."
 
 CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 
-# -------------------- Ask for TLS and protocol ---------------------
-read -rp "Enable TLS (recommended) [Y/n]: " TLS_ANSWER
-if [[ "$TLS_ANSWER" =~ ^[Nn]$ ]]; then
-  TLS_ENABLE="false"
-else
-  TLS_ENABLE="true"
-fi
-
+# -------------------- Protocol choice only (NO TLS) ----------------
 read -rp "Use KCP (UDP-based; only if TCP is unstable)? [y/N]: " KCP_ANSWER
 if [[ "$KCP_ANSWER" =~ ^[Yy]$ ]]; then
   PROTOCOL="kcp"
+  warn "IMPORTANT: Protocol (kcp) must be set IDENTICALLY on the server and the client."
 else
   PROTOCOL="tcp"
+  ok "Using TCP (recommended for maximum throughput)."
 fi
-warn "IMPORTANT: TLS (${TLS_ENABLE}) and protocol (${PROTOCOL}) must be set IDENTICALLY on the server and the client, or the handshake will never complete. Write these down."
 
 # ------------------------------------------------------------------
 if [[ "$ROLE" == "server" ]]; then
   AUTH_TOKEN="$FIXED_AUTH_TOKEN"
 
-  # Validate existing config; if invalid, back it up so we create a fresh one
   validate_or_backup_config "frps" "$CONFIG_PATH"
-  CONFIG_WAS_INVALID=$?
 
   if [[ -f "$CONFIG_PATH" ]]; then
-    # Config is valid; sync stability params and token
-    ok "Updating stability parameters in existing config..."
+    ok "Updating speed/stability parameters in existing config..."
+    strip_tls_keys "$CONFIG_PATH"
     toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
-    toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "10"
-    toml_set "$CONFIG_PATH" "transport.tcpKeepalive" "10"
-    toml_set "$CONFIG_PATH" "transport.maxPoolCount" "50"
-    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "90"
-    # Migrate old tls_enable key if present
-    if grep -qE '^tls_enable' "$CONFIG_PATH"; then
-      warn "Old config uses invalid key 'tls_enable' — migrating to 'transport.tls.force'."
-      sed -i -E 's/^tls_enable = (.*)$/transport.tls.force = \1/' "$CONFIG_PATH"
-    fi
-    toml_set "$CONFIG_PATH" "transport.tls.force" "${TLS_ENABLE}"
+    toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
+    toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "5"
+    toml_set "$CONFIG_PATH" "transport.tcpKeepalive" "5"
+    toml_set "$CONFIG_PATH" "transport.maxPoolCount" "100"
+    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "45"
 
     BIND_PORT=$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)
     BIND_PORT="${BIND_PORT:-7001}"
     if grep -q '^kcpBindPort' "$CONFIG_PATH"; then IS_KCP=1; else IS_KCP=0; fi
   else
-    # Create fresh server config
     BIND_PORT=$(pick_free_port "7001" "Bind port for tunnel control")
 
     cat > "$CONFIG_PATH" <<EOF
@@ -357,17 +363,14 @@ tcpmuxHTTPConnectPort = 7005
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport settings ----
+# ---- Transport (speed optimized) ----
 transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 10
-transport.tcpKeepalive = 10
-transport.maxPoolCount = 50
+transport.tcpMuxKeepaliveInterval = 5
+transport.tcpKeepalive = 5
+transport.maxPoolCount = 100
 
 # ---- Heartbeat ----
-transport.heartbeatTimeout = 90
-
-# ---- TLS (v0.61.0 uses transport.tls.force) ----
-transport.tls.force = ${TLS_ENABLE}
+transport.heartbeatTimeout = 45
 
 allowPorts = [ { start = 1, end = 65535 } ]
 maxPortsPerClient = 0
@@ -406,22 +409,18 @@ if [[ "$ROLE" == "client" ]]; then
   AUTH_TOKEN="$FIXED_AUTH_TOKEN"
 
   validate_or_backup_config "frpc" "$CONFIG_PATH"
-  CONFIG_WAS_INVALID=$?
 
   if [[ -f "$CONFIG_PATH" ]]; then
-    ok "Updating stability parameters in existing config..."
+    ok "Updating speed/stability parameters in existing config..."
+    strip_tls_keys "$CONFIG_PATH"
     toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
-    toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "10"
-    toml_set "$CONFIG_PATH" "transport.poolCount" "5"
-    toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "30"
-    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "90"
+    toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
+    toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "5"
+    toml_set "$CONFIG_PATH" "transport.poolCount" "10"
+    toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "15"
+    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "45"
     toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "30"
     toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "30"
-    if grep -qE '^tls_enable' "$CONFIG_PATH"; then
-      warn "Old config uses invalid key 'tls_enable' — migrating to 'transport.tls.enable'."
-      sed -i -E 's/^tls_enable = (.*)$/transport.tls.enable = \1/' "$CONFIG_PATH"
-    fi
-    toml_set "$CONFIG_PATH" "transport.tls.enable" "${TLS_ENABLE}"
     toml_set "$CONFIG_PATH" "transport.protocol" "\"${PROTOCOL}\""
 
     SERVER_ADDR=$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || echo "")
@@ -447,8 +446,8 @@ type = \"tcp\"
 localIP = \"127.0.0.1\"
 localPort = ${PORT}
 remotePort = ${PORT}
+transport.useCompression = true
 transport.useEncryption = false
-transport.useCompression = false
 "
     done
 
@@ -461,27 +460,24 @@ loginFailExit = false
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport ----
+# ---- Transport (speed optimized) ----
 transport.protocol = "${PROTOCOL}"
 transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 10
-transport.poolCount = 5
+transport.tcpMuxKeepaliveInterval = 5
+transport.poolCount = 10
 
-# ---- Heartbeat (CRITICAL: keeps NAT/firewall from dropping idle tunnel) ----
-transport.heartbeatInterval = 30
-transport.heartbeatTimeout = 90
+# ---- Heartbeat (keeps NAT/firewall from dropping idle tunnel) ----
+transport.heartbeatInterval = 15
+transport.heartbeatTimeout = 45
 
 # ---- Connection timeouts ----
 transport.dialServerTimeout = 30
 transport.dialServerKeepalive = 30
 
-# ---- TLS (v0.61.0 uses transport.tls.enable) ----
-transport.tls.enable = ${TLS_ENABLE}
-
 log.to = "console"
 log.level = "info"
 
-# ============= Auto-generated proxies (TCP only) =============
+# ============= Auto-generated proxies (compression ON) =============
 ${PROXIES_BLOCK}
 EOF
 
@@ -496,10 +492,10 @@ EOF
         if nc -uzw3 "${SERVER_ADDR}" "${SERVER_PORT}" 2>/dev/null; then
           ok "UDP port appears reachable (best-effort; UDP checks are not fully reliable)."
         else
-          warn "Could not confirm UDP reachability — this is normal for UDP and not necessarily an error."
+          warn "Could not confirm UDP reachability — this is normal for UDP."
         fi
       else
-        warn "nc not found — skipping UDP reachability test. Install netcat to enable it."
+        warn "nc not found — skipping UDP reachability test."
       fi
     else
       if timeout 5 bash -c "cat < /dev/null > /dev/tcp/${SERVER_ADDR}/${SERVER_PORT}" 2>/dev/null; then
@@ -524,9 +520,9 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 Restart=always
-RestartSec=3
+RestartSec=1
 ExecStart=/usr/local/bin/${BIN_NAME} -c ${CONFIG_PATH}
-LimitNOFILE=1048576
+LimitNOFILE=2097152
 NoNewPrivileges=true
 
 [Install]
@@ -561,7 +557,7 @@ apply_sysctl
 echo ""
 echo -e "${GREEN}=====================================================${NC}"
 echo -e "${GREEN} ${BIN_NAME} installed (${FRP_TAG})${NC}"
-echo -e "${GREEN} TLS: ${TLS_ENABLE}   Protocol: ${PROTOCOL}${NC}"
+echo -e "${GREEN} Protocol: ${PROTOCOL}   TLS: DISABLED${NC}"
 echo -e "${GREEN}=====================================================${NC}"
 echo "Config : ${CONFIG_PATH}"
 echo "Logs   : journalctl -u ${BIN_NAME} -f"
@@ -576,6 +572,6 @@ if [[ "$ROLE" == "server" ]]; then
   echo -e "  Server port    : ${GREEN}${BIND_PORT}${NC}"
   echo -e "  Auth token     : ${GREEN}${AUTH_TOKEN}${NC}"
   echo -e "  Protocol       : ${GREEN}${PROTOCOL}${NC}"
-  echo -e "  TLS            : ${GREEN}${TLS_ENABLE}${NC}"
+  echo -e "  TLS            : ${GREEN}DISABLED${NC}"
   echo -e "${CYAN}=======================================================${NC}"
 fi
