@@ -234,6 +234,12 @@ if [[ "$ROLE" == "uninstall" ]]; then
     do
       ufw delete allow "$RULE" >/dev/null 2>&1 || true
     done
+    # NOTE: the tunnel's bind port now defaults to 443, but we deliberately
+    # do NOT auto-delete a 443/tcp rule here — on a server that also runs
+    # a real HTTPS site, that rule may not belong to this script and
+    # removing it would take the site offline. Remove it manually if you
+    # confirmed it was only used for the tunnel: ufw delete allow 443/tcp
+    warn "If the tunnel was using port 443, remove that rule manually if nothing else on this server needs it: ufw delete allow 443/tcp"
     ok "Default firewall rules cleaned up (remove any custom port manually if you changed it)"
   fi
 
@@ -310,12 +316,23 @@ CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 if [[ "$ROLE" == "server" ]]; then
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config found at $CONFIG_PATH — keeping it untouched."
-    BIND_PORT="$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo 7001)"
+    BIND_PORT="$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo 443)"
   else
     echo ""
-    echo "Choosing the tunnel port. If your VPS provider already runs something"
-    echo "on the default port (7001), this will detect it and let you pick another."
-    BIND_PORT="$(pick_free_port 7001 "Bind port for tunnel control")"
+    read -rp "Which protocol will the client(s) mainly use? [tcp/wss] (default wss): " SERVER_PROTO_HINT
+    SERVER_PROTO_HINT="${SERVER_PROTO_HINT:-wss}"
+    if [[ "$SERVER_PROTO_HINT" == "wss" || "$SERVER_PROTO_HINT" == "websocket" ]]; then
+      DEFAULT_BIND_PORT=443
+      echo "Choosing the tunnel port. Default is 443 (blends in with normal HTTPS"
+      echo "traffic, which helps when using wss). If your VPS already runs a real"
+      echo "web server on 443, this will detect the conflict and let you pick another."
+    else
+      DEFAULT_BIND_PORT=7001
+      echo "Choosing the tunnel port. Default is 7001 for plain tcp. If your VPS"
+      echo "provider already runs something on that port, this will detect it and"
+      echo "let you pick another."
+    fi
+    BIND_PORT="$(pick_free_port "$DEFAULT_BIND_PORT" "Bind port for tunnel control")"
     AUTH_TOKEN="123"
     warn "Auth token is set to the default value: 123 (change it later in ${CONFIG_PATH} for real security)"
 
@@ -344,7 +361,12 @@ auth.token = "${AUTH_TOKEN}"
 # ---- stability / performance tuning (fixes common disconnect bugs) ----
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
-transport.tcpKeepalive = 7200
+# tcpKeepalive is the OS-level TCP keepalive probe interval in seconds.
+# The old default (7200s = 2 hours) is the Linux kernel default and is
+# useless for catching a tunnel that drops within seconds — the OS would
+# not even send a first probe until 2 hours in. 30s means a dead link on
+# a flaky/censored route gets detected and the connection recycled fast.
+transport.tcpKeepalive = 30
 transport.maxPoolCount = 50
 transport.heartbeatTimeout = 90
 # NOTE: "transport.qos" is intentionally NOT set here — newer frp releases
@@ -392,12 +414,17 @@ if [[ "$ROLE" == "client" ]]; then
     SERVER_PORT="$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)"
   else
     read -rp "Server public IP or domain: " SERVER_ADDR
-    read -rp "Server bind port [7001]: " SERVER_PORT
-    SERVER_PORT="${SERVER_PORT:-7001}"
+    read -rp "Transport protocol [tcp/kcp/quic/websocket/wss] (default wss): " TRANSPORT_PROTO
+    TRANSPORT_PROTO="${TRANSPORT_PROTO:-wss}"
+    if [[ "$TRANSPORT_PROTO" == "wss" || "$TRANSPORT_PROTO" == "websocket" ]]; then
+      DEFAULT_SERVER_PORT=443
+    else
+      DEFAULT_SERVER_PORT=7001
+    fi
+    read -rp "Server bind port [${DEFAULT_SERVER_PORT}]: " SERVER_PORT
+    SERVER_PORT="${SERVER_PORT:-$DEFAULT_SERVER_PORT}"
     AUTH_TOKEN="123"
     warn "Auth token is set to the default value: 123 (must match the server, change later for real security)"
-    read -rp "Transport protocol [tcp/kcp/quic/websocket/wss] (default tcp): " TRANSPORT_PROTO
-    TRANSPORT_PROTO="${TRANSPORT_PROTO:-tcp}"
 
     # ---- ask which ports need to be forwarded (like the original script) ----
     echo ""
@@ -468,8 +495,11 @@ transport.tcpMux = true
 transport.poolCount = 5
 transport.heartbeatInterval = 30
 transport.heartbeatTimeout = 90
+# Same fix as the server side: 7200s (2h) is the kernel default and won't
+# catch a dropped tunnel for hours. 30s lets a dead connection get noticed
+# and re-dialed quickly instead of sitting silently broken.
 transport.dialServerTimeout = 10
-transport.dialServerKeepAlive = 7200
+transport.dialServerKeepAlive = 30
 
 log.to = "console"
 log.level = "info"
