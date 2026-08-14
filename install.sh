@@ -45,20 +45,26 @@ EOF
 fix_dns_if_needed
 
 # ---- Port conflict helper -----------------------------------------
-port_in_use() { ss -tuln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}\$"; }
+port_in_use() {
+  local PORT="$1"
+  ss -tuln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}\$"
+}
+
 pick_free_port() {
-  local DEFAULT="$1" LABEL="$2" CHOSEN="$DEFAULT"
+  local DEFAULT_PORT="$1"
+  local LABEL="$2"
+  local CHOSEN="${DEFAULT_PORT}"
   while true; do
-    read -rp "${LABEL} [${CHOSEN}]: " INPUT
-    CHOSEN="${INPUT:-$CHOSEN}"
-    if port_in_use "$CHOSEN"; then
-      warn "Port $CHOSEN in use. Choose another."
+    read -rp "${LABEL} [${CHOSEN}]: " INPUT_PORT
+    CHOSEN="${INPUT_PORT:-$CHOSEN}"
+    if port_in_use "${CHOSEN}"; then
+      warn "Port ${CHOSEN} in use. Choose another."
       CHOSEN=$((CHOSEN + 1))
     else
       break
     fi
   done
-  echo "$CHOSEN"
+  echo "${CHOSEN}"
 }
 
 # ---- Apply sysctl tuning for network stability --------------------
@@ -187,7 +193,6 @@ fi
 read -rp "Use KCP (UDP-based, may bypass some firewalls)? [y/N]: " KCP_ANSWER
 if [[ "$KCP_ANSWER" =~ ^[Yy]$ ]]; then
   PROTOCOL="kcp"
-  # KCP needs a separate bind port on server
 else
   PROTOCOL="tcp"
 fi
@@ -196,12 +201,12 @@ fi
 if [[ "$ROLE" == "server" ]]; then
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config found. Keeping it."
+    BIND_PORT=$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo "7001")
   else
-    BIND_PORT=$(pick_free_port 7001 "Bind port for tunnel control")
+    BIND_PORT=$(pick_free_port "7001" "Bind port for tunnel control")
     AUTH_TOKEN="123"
     warn "Auth token default: 123 (change manually)."
 
-    # Build config
     cat > "$CONFIG_PATH" <<EOF
 # ===================== frps.toml (server) =====================
 bindAddr = "0.0.0.0"
@@ -230,7 +235,6 @@ log.level = "info"
 log.maxDays = 7
 detailedErrorsToClient = true
 EOF
-    # If KCP, add kcpBindPort
     if [[ "$PROTOCOL" == "kcp" ]]; then
       echo "kcpBindPort = ${BIND_PORT}" >> "$CONFIG_PATH"
     fi
@@ -254,6 +258,8 @@ fi
 if [[ "$ROLE" == "client" ]]; then
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config kept."
+    SERVER_ADDR=$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || echo "")
+    SERVER_PORT=$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo "")
   else
     read -rp "Server IP or domain: " SERVER_ADDR
     read -rp "Server bind port [7001]: " SERVER_PORT
