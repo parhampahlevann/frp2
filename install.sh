@@ -81,7 +81,7 @@ fix_dns_if_needed
 
 # ---- Port-conflict helpers -----------------------------------------
 # Learned the hard way: some VPS providers run their OWN frps (or other
-# service) on common ports like 7000 as part of their network stack,
+# service) on common ports like 7001 as part of their network stack,
 # started outside systemd (rc.local, a custom script, etc). If we blindly
 # bind to that port, our service loops forever with "address already in
 # use", and worse, a client can end up handshaking with the WRONG server
@@ -92,7 +92,7 @@ port_in_use() {
   # column 4 of `ss -tuln` is "Local Address:Port" (not column 5, which is
   # the peer address) — using the wrong column silently never detects
   # real conflicts, which is exactly the bug we hit with the provider's
-  # frps already sitting on port 7000.
+  # frps already sitting on port 7001.
   ss -tuln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}\$"
 }
 
@@ -229,7 +229,7 @@ if [[ "$ROLE" == "uninstall" ]]; then
   if command -v ufw >/dev/null 2>&1; then
     info "Removing firewall rules added by this script..."
     for RULE in \
-      "7000/tcp" "7000/udp" "8080/tcp" "8443/tcp" "7005/tcp" \
+      "7001/tcp" "7001/udp" "8080/tcp" "8443/tcp" "7005/tcp" \
       "2000:65000/tcp" "2000:65000/udp"
     do
       ufw delete allow "$RULE" >/dev/null 2>&1 || true
@@ -310,12 +310,12 @@ CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 if [[ "$ROLE" == "server" ]]; then
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config found at $CONFIG_PATH — keeping it untouched."
-    BIND_PORT="$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo 7000)"
+    BIND_PORT="$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo 7001)"
   else
     echo ""
     echo "Choosing the tunnel port. If your VPS provider already runs something"
-    echo "on the default port (7000), this will detect it and let you pick another."
-    BIND_PORT="$(pick_free_port 7000 "Bind port for tunnel control")"
+    echo "on the default port (7001), this will detect it and let you pick another."
+    BIND_PORT="$(pick_free_port 7001 "Bind port for tunnel control")"
     AUTH_TOKEN="123"
     warn "Auth token is set to the default value: 123 (change it later in ${CONFIG_PATH} for real security)"
 
@@ -392,8 +392,8 @@ if [[ "$ROLE" == "client" ]]; then
     SERVER_PORT="$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)"
   else
     read -rp "Server public IP or domain: " SERVER_ADDR
-    read -rp "Server bind port [7000]: " SERVER_PORT
-    SERVER_PORT="${SERVER_PORT:-7000}"
+    read -rp "Server bind port [7001]: " SERVER_PORT
+    SERVER_PORT="${SERVER_PORT:-7001}"
     AUTH_TOKEN="123"
     warn "Auth token is set to the default value: 123 (must match the server, change later for real security)"
     read -rp "Transport protocol [tcp/kcp/quic/websocket/wss] (default tcp): " TRANSPORT_PROTO
