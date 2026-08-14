@@ -14,17 +14,33 @@
 #      transport.tls.enable (client) instead of the non-existent
 #      top-level "tls_enable" key (which frp silently ignored).
 #   2) When KCP is selected, the KCP bind port is now opened on UDP
-#      in ufw as well (previously only TCP was opened, so the KCP
-#      control channel could never establish -> "tunnel never connects").
-#   3) Auth token is no longer hardcoded to "123": frps generates a
-#      strong random token and prints it clearly; frpc asks you to
-#      paste that exact token, preventing silent auth mismatches.
-#   4) Client reachability test now matches the real protocol
-#      (TCP test for tcp/websocket, UDP probe for kcp) instead of
-#      always doing a TCP-only check that falsely "fails" under KCP.
-#   5) After starting frps/frpc, logs are scanned for the most common
-#      failure signatures (auth mismatch, TLS handshake, timeout,
-#      port already in use) and a plain-language hint is printed.
+#      in ufw as well.
+#   3) AUTH TOKEN IS NOW FIXED/SHARED (see FIXED_AUTH_TOKEN below) —
+#      no more prompting, no more random generation, no more mismatch
+#      between server and client.
+#   4) Client reachability test matches the real protocol (TCP test
+#      for tcp/websocket, UDP probe for kcp).
+#   5) *** ROOT CAUSE OF "status doesn't work" FIXED ***
+#      `systemctl status <svc> | head -10` returns exit code 3 when a
+#      service is inactive/failed. Under `set -e` + `pipefail` (which
+#      this script uses), that silently KILLED THE WHOLE SCRIPT the
+#      instant it hit a non-running service — so you never got to see
+#      logs or diagnostics for that service (or the next one in the
+#      loop). Every status-related pipeline is now guarded with
+#      `|| true` so a "not running" service is *reported*, not fatal.
+#   6) *** ROOT CAUSE OF "server/client never connect" MITIGATED ***
+#      Previously TLS/KCP were prompted independently on the server
+#      run and the client run, with nothing forcing them to match —
+#      a silent protocol/TLS mismatch = handshake never completes.
+#      The server setup now prints one explicit "connection summary"
+#      block (public IP, port, token, protocol, TLS) at the end, and
+#      the client setup echoes back exactly what you chose so you can
+#      immediately compare it against the server's summary.
+#   7) Added an explicit CONNECTED / NOT CONNECTED verdict in the
+#      status menu, based on real log markers ("login to server
+#      success" on frpc, "client login info" on frps) instead of just
+#      "process is running" (a running process can still be failing
+#      to authenticate/connect forever).
 #  USAGE: sudo bash frp_setup.sh
 # =====================================================================
 set -euo pipefail
@@ -35,6 +51,12 @@ info()  { echo -e "${CYAN}==>${NC} $1"; }
 ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 fail()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# --------------------------- fixed shared token ----------------------
+# Same token is written to BOTH frps.toml and frpc.toml, on every
+# machine you run this on. No prompts, no random generation, no
+# mismatch. Change this constant if you ever want to rotate it.
+FIXED_AUTH_TOKEN="7ZuESw25FFWCZQmrroruUEy4qVVB9dbmkG1BMSMD6WHx"
 
 # --------------------------- pre-flight -----------------------------
 [[ $EUID -eq 0 ]] || fail "Run as root (sudo)."
@@ -50,9 +72,6 @@ check_dns() { getent hosts github.com >/dev/null 2>&1; }
 fix_dns_if_needed() {
   if check_dns; then return 0; fi
   warn "DNS broken. Fixing..."
-  # If systemd-resolved manages resolv.conf as a symlink, replacing it
-  # with a plain file works but will be reverted on next resolved
-  # restart; warn instead of silently fighting it forever.
   if [[ -L /etc/resolv.conf ]]; then
     warn "/etc/resolv.conf is a symlink (systemd-resolved). Overriding temporarily."
   fi
@@ -90,15 +109,6 @@ pick_free_port() {
   echo "${CHOSEN}"
 }
 
-# ---- Random token generator ----------------------------------------
-gen_token() {
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 16
-  else
-    tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
-  fi
-}
-
 # ---- Apply sysctl tuning for network stability --------------------
 apply_sysctl() {
   info "Applying sysctl network tuning..."
@@ -118,19 +128,22 @@ EOF
 }
 
 # ---- Diagnose common connection failures from logs ------------------
+# NOTE: every sub-command here is guarded (|| true / inside if) so a
+# non-zero exit (e.g. no matching log lines) can NEVER kill the script
+# under `set -e` + `pipefail`.
 diagnose_logs() {
   local SVC="$1"
   local LOG
-  LOG="$(journalctl -u "$SVC" -n 50 --no-pager 2>/dev/null || true)"
+  LOG="$(journalctl -u "$SVC" -n 80 --no-pager 2>/dev/null || true)"
 
   if echo "$LOG" | grep -qiE "authorization failed|auth.*fail|token.*(invalid|mismatch)"; then
-    warn "Hint: authentication failed -> auth.token in frps.toml and frpc.toml do not match. Re-check the token you pasted."
+    warn "Hint: authentication failed -> auth.token in frps.toml and frpc.toml do not match."
   fi
   if echo "$LOG" | grep -qiE "tls: |certificate|handshake"; then
-    warn "Hint: TLS handshake issue -> make sure TLS is enabled/disabled identically on BOTH server and client."
+    warn "Hint: TLS handshake issue -> TLS must be enabled/disabled IDENTICALLY on BOTH server and client."
   fi
   if echo "$LOG" | grep -qiE "i/o timeout|dial tcp.*timeout|no route to host"; then
-    warn "Hint: network/timeout -> server unreachable on this port. Check firewall/security-group rules and that frps is actually running."
+    warn "Hint: network/timeout -> server unreachable on this port. Check firewall/security-group (cloud provider panel, not just ufw) on the bind port."
   fi
   if echo "$LOG" | grep -qiE "address already in use|bind: address already in use"; then
     warn "Hint: port already in use -> another process is holding the bind port. Pick a different port."
@@ -138,6 +151,28 @@ diagnose_logs() {
   if echo "$LOG" | grep -qiE "connection refused"; then
     warn "Hint: connection refused -> frps is not listening on that IP/port yet, or a firewall is dropping it silently before that."
   fi
+  return 0
+}
+
+# ---- Explicit tunnel-connected verdict (not just "process running") --
+tunnel_verdict() {
+  local SVC="$1"
+  local LOG
+  LOG="$(journalctl -u "$SVC" -n 80 --no-pager 2>/dev/null || true)"
+  if [[ "$SVC" == "frpc" ]]; then
+    if echo "$LOG" | grep -qi "login to server success"; then
+      ok "Tunnel status: CONNECTED (client successfully logged in to server)."
+    else
+      warn "Tunnel status: NOT CONNECTED (no successful login found in recent logs)."
+    fi
+  elif [[ "$SVC" == "frps" ]]; then
+    if echo "$LOG" | grep -qi "client login info"; then
+      ok "Tunnel status: at least one client has logged in successfully."
+    else
+      warn "Tunnel status: no client has successfully logged in yet."
+    fi
+  fi
+  return 0
 }
 
 # ===================== Main Menu ===================================
@@ -165,15 +200,22 @@ esac
 # ------------------------------------------------------------------
 if [[ "$ROLE" == "status" ]]; then
   for SVC in frps frpc; do
-    if systemctl list-unit-files | grep -q "^${SVC}.service"; then
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${SVC}\.service"; then
       echo -e "\n${CYAN}=== $SVC ===${NC}"
-      systemctl is-active --quiet "$SVC" && ok "RUNNING" || warn "NOT RUNNING"
-      systemctl status "$SVC" --no-pager -l | head -10
+      systemctl is-active --quiet "$SVC" && ok "process RUNNING" || warn "process NOT RUNNING"
+      # FIX: this pipeline used to be unguarded. systemctl status exits
+      # 3 for an inactive/failed unit, which under `set -e`+`pipefail`
+      # killed the ENTIRE script right here, before ever showing logs.
+      systemctl status "$SVC" --no-pager -l 2>&1 | head -10 || true
       echo "Config: /etc/frp/$SVC.toml"
       [[ -f "/etc/frp/$SVC.toml" ]] && ok "Config present" || warn "Config missing"
       echo "Last logs:"
-      journalctl -u "$SVC" -n 5 --no-pager
+      journalctl -u "$SVC" -n 5 --no-pager 2>/dev/null || true
+      tunnel_verdict "$SVC"
       diagnose_logs "$SVC"
+    else
+      echo -e "\n${CYAN}=== $SVC ===${NC}"
+      warn "Not installed (no systemd unit found)."
     fi
   done
   exit 0
@@ -253,26 +295,30 @@ if [[ "$KCP_ANSWER" =~ ^[Yy]$ ]]; then
 else
   PROTOCOL="tcp"
 fi
+warn "IMPORTANT: TLS (${TLS_ENABLE}) and protocol (${PROTOCOL}) must be set IDENTICALLY on the server and the client, or the handshake will never complete. Write these down."
 
 # ------------------------------------------------------------------
 if [[ "$ROLE" == "server" ]]; then
+  AUTH_TOKEN="$FIXED_AUTH_TOKEN"
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config found. Keeping it."
-    BIND_PORT=$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo "7001")
-    # Determine actual protocol/TLS in use from the existing file so
-    # firewall rules match reality, not just this session's prompt.
+    BIND_PORT=$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)
+    BIND_PORT="${BIND_PORT:-7001}"
     if grep -q '^kcpBindPort' "$CONFIG_PATH"; then IS_KCP=1; else IS_KCP=0; fi
-    # Migrate configs written by older versions of this script that used
-    # the non-existent "tls_enable" key — frp rejects unknown fields and
-    # crash-loops on startup ("json: unknown field \"tls_enable\"").
     if grep -qE '^tls_enable' "$CONFIG_PATH"; then
       warn "Old config uses invalid key 'tls_enable' — migrating to 'transport.tls.force'."
       sed -i -E 's/^tls_enable = (.*)$/transport.tls.force = \1/' "$CONFIG_PATH"
       ok "Migrated TLS key in ${CONFIG_PATH}."
     fi
+    # Make sure the token in an existing config matches the fixed token,
+    # so re-running this script always converges both sides to the same
+    # shared secret instead of leaving a stale/random one in place.
+    if grep -q '^auth.token' "$CONFIG_PATH"; then
+      sed -i -E "s/^auth\.token = .*/auth.token = \"${AUTH_TOKEN}\"/" "$CONFIG_PATH"
+      ok "Synced auth.token to the fixed shared token."
+    fi
   else
     BIND_PORT=$(pick_free_port "7001" "Bind port for tunnel control")
-    AUTH_TOKEN="$(gen_token)"
 
     cat > "$CONFIG_PATH" <<EOF
 # ===================== frps.toml (server) =====================
@@ -309,9 +355,6 @@ EOF
       IS_KCP=0
     fi
     ok "Server config created."
-    echo -e "${YELLOW}Bind port:  ${GREEN}${BIND_PORT}${NC}"
-    echo -e "${YELLOW}Auth token: ${GREEN}${AUTH_TOKEN}${NC}"
-    warn "Copy this exact token — you'll need to paste it when setting up frpc."
   fi
 
   if [[ "$UFW_AVAIL" -eq 1 ]]; then
@@ -324,7 +367,7 @@ EOF
     ufw allow 8443/tcp >/dev/null 2>&1 || true
     ufw allow 7005/tcp >/dev/null 2>&1 || true
     ufw allow 1:65535/tcp >/dev/null 2>&1 || true
-    ok "Firewall rules applied."
+    ok "Firewall (ufw) rules applied."
   else
     warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using KCP)."
   fi
@@ -332,6 +375,7 @@ fi
 
 # ------------------------------------------------------------------
 if [[ "$ROLE" == "client" ]]; then
+  AUTH_TOKEN="$FIXED_AUTH_TOKEN"
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config kept."
     SERVER_ADDR=$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || echo "")
@@ -342,16 +386,14 @@ if [[ "$ROLE" == "client" ]]; then
       sed -i -E 's/^tls_enable = (.*)$/transport.tls.enable = \1/' "$CONFIG_PATH"
       ok "Migrated TLS key in ${CONFIG_PATH}."
     fi
+    if grep -q '^auth.token' "$CONFIG_PATH"; then
+      sed -i -E "s/^auth\.token = .*/auth.token = \"${AUTH_TOKEN}\"/" "$CONFIG_PATH"
+      ok "Synced auth.token to the fixed shared token."
+    fi
   else
     read -rp "Server IP or domain: " SERVER_ADDR
     read -rp "Server bind port [7001]: " SERVER_PORT
     SERVER_PORT="${SERVER_PORT:-7001}"
-
-    AUTH_TOKEN=""
-    while [[ -z "$AUTH_TOKEN" ]]; do
-      read -rp "Auth token (paste the exact token shown by frps): " AUTH_TOKEN
-      [[ -z "$AUTH_TOKEN" ]] && warn "Token cannot be empty — it must match the server exactly."
-    done
 
     echo "Enter TCP ports to forward (comma-separated, e.g. 80,443):"
     read -rp "Ports: " PORTS_INPUT
@@ -374,7 +416,6 @@ transport.useCompression = false
 "
     done
 
-    # Write config and verify
     cat > "$CONFIG_PATH" <<EOF
 # ===================== frpc.toml (client) =====================
 serverAddr = "${SERVER_ADDR}"
@@ -402,14 +443,11 @@ log.level = "info"
 ${PROXIES_BLOCK}
 EOF
 
-    # Verify file was created
     if [[ ! -f "$CONFIG_PATH" ]]; then
       fail "Failed to write config file at $CONFIG_PATH. Check disk space or permissions."
     fi
     ok "Client config created at $CONFIG_PATH."
 
-    # Test connectivity — match the actual transport protocol so KCP
-    # setups don't get a false "unreachable" warning from a TCP-only probe.
     info "Testing reachability to ${SERVER_ADDR}:${SERVER_PORT} (${PROTOCOL})..."
     if [[ "$PROTOCOL" == "kcp" ]]; then
       if command -v nc >/dev/null 2>&1; then
@@ -425,7 +463,7 @@ EOF
       if timeout 5 bash -c "cat < /dev/null > /dev/tcp/${SERVER_ADDR}/${SERVER_PORT}" 2>/dev/null; then
         ok "Server reachable."
       else
-        warn "Server NOT reachable – tunnel will fail. Check the server's firewall/security group for TCP ${SERVER_PORT}."
+        warn "Server NOT reachable – tunnel will fail. Check the server's firewall/security group (cloud provider panel, not just ufw) for TCP ${SERVER_PORT}."
       fi
     fi
   fi
@@ -453,19 +491,18 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable "${BIN_NAME}" >/dev/null 2>&1
+systemctl enable "${BIN_NAME}" >/dev/null 2>&1 || true
 systemctl restart "${BIN_NAME}"
 sleep 3
 
 # ---- Verify service ----
 if systemctl is-active --quiet "${BIN_NAME}"; then
-  ok "${BIN_NAME} is RUNNING"
-  # Even on a successful start, scan recent logs for reconnect-loop
-  # symptoms (auth/TLS/timeout) that indicate the tunnel itself is failing.
+  ok "${BIN_NAME} process is RUNNING"
+  tunnel_verdict "${BIN_NAME}"
   diagnose_logs "${BIN_NAME}"
 else
   warn "${BIN_NAME} failed to start. Showing logs:"
-  journalctl -u "${BIN_NAME}" -n 20 --no-pager
+  journalctl -u "${BIN_NAME}" -n 20 --no-pager 2>/dev/null || true
   diagnose_logs "${BIN_NAME}"
   exit 1
 fi
@@ -481,3 +518,16 @@ echo -e "${GREEN}=====================================================${NC}"
 echo "Config : ${CONFIG_PATH}"
 echo "Logs   : journalctl -u ${BIN_NAME} -f"
 echo "Restart: systemctl restart ${BIN_NAME}"
+
+if [[ "$ROLE" == "server" ]]; then
+  PUB_IP="$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null || echo "<could not detect - use your known server IP>")"
+  echo ""
+  echo -e "${CYAN}================ CONNECTION SUMMARY =================${NC}"
+  echo -e "Give these EXACT values when setting up the client (frpc):"
+  echo -e "  Server address : ${GREEN}${PUB_IP}${NC}"
+  echo -e "  Server port    : ${GREEN}${BIND_PORT}${NC}"
+  echo -e "  Auth token     : ${GREEN}${AUTH_TOKEN}${NC}  (already hardcoded in this script — fine as-is)"
+  echo -e "  Protocol       : ${GREEN}${PROTOCOL}${NC}  <-- client MUST answer the KCP prompt the same way"
+  echo -e "  TLS            : ${GREEN}${TLS_ENABLE}${NC}  <-- client MUST answer the TLS prompt the same way"
+  echo -e "${CYAN}=======================================================${NC}"
+fi
