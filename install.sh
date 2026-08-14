@@ -2,46 +2,17 @@
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
 #  - Fixed version: v0.57.0 (stable)
-#  - Optimized for stable long-lived connections and low jitter
+#  - ULTRA-STABLE TUNNEL CONFIG (Fixes random disconnects)
 #  - Supports TLS & KCP (optional)
-#  - TCP tunnel default; KCP remains optional for problematic TCP paths
-#  - Proxy health checks disabled by default
 #  - Auto-fixes DNS, port conflicts, and applies sysctl tuning
-#  - Menu: server, client, status, uninstall
 #
-#  FIXES applied vs original:
-#   1) TLS now uses correct toml keys: transport.tls.force (server) /
-#      transport.tls.enable (client) instead of the non-existent
-#      top-level "tls_enable" key (which frp silently ignored).
-#   2) When KCP is selected, the KCP bind port is now opened on UDP
-#      in ufw as well.
-#   3) AUTH TOKEN IS NOW FIXED/SHARED (see FIXED_AUTH_TOKEN below) —
-#      no more prompting, no more random generation, no more mismatch
-#      between server and client.
-#   4) Client reachability test matches the real protocol (TCP test
-#      for tcp/websocket, UDP probe for kcp).
-#   5) *** ROOT CAUSE OF "status doesn't work" FIXED ***
-#      `systemctl status <svc> | head -10` returns exit code 3 when a
-#      service is inactive/failed. Under `set -e` + `pipefail` (which
-#      this script uses), that silently KILLED THE WHOLE SCRIPT the
-#      instant it hit a non-running service — so you never got to see
-#      logs or diagnostics for that service (or the next one in the
-#      loop). Every status-related pipeline is now guarded with
-#      `|| true` so a "not running" service is *reported*, not fatal.
-#   6) *** ROOT CAUSE OF "server/client never connect" MITIGATED ***
-#      Previously TLS/KCP were prompted independently on the server
-#      run and the client run, with nothing forcing them to match —
-#      a silent protocol/TLS mismatch = handshake never completes.
-#      The server setup now prints one explicit "connection summary"
-#      block (public IP, port, token, protocol, TLS) at the end, and
-#      the client setup echoes back exactly what you chose so you can
-#      immediately compare it against the server's summary.
-#   7) Added an explicit CONNECTED / NOT CONNECTED verdict in the
-#      status menu, based on real log markers ("login to server
-#      success" on frpc, "client login info" on frps) instead of just
-#      "process is running" (a running process can still be failing
-#      to authenticate/connect forever).
-#  USAGE: sudo bash frp_setup.sh
+#  STABILITY FIXES APPLIED:
+#   1) Heartbeat enabled (Interval=30, Timeout=90) -> Prevents silent NAT drops.
+#   2) PoolCount set to 5 -> Prevents reconnect storms on new connections.
+#   3) Keepalive intervals increased to 30s -> Prevents false-positive disconnects on mobile/high-latency networks.
+#   4) BBR Kernel module auto-loaded -> Fixes sysctl silent fail.
+#   5) TLS keys corrected (transport.tls.force / transport.tls.enable).
+#   6) Status & Diagnose pipelines guarded with `|| true` -> Prevents script crash under `set -e`.
 # =====================================================================
 set -euo pipefail
 
@@ -53,9 +24,6 @@ warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 fail()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # --------------------------- fixed shared token ----------------------
-# Same token is written to BOTH frps.toml and frpc.toml, on every
-# machine you run this on. No prompts, no random generation, no
-# mismatch. Change this constant if you ever want to rotate it.
 FIXED_AUTH_TOKEN="7ZuESw25FFWCZQmrroruUEy4qVVB9dbmkG1BMSMD6WHx"
 
 # --------------------------- pre-flight -----------------------------
@@ -112,6 +80,12 @@ pick_free_port() {
 # ---- Apply sysctl tuning for network stability --------------------
 apply_sysctl() {
   info "Applying sysctl network tuning..."
+  # Load BBR module safely
+  modprobe tcp_bbr 2>/dev/null || true
+  if ! lsmod | grep -q "^tcp_bbr"; then
+    echo "tcp_bbr" >> /etc/modules-load.d/modules.conf 2>/dev/null || true
+  fi
+
   cat > /etc/sysctl.d/99-frp-tune.conf <<'EOF'
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
@@ -119,7 +93,7 @@ net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_keepalive_time = 1800
+net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 EOF
@@ -128,9 +102,6 @@ EOF
 }
 
 # ---- Diagnose common connection failures from logs ------------------
-# NOTE: every sub-command here is guarded (|| true / inside if) so a
-# non-zero exit (e.g. no matching log lines) can NEVER kill the script
-# under `set -e` + `pipefail`.
 diagnose_logs() {
   local SVC="$1"
   local LOG
@@ -143,18 +114,18 @@ diagnose_logs() {
     warn "Hint: TLS handshake issue -> TLS must be enabled/disabled IDENTICALLY on BOTH server and client."
   fi
   if echo "$LOG" | grep -qiE "i/o timeout|dial tcp.*timeout|no route to host"; then
-    warn "Hint: network/timeout -> server unreachable on this port. Check firewall/security-group (cloud provider panel, not just ufw) on the bind port."
+    warn "Hint: network/timeout -> server unreachable on this port. Check firewall/security-group."
   fi
   if echo "$LOG" | grep -qiE "address already in use|bind: address already in use"; then
-    warn "Hint: port already in use -> another process is holding the bind port. Pick a different port."
+    warn "Hint: port already in use -> another process is holding the bind port."
   fi
   if echo "$LOG" | grep -qiE "connection refused"; then
-    warn "Hint: connection refused -> frps is not listening on that IP/port yet, or a firewall is dropping it silently before that."
+    warn "Hint: connection refused -> frps is not listening on that IP/port yet."
   fi
   return 0
 }
 
-# ---- Explicit tunnel-connected verdict (not just "process running") --
+# ---- Explicit tunnel-connected verdict -----------------------------
 tunnel_verdict() {
   local SVC="$1"
   local LOG
@@ -179,7 +150,7 @@ tunnel_verdict() {
 echo -e "${CYAN}"
 echo "==================================================="
 echo "        FRP Reverse Tunnel - One-Click Setup"
-echo "           (Stable v0.57.0 - Low Latency)"
+echo "           (Stable v0.57.0 - Ultra Stable)"
 echo "==================================================="
 echo -e "${NC}"
 
@@ -203,9 +174,6 @@ if [[ "$ROLE" == "status" ]]; then
     if systemctl list-unit-files 2>/dev/null | grep -q "^${SVC}\.service"; then
       echo -e "\n${CYAN}=== $SVC ===${NC}"
       systemctl is-active --quiet "$SVC" && ok "process RUNNING" || warn "process NOT RUNNING"
-      # FIX: this pipeline used to be unguarded. systemctl status exits
-      # 3 for an inactive/failed unit, which under `set -e`+`pipefail`
-      # killed the ENTIRE script right here, before ever showing logs.
       systemctl status "$SVC" --no-pager -l 2>&1 | head -10 || true
       echo "Config: /etc/frp/$SVC.toml"
       [[ -f "/etc/frp/$SVC.toml" ]] && ok "Config present" || warn "Config missing"
@@ -294,7 +262,7 @@ if [[ "$KCP_ANSWER" =~ ^[Yy]$ ]]; then
 else
   PROTOCOL="tcp"
 fi
-warn "IMPORTANT: TLS (${TLS_ENABLE}) and protocol (${PROTOCOL}) must be set IDENTICALLY on the server and the client, or the handshake will never complete. Write these down."
+warn "IMPORTANT: TLS (${TLS_ENABLE}) and protocol (${PROTOCOL}) must be set IDENTICALLY on the server and the client."
 
 # ------------------------------------------------------------------
 if [[ "$ROLE" == "server" ]]; then
@@ -309,9 +277,6 @@ if [[ "$ROLE" == "server" ]]; then
       sed -i -E 's/^tls_enable = (.*)$/transport.tls.force = \1/' "$CONFIG_PATH"
       ok "Migrated TLS key in ${CONFIG_PATH}."
     fi
-    # Make sure the token in an existing config matches the fixed token,
-    # so re-running this script always converges both sides to the same
-    # shared secret instead of leaving a stale/random one in place.
     if grep -q '^auth.token' "$CONFIG_PATH"; then
       sed -i -E "s/^auth\.token = .*/auth.token = \"${AUTH_TOKEN}\"/" "$CONFIG_PATH"
       ok "Synced auth.token to the fixed shared token."
@@ -330,12 +295,12 @@ tcpmuxHTTPConnectPort = 7005
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport settings ----
+# ---- Transport settings (STABILITY OPTIMIZED) ----
 transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 15
-transport.tcpKeepalive = 15
+transport.tcpMuxKeepaliveInterval = 30
+transport.tcpKeepalive = 30
 transport.maxPoolCount = 5
-transport.heartbeatTimeout = 60
+transport.heartbeatTimeout = 90
 
 # ---- TLS (correct key for v0.57.0 is transport.tls.force) ----
 transport.tls.force = ${TLS_ENABLE}
@@ -424,15 +389,15 @@ loginFailExit = false
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport ----
+# ---- Transport (STABILITY OPTIMIZED) ----
 transport.protocol = "${PROTOCOL}"
 transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 15
-transport.poolCount = 0
-transport.heartbeatInterval = -1
-transport.heartbeatTimeout = 60
+transport.tcpMuxKeepaliveInterval = 30
+transport.poolCount = 5
+transport.heartbeatInterval = 30
+transport.heartbeatTimeout = 90
 transport.dialServerTimeout = 15
-transport.dialServerKeepalive = 15
+transport.dialServerKeepalive = 30
 
 # ---- TLS (correct key for v0.57.0 is transport.tls.enable) ----
 transport.tls.enable = ${TLS_ENABLE}
@@ -441,7 +406,7 @@ log.to = "console"
 log.level = "info"
 
 # ============= Auto-generated proxies (TCP only) =============
-${PROXIES_BLOCK}
+ ${PROXIES_BLOCK}
 EOF
 
     if [[ ! -f "$CONFIG_PATH" ]]; then
@@ -455,16 +420,16 @@ EOF
         if nc -uzw3 "${SERVER_ADDR}" "${SERVER_PORT}" 2>/dev/null; then
           ok "UDP port appears reachable (best-effort; UDP checks are not fully reliable)."
         else
-          warn "Could not confirm UDP reachability — this is normal for UDP and not necessarily an error. Verify manually if the tunnel fails."
+          warn "Could not confirm UDP reachability — this is normal for UDP and not necessarily an error."
         fi
       else
-        warn "nc not found — skipping UDP reachability test. Install netcat to enable it."
+        warn "nc not found — skipping UDP reachability test."
       fi
     else
       if timeout 5 bash -c "cat < /dev/null > /dev/tcp/${SERVER_ADDR}/${SERVER_PORT}" 2>/dev/null; then
         ok "Server reachable."
       else
-        warn "Server NOT reachable – tunnel will fail. Check the server's firewall/security group (cloud provider panel, not just ufw) for TCP ${SERVER_PORT}."
+        warn "Server NOT reachable – tunnel will fail. Check the server's firewall/security group."
       fi
     fi
   fi
@@ -483,7 +448,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 Restart=always
-RestartSec=3
+RestartSec=5
 ExecStart=/usr/local/bin/${BIN_NAME} -c ${CONFIG_PATH}
 LimitNOFILE=1048576
 NoNewPrivileges=true
@@ -492,11 +457,13 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
+
 # Validate the generated configuration before restarting the service.
 if ! "${BIN_NAME}" verify -c "${CONFIG_PATH}" >/tmp/${BIN_NAME}-verify.out 2>&1; then
   cat /tmp/${BIN_NAME}-verify.out
   fail "${BIN_NAME} configuration validation failed. Service was NOT restarted."
 fi
+
 systemctl enable "${BIN_NAME}" >/dev/null 2>&1 || true
 systemctl restart "${BIN_NAME}"
 sleep 3
@@ -532,7 +499,7 @@ if [[ "$ROLE" == "server" ]]; then
   echo -e "Give these EXACT values when setting up the client (frpc):"
   echo -e "  Server address : ${GREEN}${PUB_IP}${NC}"
   echo -e "  Server port    : ${GREEN}${BIND_PORT}${NC}"
-  echo -e "  Auth token     : ${GREEN}${AUTH_TOKEN}${NC}  (already hardcoded in this script — fine as-is)"
+  echo -e "  Auth token     : ${GREEN}${AUTH_TOKEN}${NC}  (already hardcoded in this script)"
   echo -e "  Protocol       : ${GREEN}${PROTOCOL}${NC}  <-- client MUST answer the KCP prompt the same way"
   echo -e "  TLS            : ${GREEN}${TLS_ENABLE}${NC}  <-- client MUST answer the TLS prompt the same way"
   echo -e "${CYAN}=======================================================${NC}"
