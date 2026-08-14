@@ -2,23 +2,13 @@
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
 #  - Version: v0.61.0 (latest stable)
-#  - TLS COMPLETELY REMOVED for maximum throughput & lowest CPU overhead
-#  - TCP, QUIC, and KCP all optimized for bandwidth, jitter, and ping stability
+#  - TLS COMPLETELY REMOVED
+#  - TCP (tcpMux=false), QUIC, and KCP supported
+#  - KCP NOTE: v0.61.0 does NOT expose internal KCP tuning parameters
+#    (sndwnd, rcvwnd, nodelay, etc). KCP runs with built-in defaults.
+#    For maximum bandwidth, use TCP or QUIC instead.
 #  - Auto-fixes DNS, port conflicts, and applies aggressive sysctl tuning
 #  - Menu: server, client, status, uninstall
-#
-#  BANDWIDTH UNLOCK STRATEGY:
-#    TCP  : tcpMux = false → each proxy = independent TCP stream
-#    QUIC : UDP multi-stream, no HOL blocking, native multiplexing
-#    KCP  : aggressive window sizing + nodelay + no-congestion for max throughput
-#
-#  STABILITY STRATEGY (jitter & ping):
-#    - heartbeatInterval = 5s  (was 10s) → faster dead-connection detection
-#    - heartbeatTimeout  = 30s (was 90s) → quicker recovery
-#    - dialServerKeepalive = 30s on all protocols
-#    - tcpKeepalive = 30s on TCP
-#    - KCP: acknodelay = true, interval = 10, resend = 2, nc = true
-#    - Sysctl: tcp_tw_reuse, tcp_fastopen, BBR, large buffers
 #
 #  USAGE: sudo bash frp_setup.sh
 # =====================================================================
@@ -84,9 +74,9 @@ pick_free_port() {
   echo "${CHOSEN}"
 }
 
-# ---- Apply sysctl tuning for throughput + stability --------------
+# ---- Apply sysctl tuning for maximum throughput ------------------
 apply_sysctl() {
-  info "Applying sysctl network tuning (throughput + stability)..."
+  info "Applying sysctl network tuning (throughput optimized)..."
   cat > /etc/sysctl.d/99-frp-tune.conf <<'EOF'
 # Core buffers
 net.core.rmem_max = 33554432
@@ -111,7 +101,7 @@ net.ipv4.tcp_max_syn_backlog = 65536
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_max_tw_buckets = 2000000
 
-# Keepalive (moderate)
+# Keepalive
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
@@ -211,6 +201,8 @@ strip_problematic_keys() {
   sed -i '/^transport\.useCompression/d' "$FILE"
   sed -i '/^transport\.useEncryption/d' "$FILE"
   sed -i '/^transport\.udpPacketSize/d' "$FILE"
+  # Remove any leftover KCP tuning keys (not supported in v0.61.0)
+  sed -i '/^transport\.kcp\./d' "$FILE"
 }
 
 # ---- Ensure proxy blocks have compression=false, encryption=false --
@@ -224,7 +216,7 @@ fix_proxy_blocks() {
 echo -e "${CYAN}"
 echo "==================================================="
 echo "   FRP Reverse Tunnel - One-Click Setup"
-echo "  (v0.61.0 | NO-TLS | Bandwidth + Stability)"
+echo "        (v0.61.0 | NO-TLS | Bandwidth+)"
 echo "==================================================="
 echo -e "${NC}"
 
@@ -326,9 +318,9 @@ CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 # -------------------- Protocol choice (NO TLS) ----------------------
 echo ""
 echo "Select transport protocol:"
-echo "  1) TCP  — tcpMux = false, each proxy = independent connection (max throughput)"
-echo "  2) QUIC — UDP multi-stream, no HOL blocking, stable ping (recommended)"
-echo "  3) KCP  — UDP with aggressive window tuning (if TCP/QUIC blocked)"
+echo "  1) TCP  — tcpMux = false, each proxy = independent connection (MAX throughput)"
+echo "  2) QUIC — UDP multi-stream, no HOL blocking (recommended)"
+echo "  3) KCP  — UDP-based fallback (v0.61.0 has NO internal tuning params)"
 read -rp "Choose [1-3]: " PROTO_CHOICE
 case "$PROTO_CHOICE" in
   1) PROTOCOL="tcp" ;;
@@ -401,19 +393,6 @@ EOF
     if [[ "$PROTOCOL" == "kcp" ]]; then
       cat >> "$CONFIG_PATH" <<EOF
 kcpBindPort = ${BIND_PORT}
-
-# ---- KCP aggressive throughput tuning ----
-transport.kcp.mtu = 1350
-transport.kcp.sndwnd = 4096
-transport.kcp.rcvwnd = 4096
-transport.kcp.datashard = 10
-transport.kcp.parityshard = 3
-transport.kcp.dscp = 46
-transport.kcp.acknodelay = true
-transport.kcp.nodelay = true
-transport.kcp.interval = 10
-transport.kcp.resend = 2
-transport.kcp.nc = true
 EOF
     fi
 
@@ -460,20 +439,6 @@ if [[ "$ROLE" == "client" ]]; then
     if [[ "$PROTOCOL" == "quic" ]]; then
       toml_set "$CONFIG_PATH" "transport.quic.keepalivePeriod" "5"
       toml_set "$CONFIG_PATH" "transport.quic.maxIdleTimeout" "30"
-    fi
-
-    if [[ "$PROTOCOL" == "kcp" ]]; then
-      toml_set "$CONFIG_PATH" "transport.kcp.mtu" "1350"
-      toml_set "$CONFIG_PATH" "transport.kcp.sndwnd" "4096"
-      toml_set "$CONFIG_PATH" "transport.kcp.rcvwnd" "4096"
-      toml_set "$CONFIG_PATH" "transport.kcp.datashard" "10"
-      toml_set "$CONFIG_PATH" "transport.kcp.parityshard" "3"
-      toml_set "$CONFIG_PATH" "transport.kcp.dscp" "46"
-      toml_set "$CONFIG_PATH" "transport.kcp.acknodelay" "true"
-      toml_set "$CONFIG_PATH" "transport.kcp.nodelay" "true"
-      toml_set "$CONFIG_PATH" "transport.kcp.interval" "10"
-      toml_set "$CONFIG_PATH" "transport.kcp.resend" "2"
-      toml_set "$CONFIG_PATH" "transport.kcp.nc" "true"
     fi
 
     SERVER_ADDR=$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || echo "")
@@ -532,24 +497,6 @@ EOF
       cat >> "$CONFIG_PATH" <<'EOF'
 transport.quic.keepalivePeriod = 5
 transport.quic.maxIdleTimeout = 30
-EOF
-    fi
-
-    if [[ "$PROTOCOL" == "kcp" ]]; then
-      cat >> "$CONFIG_PATH" <<'EOF'
-
-# ---- KCP aggressive throughput tuning ----
-transport.kcp.mtu = 1350
-transport.kcp.sndwnd = 4096
-transport.kcp.rcvwnd = 4096
-transport.kcp.datashard = 10
-transport.kcp.parityshard = 3
-transport.kcp.dscp = 46
-transport.kcp.acknodelay = true
-transport.kcp.nodelay = true
-transport.kcp.interval = 10
-transport.kcp.resend = 2
-transport.kcp.nc = true
 EOF
     fi
 
