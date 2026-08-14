@@ -262,6 +262,14 @@ if [[ "$ROLE" == "server" ]]; then
     # Determine actual protocol/TLS in use from the existing file so
     # firewall rules match reality, not just this session's prompt.
     if grep -q '^kcpBindPort' "$CONFIG_PATH"; then IS_KCP=1; else IS_KCP=0; fi
+    # Migrate configs written by older versions of this script that used
+    # the non-existent "tls_enable" key — frp rejects unknown fields and
+    # crash-loops on startup ("json: unknown field \"tls_enable\"").
+    if grep -qE '^tls_enable' "$CONFIG_PATH"; then
+      warn "Old config uses invalid key 'tls_enable' — migrating to 'transport.tls.force'."
+      sed -i -E 's/^tls_enable = (.*)$/transport.tls.force = \1/' "$CONFIG_PATH"
+      ok "Migrated TLS key in ${CONFIG_PATH}."
+    fi
   else
     BIND_PORT=$(pick_free_port "7001" "Bind port for tunnel control")
     AUTH_TOKEN="$(gen_token)"
@@ -329,6 +337,11 @@ if [[ "$ROLE" == "client" ]]; then
     SERVER_ADDR=$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || echo "")
     SERVER_PORT=$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo "")
     if grep -qE '^transport\.protocol *= *"kcp"' "$CONFIG_PATH"; then PROTOCOL="kcp"; else PROTOCOL="tcp"; fi
+    if grep -qE '^tls_enable' "$CONFIG_PATH"; then
+      warn "Old config uses invalid key 'tls_enable' — migrating to 'transport.tls.enable'."
+      sed -i -E 's/^tls_enable = (.*)$/transport.tls.enable = \1/' "$CONFIG_PATH"
+      ok "Migrated TLS key in ${CONFIG_PATH}."
+    fi
   else
     read -rp "Server IP or domain: " SERVER_ADDR
     read -rp "Server bind port [7001]: " SERVER_PORT
