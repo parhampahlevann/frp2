@@ -324,8 +324,15 @@ if [[ "$ROLE" == "server" ]]; then
 # Pure tunnel: no web dashboard / no panel — just server<->client traffic passthrough.
 bindAddr = "0.0.0.0"
 bindPort = ${BIND_PORT}
-kcpBindPort = ${BIND_PORT}          # enables KCP (UDP) on same port for unstable networks
-quicBindPort = ${BIND_PORT}         # enables QUIC on same port (faster / more resilient)
+# NOTE: kcpBindPort / quicBindPort are intentionally left OFF by default.
+# Some VPS/container hosts (OpenVZ/Virtuozzo-style nodes especially) block
+# or pre-reserve the matching UDP port at the hypervisor level even though
+# it shows as free inside the container, which makes frps fail to start
+# with "bind: address already in use" for no visible reason. TCP alone
+# covers the default transport.protocol = "tcp" client setting. If you
+# want KCP/QUIC and your host supports it, uncomment these two lines:
+# kcpBindPort = ${BIND_PORT}
+# quicBindPort = ${BIND_PORT}
 
 vhostHTTPPort = 8080                # only used if you enable a proxy of type = http
 vhostHTTPSPort = 8443               # only used if you enable a proxy of type = https
@@ -344,7 +351,7 @@ transport.heartbeatTimeout = 90
 # reject it with "json: unknown field \"qos\"" and refuse to start.
 
 allowPorts = [
-  { start = 2000, end = 65000 }
+  { start = 1, end = 65535 }
 ]
 maxPortsPerClient = 0
 
@@ -367,9 +374,9 @@ EOF
     ufw allow 8080/tcp  >/dev/null 2>&1 || true
     ufw allow 8443/tcp  >/dev/null 2>&1 || true
     ufw allow 7005/tcp  >/dev/null 2>&1 || true
-    ufw allow 2000:65000/tcp >/dev/null 2>&1 || true
-    ufw allow 2000:65000/udp >/dev/null 2>&1 || true
-    ok "Firewall rules applied — full 2000-65000 range opened for forwarded ports"
+    ufw allow 1:65535/tcp >/dev/null 2>&1 || true
+    ufw allow 1:65535/udp >/dev/null 2>&1 || true
+    ok "Firewall rules applied — full 1-65535 range opened for forwarded ports"
   else
     warn "ufw is not installed on this machine — skipping firewall rules. Open the needed ports manually (iptables / cloud provider security group / etc)."
   fi
