@@ -3,34 +3,25 @@
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
 #  - Version: v0.61.0 (latest stable)
 #  - TLS COMPLETELY REMOVED for maximum throughput & lowest CPU overhead
-#  - TCP & KCP optimized for bandwidth and speed
+#  - BANDWIDTH BOTTLENECK FIXED: tcpMux disabled in TCP mode / QUIC native multiplexing
 #  - Auto-fixes DNS, port conflicts, and applies aggressive sysctl tuning
 #  - Menu: server, client, status, uninstall
 #
-#  OPTIMIZATIONS vs previous versions:
-#   1) TLS fully stripped — no prompts, no keys, no handshake overhead.
-#   2) TCP congestion & buffer tuning enhanced:
-#      - tcp_slow_start_after_idle = 0  (prevents speed drop after idle)
-#      - tcp_no_metrics_save = 1        (prevents stale cwnd cache)
-#      - tcp_moderate_rcvbuf = 1        (auto receive-buffer scaling)
-#      - tcp_fastopen = 3               (TFO client + server)
-#      - netdev_max_backlog = 65536
-#      - tcp_max_syn_backlog = 65536
-#      - tcp_fin_timeout = 10
-#      - tcp_max_tw_buckets = 2000000
-#   3) FRP transport tuned for throughput:
-#      - poolCount = 10  (was 5)
-#      - maxPoolCount = 100 (was 50)
-#      - tcpMuxKeepaliveInterval = 5s (was 10s)
-#      - tcpKeepalive = 5s (was 10s)
-#      - heartbeatInterval = 15s (was 30s)
-#      - heartbeatTimeout = 45s
-#      - dialServerTimeout = 30s
-#      - dialServerKeepalive = 30s
-#      - useCompression = true on every proxy (reduces bandwidth)
-#      - useEncryption = false (speed over obfuscation)
-#   4) Systemd: RestartSec=1, LimitNOFILE=2097152
-#   5) Existing configs are validated; invalid ones are backed up.
+#  ROOT CAUSE OF "BANDWIDTH LOCKED":
+#    transport.tcpMux = true forces ALL proxies through a SINGLE TCP stream.
+#    This creates a hard throughput ceiling (one cwnd, head-of-line blocking).
+#    FIX: TCP mode now sets tcpMux = false so each proxy gets independent connections.
+#    QUIC mode uses UDP multi-stream (no head-of-line blocking, natively multiplexed).
+#    KCP is kept only as fallback but strongly discouraged for bandwidth.
+#
+#  OPTIMIZATIONS:
+#   1) TCP mode: tcpMux = false  → each proxy = independent TCP connection
+#   2) QUIC mode: protocol = quic → UDP multi-stream, no HOL blocking
+#   3) KCP mode: protocol = kcp  → ONLY if TCP/QUIC blocked (20-30% throughput penalty)
+#   4) All proxy blocks: useCompression = false, useEncryption = false
+#   5) Strip any bandwidthLimit from existing configs (common cause of speed cap)
+#   6) Sysctl tuned for multi-connection throughput (tcp_slow_start_after_idle = 0, etc.)
+#   7) maxPoolCount = 200 (server), poolCount = 10 (client) for connection reuse
 #
 #  USAGE: sudo bash frp_setup.sh
 # =====================================================================
@@ -101,22 +92,17 @@ apply_sysctl() {
   info "Applying sysctl network tuning (throughput optimized)..."
   cat > /etc/sysctl.d/99-frp-tune.conf <<'EOF'
 # Core buffers
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65536
 
-# TCP memory & congestion
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
+# TCP memory & congestion (BBR)
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_moderate_rcvbuf = 1
-
-# Keepalive
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 5
 
 # Prevent speed collapse after idle / stale cwnd cache
 net.ipv4.tcp_slow_start_after_idle = 0
@@ -127,6 +113,11 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_max_syn_backlog = 65536
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_max_tw_buckets = 2000000
+
+# Keepalive (moderate)
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
 
 # Port range & reuse
 net.ipv4.tcp_tw_reuse = 1
@@ -153,6 +144,9 @@ diagnose_logs() {
   fi
   if echo "$LOG" | grep -qiE "connection refused"; then
     warn "Hint: connection refused -> frps is not listening on that IP/port yet, or a firewall is dropping it."
+  fi
+  if echo "$LOG" | grep -qiE "bandwidth limit|bandwidthLimit"; then
+    warn "Hint: bandwidth limit detected in config -> remove transport.bandwidthLimit from proxy blocks."
   fi
   return 0
 }
@@ -210,18 +204,36 @@ toml_set() {
   fi
 }
 
-# ---- Strip all TLS keys from a config -----------------------------
-strip_tls_keys() {
+# ---- Strip ALL problematic keys from existing configs ---------------
+strip_problematic_keys() {
   local FILE="$1"
+  # Remove TLS keys
   sed -i '/^tls_enable/d' "$FILE"
   sed -i '/^transport\.tls\./d' "$FILE"
+  # Remove bandwidth limits (common cause of speed cap)
+  sed -i '/^transport\.bandwidthLimit/d' "$FILE"
+  sed -i '/bandwidthLimit/d' "$FILE"
+  # Remove compression/encryption from proxy blocks if they exist globally
+  # (we handle per-proxy in generation, but strip global ones)
+  sed -i '/^transport\.useCompression/d' "$FILE"
+  sed -i '/^transport\.useEncryption/d' "$FILE"
+}
+
+# ---- Ensure proxy blocks have compression=false, encryption=false --
+fix_proxy_blocks() {
+  local FILE="$1"
+  # This is a best-effort sed: after each [[proxies]] block, ensure
+  # useCompression and useEncryption are false if present.
+  # A simpler approach: replace any existing useCompression/useEncryption values.
+  sed -i -E 's/^transport\.useCompression\s*=\s*.*/transport.useCompression = false/' "$FILE"
+  sed -i -E 's/^transport\.useEncryption\s*=\s*.*/transport.useEncryption = false/' "$FILE"
 }
 
 # ===================== Main Menu ===================================
 echo -e "${CYAN}"
 echo "==================================================="
 echo "   FRP Reverse Tunnel - One-Click Setup"
-echo "      (v0.61.0 | NO-TLS | Speed Optimized)"
+echo "   (v0.61.0 | NO-TLS | Bandwidth Unlocked)"
 echo "==================================================="
 echo -e "${NC}"
 
@@ -320,15 +332,33 @@ ok "Binary installed."
 
 CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 
-# -------------------- Protocol choice only (NO TLS) ----------------
-read -rp "Use KCP (UDP-based; only if TCP is unstable)? [y/N]: " KCP_ANSWER
-if [[ "$KCP_ANSWER" =~ ^[Yy]$ ]]; then
-  PROTOCOL="kcp"
-  warn "IMPORTANT: Protocol (kcp) must be set IDENTICALLY on the server and the client."
-else
-  PROTOCOL="tcp"
-  ok "Using TCP (recommended for maximum throughput)."
+# -------------------- Protocol choice (NO TLS) ----------------------
+echo ""
+echo "Select transport protocol:"
+echo "  1) TCP  (MAXIMUM THROUGHPUT) — each proxy gets independent TCP connection"
+echo "  2) QUIC (RECOMMENDED) — UDP multi-stream, no head-of-line blocking, stable"
+echo "  3) KCP  (FALLBACK ONLY) — UDP-based, 20-30% bandwidth penalty, NOT for speed"
+read -rp "Choose [1-3]: " PROTO_CHOICE
+case "$PROTO_CHOICE" in
+  1) PROTOCOL="tcp"; USE_MUX="false" ;;
+  2) PROTOCOL="quic"; USE_MUX="false" ;;
+  3) PROTOCOL="kcp"; USE_MUX="false" ;;
+  *) fail "Invalid protocol choice." ;;
+esac
+
+if [[ "$PROTOCOL" == "kcp" ]]; then
+  warn "KCP reduces throughput by 20-30%. Only use if TCP/QUIC are blocked by your ISP."
 fi
+
+if [[ "$PROTOCOL" == "quic" ]]; then
+  ok "QUIC selected: native multi-stream over UDP, no bandwidth lock."
+fi
+
+if [[ "$PROTOCOL" == "tcp" ]]; then
+  ok "TCP selected: tcpMux = false — each proxy gets its own connection (no bandwidth ceiling)."
+fi
+
+warn "IMPORTANT: Protocol (${PROTOCOL}) must be set IDENTICALLY on server and client."
 
 # ------------------------------------------------------------------
 if [[ "$ROLE" == "server" ]]; then
@@ -337,18 +367,16 @@ if [[ "$ROLE" == "server" ]]; then
   validate_or_backup_config "frps" "$CONFIG_PATH"
 
   if [[ -f "$CONFIG_PATH" ]]; then
-    ok "Updating speed/stability parameters in existing config..."
-    strip_tls_keys "$CONFIG_PATH"
+    ok "Updating config for ${PROTOCOL} mode..."
+    strip_problematic_keys "$CONFIG_PATH"
     toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
-    toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
-    toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "5"
-    toml_set "$CONFIG_PATH" "transport.tcpKeepalive" "5"
-    toml_set "$CONFIG_PATH" "transport.maxPoolCount" "100"
-    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "45"
+    toml_set "$CONFIG_PATH" "transport.maxPoolCount" "200"
+    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "90"
+    toml_set "$CONFIG_PATH" "transport.udpPacketSize" "1500"
+    fix_proxy_blocks "$CONFIG_PATH"
 
     BIND_PORT=$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)
     BIND_PORT="${BIND_PORT:-7001}"
-    if grep -q '^kcpBindPort' "$CONFIG_PATH"; then IS_KCP=1; else IS_KCP=0; fi
   else
     BIND_PORT=$(pick_free_port "7001" "Bind port for tunnel control")
 
@@ -363,14 +391,10 @@ tcpmuxHTTPConnectPort = 7005
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport (speed optimized) ----
-transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 5
-transport.tcpKeepalive = 5
-transport.maxPoolCount = 100
-
-# ---- Heartbeat ----
-transport.heartbeatTimeout = 45
+# ---- Transport (bandwidth unlocked) ----
+transport.maxPoolCount = 200
+transport.heartbeatTimeout = 90
+transport.udpPacketSize = 1500
 
 allowPorts = [ { start = 1, end = 65535 } ]
 maxPortsPerClient = 0
@@ -380,27 +404,38 @@ log.level = "info"
 log.maxDays = 7
 detailedErrorsToClient = true
 EOF
+
+    if [[ "$PROTOCOL" == "tcp" ]]; then
+      echo "transport.tcpMux = false" >> "$CONFIG_PATH"
+      echo "transport.tcpKeepalive = 7200" >> "$CONFIG_PATH"
+    fi
+
+    if [[ "$PROTOCOL" == "quic" ]]; then
+      echo "quicBindPort = ${BIND_PORT}" >> "$CONFIG_PATH"
+      echo "transport.quic.keepalivePeriod = 10" >> "$CONFIG_PATH"
+      echo "transport.quic.maxIdleTimeout = 60" >> "$CONFIG_PATH"
+      echo "transport.quic.maxIncomingStreams = 100000" >> "$CONFIG_PATH"
+    fi
+
     if [[ "$PROTOCOL" == "kcp" ]]; then
       echo "kcpBindPort = ${BIND_PORT}" >> "$CONFIG_PATH"
-      IS_KCP=1
-    else
-      IS_KCP=0
     fi
-    ok "Server config created."
+
+    ok "Server config created for ${PROTOCOL}."
   fi
 
   if [[ "$UFW_AVAIL" -eq 1 ]]; then
     ufw allow "${BIND_PORT}"/tcp >/dev/null 2>&1 || true
-    if [[ "${IS_KCP:-0}" -eq 1 ]]; then
+    if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
       ufw allow "${BIND_PORT}"/udp >/dev/null 2>&1 || true
-      ok "Opened ${BIND_PORT}/udp for KCP."
+      ok "Opened ${BIND_PORT}/udp for ${PROTOCOL}."
     fi
     ufw allow 8080/tcp >/dev/null 2>&1 || true
     ufw allow 8443/tcp >/dev/null 2>&1 || true
     ufw allow 7005/tcp >/dev/null 2>&1 || true
     ok "Firewall (ufw) rules applied."
   else
-    warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using KCP)."
+    warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using QUIC/KCP)."
   fi
 fi
 
@@ -411,17 +446,26 @@ if [[ "$ROLE" == "client" ]]; then
   validate_or_backup_config "frpc" "$CONFIG_PATH"
 
   if [[ -f "$CONFIG_PATH" ]]; then
-    ok "Updating speed/stability parameters in existing config..."
-    strip_tls_keys "$CONFIG_PATH"
+    ok "Updating config for ${PROTOCOL} mode..."
+    strip_problematic_keys "$CONFIG_PATH"
     toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
-    toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
-    toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "5"
-    toml_set "$CONFIG_PATH" "transport.poolCount" "10"
-    toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "15"
-    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "45"
-    toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "30"
-    toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "30"
     toml_set "$CONFIG_PATH" "transport.protocol" "\"${PROTOCOL}\""
+    toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "10"
+    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "90"
+    toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "30"
+    toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "7200"
+    toml_set "$CONFIG_PATH" "transport.udpPacketSize" "1500"
+    fix_proxy_blocks "$CONFIG_PATH"
+
+    if [[ "$PROTOCOL" == "tcp" ]]; then
+      toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
+      toml_set "$CONFIG_PATH" "transport.poolCount" "10"
+    fi
+
+    if [[ "$PROTOCOL" == "quic" ]]; then
+      toml_set "$CONFIG_PATH" "transport.quic.keepalivePeriod" "10"
+      toml_set "$CONFIG_PATH" "transport.quic.maxIdleTimeout" "60"
+    fi
 
     SERVER_ADDR=$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || echo "")
     SERVER_PORT=$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo "")
@@ -446,7 +490,7 @@ type = \"tcp\"
 localIP = \"127.0.0.1\"
 localPort = ${PORT}
 remotePort = ${PORT}
-transport.useCompression = true
+transport.useCompression = false
 transport.useEncryption = false
 "
     done
@@ -460,24 +504,35 @@ loginFailExit = false
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport (speed optimized) ----
+# ---- Transport (bandwidth unlocked) ----
 transport.protocol = "${PROTOCOL}"
-transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 5
-transport.poolCount = 10
-
-# ---- Heartbeat (keeps NAT/firewall from dropping idle tunnel) ----
-transport.heartbeatInterval = 15
-transport.heartbeatTimeout = 45
-
-# ---- Connection timeouts ----
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 90
 transport.dialServerTimeout = 30
-transport.dialServerKeepalive = 30
+transport.dialServerKeepalive = 7200
+transport.udpPacketSize = 1500
+EOF
+
+    if [[ "$PROTOCOL" == "tcp" ]]; then
+      cat >> "$CONFIG_PATH" <<'EOF'
+transport.tcpMux = false
+transport.poolCount = 10
+EOF
+    fi
+
+    if [[ "$PROTOCOL" == "quic" ]]; then
+      cat >> "$CONFIG_PATH" <<'EOF'
+transport.quic.keepalivePeriod = 10
+transport.quic.maxIdleTimeout = 60
+EOF
+    fi
+
+    cat >> "$CONFIG_PATH" <<EOF
 
 log.to = "console"
 log.level = "info"
 
-# ============= Auto-generated proxies (compression ON) =============
+# ============= Auto-generated proxies (NO bandwidth limit) =============
 ${PROXIES_BLOCK}
 EOF
 
@@ -487,7 +542,7 @@ EOF
     ok "Client config created at $CONFIG_PATH."
 
     info "Testing reachability to ${SERVER_ADDR}:${SERVER_PORT} (${PROTOCOL})..."
-    if [[ "$PROTOCOL" == "kcp" ]]; then
+    if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
       if command -v nc >/dev/null 2>&1; then
         if nc -uzw3 "${SERVER_ADDR}" "${SERVER_PORT}" 2>/dev/null; then
           ok "UDP port appears reachable (best-effort; UDP checks are not fully reliable)."
