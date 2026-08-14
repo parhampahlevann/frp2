@@ -14,6 +14,9 @@
 #  - Menu: install server / install client / status / full uninstall
 #  - Creates a self-healing systemd service (auto-restart)
 #
+#  TCP-ONLY mode: UDP support has been completely removed for stability.
+#  All forwarded ports are TCP only.
+#
 #  USAGE (just run it, it will ask you what to do):
 #     sudo bash frp_setup.sh
 # =====================================================================
@@ -229,8 +232,8 @@ if [[ "$ROLE" == "uninstall" ]]; then
   if command -v ufw >/dev/null 2>&1; then
     info "Removing firewall rules added by this script..."
     for RULE in \
-      "7001/tcp" "7001/udp" "8080/tcp" "8443/tcp" "7005/tcp" \
-      "2000:65000/tcp" "2000:65000/udp"
+      "7001/tcp" "8080/tcp" "8443/tcp" "7005/tcp" \
+      "2000:65000/tcp"
     do
       ufw delete allow "$RULE" >/dev/null 2>&1 || true
     done
@@ -349,17 +352,13 @@ auth.token = "${AUTH_TOKEN}"
 # connection instead.
 transport.tcpMux = false
 # tcpKeepalive is the OS-level TCP keepalive probe interval in seconds.
-# The old default (7200s = 2 hours) is the Linux kernel default and is
-# useless for catching a tunnel that drops within seconds — the OS would
-# not even send a first probe until 2 hours in. 30s means a dead link on
-# a flaky/censored route gets detected and the connection recycled fast.
-transport.tcpKeepalive = 30
+# Lowered to 15s to detect dead connections faster.
+transport.tcpKeepalive = 15
 # Raised to comfortably cover several proxies each requesting their own
 # pool of pre-dialed connections (client-side poolCount = 20 per proxy).
 transport.maxPoolCount = 100
-transport.heartbeatTimeout = 90
-# NOTE: "transport.qos" is intentionally NOT set here — newer frp releases
-# reject it with "json: unknown field \"qos\"" and refuse to start.
+# Reduced heartbeat timeout to 60s to close stale connections sooner.
+transport.heartbeatTimeout = 60
 
 allowPorts = [
   { start = 1, end = 65535 }
@@ -385,8 +384,7 @@ EOF
     ufw allow 8443/tcp  >/dev/null 2>&1 || true
     ufw allow 7005/tcp  >/dev/null 2>&1 || true
     ufw allow 1:65535/tcp >/dev/null 2>&1 || true
-    ufw allow 1:65535/udp >/dev/null 2>&1 || true
-    ok "Firewall rules applied — full 1-65535 range opened for forwarded ports"
+    ok "Firewall rules applied — full 1-65535 TCP range opened for forwarded ports"
   else
     warn "ufw is not installed on this machine — skipping firewall rules. Open the needed ports manually (iptables / cloud provider security group / etc)."
   fi
@@ -409,11 +407,9 @@ if [[ "$ROLE" == "client" ]]; then
 
     # ---- ask which ports need to be forwarded (like the original script) ----
     echo ""
-    echo "Which ports do you want to forward through the tunnel?"
+    echo "Which TCP ports do you want to forward through the tunnel?"
     echo "Enter them comma-separated, e.g.:  80,443,2053,2087"
     read -rp "Ports: " PORTS_INPUT
-    read -rp "Protocol for these ports? [tcp/udp/both] (default tcp): " PORT_PROTO
-    PORT_PROTO="${PORT_PROTO:-tcp}"
 
     # ---- compression / encryption: always off ------------------------
     # useCompression runs every packet through compression before it goes
@@ -427,7 +423,7 @@ if [[ "$ROLE" == "client" ]]; then
     USE_ENCRYPTION="false"
     USE_COMPRESSION="false"
 
-    # build the [[proxies]] blocks dynamically from user input
+    # build the [[proxies]] blocks dynamically from user input (TCP only)
     PROXIES_BLOCK=""
     IFS=',' read -ra PORT_ARR <<< "$PORTS_INPUT"
     for RAW_PORT in "${PORT_ARR[@]}"; do
@@ -438,8 +434,7 @@ if [[ "$ROLE" == "client" ]]; then
         continue
       fi
 
-      if [[ "$PORT_PROTO" == "tcp" || "$PORT_PROTO" == "both" ]]; then
-        PROXIES_BLOCK+="
+      PROXIES_BLOCK+="
 [[proxies]]
 name = \"tcp-${PORT}\"
 type = \"tcp\"
@@ -448,33 +443,18 @@ localPort = ${PORT}
 remotePort = ${PORT}
 transport.useEncryption = ${USE_ENCRYPTION}
 transport.useCompression = ${USE_COMPRESSION}
-# Loosened from 3s/3fails (30s total) to 5s/5fails (~25-30s of SUSTAINED
-# failure, not one slow response) — the tight version was flapping the
-# proxy offline on any brief local CPU/latency blip, which looked like
-# random disconnects from the outside.
+# Health check with slightly stricter failure detection
 healthCheck.type = \"tcp\"
 healthCheck.intervalSeconds = 10
 healthCheck.timeoutSeconds = 5
-healthCheck.maxFailed = 5
+healthCheck.maxFailed = 3
 "
-      fi
-
-      if [[ "$PORT_PROTO" == "udp" || "$PORT_PROTO" == "both" ]]; then
-        PROXIES_BLOCK+="
-[[proxies]]
-name = \"udp-${PORT}\"
-type = \"udp\"
-localIP = \"127.0.0.1\"
-localPort = ${PORT}
-remotePort = ${PORT}
-"
-      fi
     done
 
     if [[ -z "$PROXIES_BLOCK" ]]; then
       warn "No valid ports entered — you'll need to add [[proxies]] blocks manually later."
     else
-      ok "Will forward these ports (${PORT_PROTO}): ${PORTS_INPUT}"
+      ok "Will forward these TCP ports: ${PORTS_INPUT}"
     fi
 
     cat > "$CONFIG_PATH" <<EOF
@@ -496,19 +476,20 @@ transport.tcpMux = false
 # fresh TCP handshake's latency — matters more now that every proxy has
 # its own connection instead of sharing one mux'd stream.
 transport.poolCount = 20
-transport.heartbeatInterval = 30
-transport.heartbeatTimeout = 90
+# More aggressive heartbeat for faster failure detection
+transport.heartbeatInterval = 20
+transport.heartbeatTimeout = 60
 # Same fix as the server side: 7200s (2h) is the kernel default and won't
-# catch a dropped tunnel for hours. 30s lets a dead connection get noticed
+# catch a dropped tunnel for hours. 15s lets a dead connection get noticed
 # and re-dialed quickly instead of sitting silently broken.
-transport.dialServerTimeout = 10
-transport.dialServerKeepAlive = 30
+transport.dialServerTimeout = 15
+transport.dialServerKeepAlive = 15
 
 log.to = "console"
 log.level = "info"
 
 # =====================================================================
-#  Auto-generated proxies for the ports you entered (${PORT_PROTO})
+#  Auto-generated proxies for the ports you entered (TCP only)
 # =====================================================================
 ${PROXIES_BLOCK}
 # =====================================================================
