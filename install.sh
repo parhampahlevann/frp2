@@ -462,7 +462,7 @@ if [[ "$ROLE" == "client" ]]; then
       warn "These local ports have nothing listening on them: ${NOT_LISTENING[*]}"
       warn "The tunnel itself will still connect fine, but frpc will keep marking"
       warn "these specific proxies as offline (and logging 'connection refused')"
-      warn "until the local service (e.g. xray/v2ray) is actually running and"
+      warn "until the local service (e.g. x-ui, xray, v2ray) is actually running and"
       warn "listening on that exact port. This is NOT a network/tunnel problem —"
       warn "it will clear up by itself the moment the local app is up and"
       warn "listening on the right port."
@@ -479,7 +479,7 @@ if [[ "$ROLE" == "client" ]]; then
     # If that local service also runs under systemd, wiring an explicit
     # After=/Wants= dependency here removes that race entirely.
     echo ""
-    read -rp "Local systemd service name frpc should wait for, if any (e.g. xray) — leave blank if none: " LOCAL_DEP_SERVICE
+    read -rp "Local systemd service name frpc should wait for, if any (e.g. x-ui) — leave blank if none: " LOCAL_DEP_SERVICE
     LOCAL_DEP_SERVICE="$(echo "$LOCAL_DEP_SERVICE" | tr -d '[:space:]')"
 
     # ---- compression / encryption: OFF by default -------------------
