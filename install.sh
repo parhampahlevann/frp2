@@ -372,7 +372,6 @@ if [[ "$ROLE" == "server" ]]; then
     toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
     toml_set "$CONFIG_PATH" "transport.maxPoolCount" "200"
     toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "90"
-    toml_set "$CONFIG_PATH" "transport.udpPacketSize" "1500"
     fix_proxy_blocks "$CONFIG_PATH"
 
     BIND_PORT=$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)
@@ -394,7 +393,6 @@ auth.token = "${AUTH_TOKEN}"
 # ---- Transport (bandwidth unlocked) ----
 transport.maxPoolCount = 200
 transport.heartbeatTimeout = 90
-transport.udpPacketSize = 1500
 
 allowPorts = [ { start = 1, end = 65535 } ]
 maxPortsPerClient = 0
@@ -454,7 +452,6 @@ if [[ "$ROLE" == "client" ]]; then
     toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "90"
     toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "30"
     toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "7200"
-    toml_set "$CONFIG_PATH" "transport.udpPacketSize" "1500"
     fix_proxy_blocks "$CONFIG_PATH"
 
     if [[ "$PROTOCOL" == "tcp" ]]; then
@@ -510,7 +507,6 @@ transport.heartbeatInterval = 10
 transport.heartbeatTimeout = 90
 transport.dialServerTimeout = 30
 transport.dialServerKeepalive = 7200
-transport.udpPacketSize = 1500
 EOF
 
     if [[ "$PROTOCOL" == "tcp" ]]; then
