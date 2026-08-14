@@ -5,7 +5,11 @@
 #  - Always fetches the LATEST release from GitHub automatically
 #  - Works on Ubuntu 18.04 / 20.04 / 22.04 / 24.04+ (any systemd distro)
 #  - Supports amd64 / arm64 / armv7
-#  - Auto-fixes the common immutable /etc/resolv.conf / resolvconf dpkg bug
+#  - Auto-fixes immutable /etc/resolv.conf (resolvconf dpkg bug)
+#  - Auto-fixes broken DNS resolution (falls back to 1.1.1.1 / 8.8.8.8)
+#  - Detects port conflicts BEFORE binding (e.g. a provider-managed frps
+#    already sitting on the port you picked) instead of looping/crashing
+#  - Verifies the service actually stays up after start, not just "started"
 #  - Interactively asks which ports to forward (like the original script)
 #  - Menu: install server / install client / status / full uninstall
 #  - Creates a self-healing systemd service (auto-restart)
@@ -34,6 +38,91 @@ if [[ -e /etc/resolv.conf ]] && command -v chattr >/dev/null 2>&1; then
   chattr -i /etc/resolv.conf 2>/dev/null || true
 fi
 dpkg --configure -a >/dev/null 2>&1 || true
+
+# ---- DNS self-check / auto-repair --------------------------------
+# Fixes "Temporary failure resolving..." / "Could not resolve host"
+# errors on VPS/containers with a broken or empty resolver config.
+# Uses getent (pure libc, no extra package needed) so it works even
+# before curl/jq are installed.
+check_dns() {
+  getent hosts github.com >/dev/null 2>&1
+}
+
+fix_dns_if_needed() {
+  if check_dns; then
+    return 0
+  fi
+  warn "DNS resolution is broken on this machine (can't resolve hostnames). Attempting an automatic fix..."
+
+  if command -v chattr >/dev/null 2>&1; then
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+  fi
+  if [[ -L /etc/resolv.conf || -e /etc/resolv.conf ]]; then
+    cp -L /etc/resolv.conf "/etc/resolv.conf.bak.$(date +%s)" 2>/dev/null || true
+    rm -f /etc/resolv.conf
+  fi
+  cat > /etc/resolv.conf <<'EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 1.0.0.1
+EOF
+
+  sleep 1
+  if check_dns; then
+    ok "DNS fixed using public resolvers (1.1.1.1 / 8.8.8.8)."
+  else
+    warn "DNS is still broken after the automatic fix."
+    warn "This usually means the machine has no working internet route or its provider blocks outbound DNS/UDP:53."
+    warn "Check: ping 1.1.1.1   and   cat /etc/resolv.conf   — fix networking first, then re-run this script."
+  fi
+}
+
+fix_dns_if_needed
+
+# ---- Port-conflict helpers -----------------------------------------
+# Learned the hard way: some VPS providers run their OWN frps (or other
+# service) on common ports like 7000 as part of their network stack,
+# started outside systemd (rc.local, a custom script, etc). If we blindly
+# bind to that port, our service loops forever with "address already in
+# use", and worse, a client can end up handshaking with the WRONG server
+# entirely, which shows up as a confusing "unexpected EOF". So: always
+# check before we commit a port to the config.
+port_in_use() {
+  local PORT="$1"
+  # column 4 of `ss -tuln` is "Local Address:Port" (not column 5, which is
+  # the peer address) — using the wrong column silently never detects
+  # real conflicts, which is exactly the bug we hit with the provider's
+  # frps already sitting on port 7000.
+  ss -tuln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}\$"
+}
+
+describe_port_owner() {
+  local PORT="$1"
+  ss -tulpn 2>/dev/null | grep -E ":${PORT}\b" || true
+}
+
+pick_free_port() {
+  # $1 = suggested/default port, $2 = human label for prompts
+  local DEFAULT_PORT="$1"
+  local LABEL="$2"
+  local CHOSEN="$DEFAULT_PORT"
+
+  while true; do
+    read -rp "${LABEL} [${CHOSEN}]: " INPUT_PORT
+    CHOSEN="${INPUT_PORT:-$CHOSEN}"
+
+    if port_in_use "$CHOSEN"; then
+      warn "Port ${CHOSEN} is already in use by another process on this machine:"
+      describe_port_owner "$CHOSEN"
+      warn "This is often something the VPS provider itself runs (not related to this script)."
+      echo "Pick a different port instead (e.g. $((CHOSEN + 1)))."
+      CHOSEN=$((CHOSEN + 1))
+      continue
+    fi
+    break
+  done
+  echo "$CHOSEN"
+}
 
 echo -e "${CYAN}"
 echo "==================================================="
@@ -103,13 +192,14 @@ fi
 # ===================================================================
 if [[ "$ROLE" == "uninstall" ]]; then
   echo ""
-  warn "This will completely remove frps AND frpc from this machine:"
-  echo "    - stop & disable both systemd services"
-  echo "    - delete service unit files"
+  warn "This will completely remove frps AND frpc that THIS SCRIPT installed:"
+  echo "    - stop & disable the frps.service / frpc.service systemd units"
+  echo "    - delete those service unit files"
   echo "    - delete binaries (/usr/local/bin/frps, /usr/local/bin/frpc)"
   echo "    - delete configs (/etc/frp)"
   echo "    - delete logs (/var/log/frp)"
   echo "    - remove the firewall rules this script added"
+  warn "It will NOT touch any other frps@/frpc@ instances your VPS provider may run separately."
   read -rp "Are you sure? Type 'yes' to confirm: " CONFIRM
   [[ "$CONFIRM" == "yes" ]] || fail "Uninstall cancelled."
 
@@ -144,13 +234,12 @@ if [[ "$ROLE" == "uninstall" ]]; then
     do
       ufw delete allow "$RULE" >/dev/null 2>&1 || true
     done
-    # also remove a possible custom bind port rule (best-effort, safe no-op if not found)
-    ok "Firewall rules cleaned up (default set — remove any custom port manually if you changed it)"
+    ok "Default firewall rules cleaned up (remove any custom port manually if you changed it)"
   fi
 
   echo ""
   echo -e "${GREEN}=====================================================${NC}"
-  echo -e "${GREEN} FRP has been completely removed from this machine.${NC}"
+  echo -e "${GREEN} FRP (installed by this script) has been removed.${NC}"
   echo -e "${GREEN}=====================================================${NC}"
   exit 0
 fi
@@ -168,15 +257,15 @@ fi
 ok "Required dependencies ready"
 
 # ---- optional firewall rules via ufw, only if it's already installed.
-#      We never install ufw ourselves anymore — this script's only job
-#      is the tunnel itself (frps <-> frpc), not managing your firewall
-#      or pulling in extra packages like resolvconf. ----
+#      We never install ufw ourselves — this script's only job is the
+#      tunnel itself (frps <-> frpc), not managing your firewall or
+#      pulling in extra packages like resolvconf. ----
 UFW_OK=0
 if command -v ufw >/dev/null 2>&1; then
   UFW_OK=1
 fi
 
-# ------------------------- detect arch -------------------------------
+# ---- detect architecture -------------------------------------------
 ARCH_RAW="$(uname -m)"
 case "$ARCH_RAW" in
   x86_64)   FRP_ARCH="amd64" ;;
@@ -187,9 +276,10 @@ esac
 ok "Detected architecture: $FRP_ARCH"
 
 # --------------------- fetch latest release ---------------------------
+fix_dns_if_needed   # safety net: re-check right before we need real network access
 info "Fetching the latest FRP release from GitHub..."
 LATEST_TAG="$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)"
-[[ -n "$LATEST_TAG" && "$LATEST_TAG" != "null" ]] || fail "Could not fetch latest release. Check server internet connection."
+[[ -n "$LATEST_TAG" && "$LATEST_TAG" != "null" ]] || fail "Could not fetch latest release. DNS/network to github.com is still not working on this machine — fix connectivity and re-run."
 VERSION="${LATEST_TAG#v}"
 ok "Latest version: $LATEST_TAG"
 
@@ -220,9 +310,12 @@ CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 if [[ "$ROLE" == "server" ]]; then
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config found at $CONFIG_PATH — keeping it untouched."
+    BIND_PORT="$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo 7000)"
   else
-    read -rp "Bind port for tunnel control [7000]: " BIND_PORT
-    BIND_PORT="${BIND_PORT:-7000}"
+    echo ""
+    echo "Choosing the tunnel port. If your VPS provider already runs something"
+    echo "on the default port (7000), this will detect it and let you pick another."
+    BIND_PORT="$(pick_free_port 7000 "Bind port for tunnel control")"
     AUTH_TOKEN="123"
     warn "Auth token is set to the default value: 123 (change it later in ${CONFIG_PATH} for real security)"
 
@@ -247,7 +340,8 @@ transport.tcpMuxKeepaliveInterval = 30
 transport.tcpKeepalive = 7200
 transport.maxPoolCount = 50
 transport.heartbeatTimeout = 90
-transport.qos = 0
+# NOTE: "transport.qos" is intentionally NOT set here — newer frp releases
+# reject it with "json: unknown field \"qos\"" and refuse to start.
 
 allowPorts = [
   { start = 2000, end = 65000 }
@@ -261,14 +355,15 @@ detailedErrorsToClient = true
 EOF
     ok "Config generated at $CONFIG_PATH"
     echo -e "${YELLOW}--------------------------------------------------${NC}"
+    echo -e "  Bind port:   ${GREEN}${BIND_PORT}${NC}  (use this on the client!)"
     echo -e "  Auth token:  ${GREEN}${AUTH_TOKEN}${NC}  (use this on the client!)"
     echo -e "${YELLOW}--------------------------------------------------${NC}"
   fi
 
   if [[ "$UFW_OK" -eq 1 ]]; then
     info "Opening firewall ports (ufw)..."
-    ufw allow "${BIND_PORT:-7000}"/tcp  >/dev/null 2>&1 || true
-    ufw allow "${BIND_PORT:-7000}"/udp  >/dev/null 2>&1 || true
+    ufw allow "${BIND_PORT}"/tcp  >/dev/null 2>&1 || true
+    ufw allow "${BIND_PORT}"/udp  >/dev/null 2>&1 || true
     ufw allow 8080/tcp  >/dev/null 2>&1 || true
     ufw allow 8443/tcp  >/dev/null 2>&1 || true
     ufw allow 7005/tcp  >/dev/null 2>&1 || true
@@ -286,6 +381,8 @@ fi
 if [[ "$ROLE" == "client" ]]; then
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config found at $CONFIG_PATH — keeping it untouched."
+    SERVER_ADDR="$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || true)"
+    SERVER_PORT="$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)"
   else
     read -rp "Server public IP or domain: " SERVER_ADDR
     read -rp "Server bind port [7000]: " SERVER_PORT
@@ -425,26 +522,45 @@ ${PROXIES_BLOCK}
 EOF
     ok "Config generated at $CONFIG_PATH"
   fi
+
+  # ---- Live reachability test: catches wrong IP/port or a closed
+  # firewall/security-group BEFORE the service is even started, instead
+  # of you having to dig through journalctl later. ----
+  if [[ -n "${SERVER_ADDR:-}" && -n "${SERVER_PORT:-}" ]]; then
+    info "Testing connectivity to ${SERVER_ADDR}:${SERVER_PORT}..."
+    if timeout 5 bash -c "cat < /dev/null > /dev/tcp/${SERVER_ADDR}/${SERVER_PORT}" 2>/dev/null; then
+      ok "Server is reachable on ${SERVER_ADDR}:${SERVER_PORT}"
+    else
+      warn "Could NOT reach ${SERVER_ADDR}:${SERVER_PORT} from this machine."
+      warn "The tunnel will fail to connect until this is fixed. Check:"
+      warn "  1) frps is actually running on the server:  systemctl status frps"
+      warn "  2) the port is open in the server's firewall / cloud security group"
+      warn "  3) serverAddr/serverPort in ${CONFIG_PATH} are correct"
+      warn "  4) the port isn't already used by something ELSE on the server (e.g."
+      warn "     a provider-managed frps/network agent) — pick a different port if so"
+    fi
+  fi
 fi
 
 # ===================================================================
 #                        SYSTEMD SERVICE
 # ===================================================================
 SERVICE_FILE="/etc/systemd/system/${BIN_NAME}.service"
-if [[ ! -f "$SERVICE_FILE" ]]; then
-  info "Creating systemd service..."
-  cat > "$SERVICE_FILE" <<EOF
+# Always (re)write the service file — unlike the config, it holds no secrets
+# or user customization, and regenerating it keeps it in sync with fixes.
+info "Writing systemd service..."
+cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=frp ${ROLE} (${BIN_NAME})
 After=network.target network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=root
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=0
 ExecStart=/usr/local/bin/${BIN_NAME} -c ${CONFIG_PATH}
 LimitNOFILE=1048576
 NoNewPrivileges=true
@@ -452,23 +568,40 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-  ok "Service created: $SERVICE_FILE"
-else
-  ok "Service already exists, reusing it"
-fi
+ok "Service written: $SERVICE_FILE"
 
 systemctl daemon-reload
 systemctl enable "${BIN_NAME}" >/dev/null 2>&1
 systemctl restart "${BIN_NAME}"
-sleep 1
+sleep 2
 
+# ---- Post-start verification: don't just say "started", PROVE it's
+# actually still running a couple seconds later, and give an immediate,
+# specific hint if it's not (this is what would have caught every bug
+# we hit today: qos field, port conflicts, orphaned processes). ----
 echo ""
+if systemctl is-active --quiet "${BIN_NAME}"; then
+  ok "${BIN_NAME} is up and RUNNING"
+else
+  warn "${BIN_NAME} is NOT staying up. Last log lines:"
+  journalctl -u "${BIN_NAME}" -n 15 --no-pager || true
+  echo ""
+  if journalctl -u "${BIN_NAME}" -n 15 --no-pager 2>/dev/null | grep -qi "address already in use"; then
+    warn "That port is already used by something else on this machine."
+    warn "Re-run this script and pick a different port when asked, or manually"
+    warn "check with:  sudo ss -tulpn | grep <port>   to see who owns it."
+  elif journalctl -u "${BIN_NAME}" -n 15 --no-pager 2>/dev/null | grep -qi "unknown field"; then
+    warn "The config has a field this frp version doesn't recognize."
+    warn "Check ${CONFIG_PATH} against the version installed: ${BIN_NAME} -v vs the toml keys."
+  fi
+fi
+
 info "Service status:"
 systemctl --no-pager status "${BIN_NAME}" | head -n 8 || true
 
 echo ""
 echo -e "${GREEN}=====================================================${NC}"
-echo -e "${GREEN} ${BIN_NAME} installed/updated to ${LATEST_TAG} successfully${NC}"
+echo -e "${GREEN} ${BIN_NAME} installed/updated to ${LATEST_TAG}${NC}"
 echo -e "${GREEN}=====================================================${NC}"
 echo "  Config file : ${CONFIG_PATH}"
 echo "  Live logs   : journalctl -u ${BIN_NAME} -f"
