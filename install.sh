@@ -2,10 +2,10 @@
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
 #  - Fixed version: v0.57.0 (stable)
-#  - Optimized for low latency and jitter
+#  - Optimized for stable long-lived connections and low jitter
 #  - Supports TLS & KCP (optional)
-#  - Pure TCP tunnel default — UDP completely removed
-#  - Health Check completely disabled
+#  - TCP tunnel default; KCP remains optional for problematic TCP paths
+#  - Proxy health checks disabled by default
 #  - Auto-fixes DNS, port conflicts, and applies sysctl tuning
 #  - Menu: server, client, status, uninstall
 #
@@ -238,7 +238,6 @@ if [[ "$ROLE" == "uninstall" ]]; then
   ufw delete allow 7001/udp 2>/dev/null || true
   ufw delete allow 8080/tcp 2>/dev/null || true
   ufw delete allow 8443/tcp 2>/dev/null || true
-  ufw delete allow 1:65535/tcp 2>/dev/null || true
   echo -e "${GREEN}Removed.${NC}"
   exit 0
 fi
@@ -282,14 +281,14 @@ ok "Binary installed."
 CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 
 # -------------------- Ask for TLS and protocol ---------------------
-read -rp "Enable TLS (encryption) to avoid DPI? [y/N]: " TLS_ANSWER
-if [[ "$TLS_ANSWER" =~ ^[Yy]$ ]]; then
-  TLS_ENABLE="true"
-else
+read -rp "Enable TLS (recommended) [Y/n]: " TLS_ANSWER
+if [[ "$TLS_ANSWER" =~ ^[Nn]$ ]]; then
   TLS_ENABLE="false"
+else
+  TLS_ENABLE="true"
 fi
 
-read -rp "Use KCP (UDP-based, may bypass some firewalls)? [y/N]: " KCP_ANSWER
+read -rp "Use KCP (UDP-based; only if TCP is unstable)? [y/N]: " KCP_ANSWER
 if [[ "$KCP_ANSWER" =~ ^[Yy]$ ]]; then
   PROTOCOL="kcp"
 else
@@ -332,10 +331,11 @@ auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
 # ---- Transport settings ----
-transport.tcpMux = false
-transport.tcpKeepalive = 30
-transport.maxPoolCount = 200
-transport.heartbeatTimeout = 90
+transport.tcpMux = true
+transport.tcpMuxKeepaliveInterval = 15
+transport.tcpKeepalive = 15
+transport.maxPoolCount = 5
+transport.heartbeatTimeout = 60
 
 # ---- TLS (correct key for v0.57.0 is transport.tls.force) ----
 transport.tls.force = ${TLS_ENABLE}
@@ -366,7 +366,6 @@ EOF
     ufw allow 8080/tcp >/dev/null 2>&1 || true
     ufw allow 8443/tcp >/dev/null 2>&1 || true
     ufw allow 7005/tcp >/dev/null 2>&1 || true
-    ufw allow 1:65535/tcp >/dev/null 2>&1 || true
     ok "Firewall (ufw) rules applied."
   else
     warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using KCP)."
@@ -420,18 +419,20 @@ transport.useCompression = false
 # ===================== frpc.toml (client) =====================
 serverAddr = "${SERVER_ADDR}"
 serverPort = ${SERVER_PORT}
+loginFailExit = false
 
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
 # ---- Transport ----
 transport.protocol = "${PROTOCOL}"
-transport.tcpMux = false
-transport.poolCount = 2
-transport.heartbeatInterval = 30
-transport.heartbeatTimeout = 90
-transport.dialServerTimeout = 20
-transport.dialServerKeepAlive = 30
+transport.tcpMux = true
+transport.tcpMuxKeepaliveInterval = 15
+transport.poolCount = 0
+transport.heartbeatInterval = -1
+transport.heartbeatTimeout = 60
+transport.dialServerTimeout = 15
+transport.dialServerKeepalive = 15
 
 # ---- TLS (correct key for v0.57.0 is transport.tls.enable) ----
 transport.tls.enable = ${TLS_ENABLE}
@@ -491,6 +492,11 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
+# Validate the generated configuration before restarting the service.
+if ! "${BIN_NAME}" verify -c "${CONFIG_PATH}" >/tmp/${BIN_NAME}-verify.out 2>&1; then
+  cat /tmp/${BIN_NAME}-verify.out
+  fail "${BIN_NAME} configuration validation failed. Service was NOT restarted."
+fi
 systemctl enable "${BIN_NAME}" >/dev/null 2>&1 || true
 systemctl restart "${BIN_NAME}"
 sleep 3
