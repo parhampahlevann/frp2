@@ -361,6 +361,7 @@ auth.token = "${AUTH_TOKEN}"
 # ---- stability / performance tuning (fixes common disconnect bugs) ----
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
+# Explicit mux keepalive on the server; client uses the same interval.
 # tcpKeepalive is the OS-level TCP keepalive probe interval in seconds.
 # The old default (7200s = 2 hours) is the Linux kernel default and is
 # useless for catching a tunnel that drops within seconds — the OS would
@@ -459,6 +460,13 @@ if [[ "$ROLE" == "client" ]]; then
       if [[ "$ENABLE_COMP" =~ ^[Yy]$ ]]; then USE_COMPRESSION="true"; fi
     fi
 
+    # IMPORTANT: do not enable healthCheck by default. A TCP health check tests
+    # the LOCAL backend at 127.0.0.1:<port>, not the frps<->frpc tunnel. If the
+    # local service is not listening (connection refused), FRP marks that proxy
+    # unhealthy. This is exactly what the supplied logs show for 2053/7070/23902.
+    # Health checks can be added manually later when the backend is guaranteed to be
+    # continuously available or when using a load-balancing/HA design.
+
     # build the [[proxies]] blocks dynamically from user input
     PROXIES_BLOCK=""
     IFS=',' read -ra PORT_ARR <<< "$PORTS_INPUT"
@@ -480,14 +488,6 @@ localPort = ${PORT}
 remotePort = ${PORT}
 transport.useEncryption = ${USE_ENCRYPTION}
 transport.useCompression = ${USE_COMPRESSION}
-# Loosened from 3s/3fails (30s total) to 5s/5fails (~25-30s of SUSTAINED
-# failure, not one slow response) — the tight version was flapping the
-# proxy offline on any brief local CPU/latency blip, which looked like
-# random disconnects from the outside.
-healthCheck.type = \"tcp\"
-healthCheck.intervalSeconds = 10
-healthCheck.timeoutSeconds = 5
-healthCheck.maxFailed = 5
 "
       fi
 
@@ -527,7 +527,7 @@ transport.tcpMux = true
 # to one side sooner than the other.
 transport.tcpMuxKeepaliveInterval = 30
 transport.poolCount = 5
-transport.heartbeatInterval = 30
+transport.heartbeatInterval = -1
 transport.heartbeatTimeout = 90
 # Same fix as the server side: 7200s (2h) is the kernel default and won't
 # catch a dropped tunnel for hours. 30s lets a dead connection get noticed
