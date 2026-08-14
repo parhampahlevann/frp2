@@ -316,40 +316,22 @@ CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 if [[ "$ROLE" == "server" ]]; then
   if [[ -f "$CONFIG_PATH" ]]; then
     warn "Existing config found at $CONFIG_PATH — keeping it untouched."
-    BIND_PORT="$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo 443)"
+    BIND_PORT="$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo 7001)"
   else
     echo ""
-    read -rp "Which protocol will the client(s) mainly use? [tcp/wss] (default tcp): " SERVER_PROTO_HINT
-    SERVER_PROTO_HINT="${SERVER_PROTO_HINT:-tcp}"
-    if [[ "$SERVER_PROTO_HINT" == "wss" || "$SERVER_PROTO_HINT" == "websocket" ]]; then
-      DEFAULT_BIND_PORT=443
-      echo "Choosing the tunnel port. Default is 443 (blends in with normal HTTPS"
-      echo "traffic, which helps when using wss). If your VPS already runs a real"
-      echo "web server on 443, this will detect the conflict and let you pick another."
-    else
-      DEFAULT_BIND_PORT=7001
-      echo "Choosing the tunnel port. Default is 7001 for plain tcp. If your VPS"
-      echo "provider already runs something on that port, this will detect it and"
-      echo "let you pick another."
-    fi
-    BIND_PORT="$(pick_free_port "$DEFAULT_BIND_PORT" "Bind port for tunnel control")"
+    echo "Choosing the tunnel port. Default is 7001. If your VPS provider"
+    echo "already runs something on that port, this will detect it and let"
+    echo "you pick another."
+    BIND_PORT="$(pick_free_port 7001 "Bind port for tunnel control")"
     AUTH_TOKEN="123"
     warn "Auth token is set to the default value: 123 (change it later in ${CONFIG_PATH} for real security)"
 
     cat > "$CONFIG_PATH" <<EOF
 # ===================== frps.toml (server) =====================
 # Pure tunnel: no web dashboard / no panel — just server<->client traffic passthrough.
+# TCP only — this deployment intentionally does not use kcp/quic/websocket/wss.
 bindAddr = "0.0.0.0"
 bindPort = ${BIND_PORT}
-# NOTE: kcpBindPort / quicBindPort are intentionally left OFF by default.
-# Some VPS/container hosts (OpenVZ/Virtuozzo-style nodes especially) block
-# or pre-reserve the matching UDP port at the hypervisor level even though
-# it shows as free inside the container, which makes frps fail to start
-# with "bind: address already in use" for no visible reason. TCP alone
-# covers the default transport.protocol = "tcp" client setting. If you
-# want KCP/QUIC and your host supports it, uncomment these two lines:
-# kcpBindPort = ${BIND_PORT}
-# quicBindPort = ${BIND_PORT}
 
 vhostHTTPPort = 8080                # only used if you enable a proxy of type = http
 vhostHTTPSPort = 8443               # only used if you enable a proxy of type = https
@@ -372,7 +354,9 @@ transport.tcpMux = false
 # not even send a first probe until 2 hours in. 30s means a dead link on
 # a flaky/censored route gets detected and the connection recycled fast.
 transport.tcpKeepalive = 30
-transport.maxPoolCount = 50
+# Raised to comfortably cover several proxies each requesting their own
+# pool of pre-dialed connections (client-side poolCount = 20 per proxy).
+transport.maxPoolCount = 100
 transport.heartbeatTimeout = 90
 # NOTE: "transport.qos" is intentionally NOT set here — newer frp releases
 # reject it with "json: unknown field \"qos\"" and refuse to start.
@@ -397,7 +381,6 @@ EOF
   if [[ "$UFW_OK" -eq 1 ]]; then
     info "Opening firewall ports (ufw)..."
     ufw allow "${BIND_PORT}"/tcp  >/dev/null 2>&1 || true
-    ufw allow "${BIND_PORT}"/udp  >/dev/null 2>&1 || true
     ufw allow 8080/tcp  >/dev/null 2>&1 || true
     ufw allow 8443/tcp  >/dev/null 2>&1 || true
     ufw allow 7005/tcp  >/dev/null 2>&1 || true
@@ -419,15 +402,8 @@ if [[ "$ROLE" == "client" ]]; then
     SERVER_PORT="$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)"
   else
     read -rp "Server public IP or domain: " SERVER_ADDR
-    read -rp "Transport protocol [tcp/kcp/quic/websocket/wss] (default tcp): " TRANSPORT_PROTO
-    TRANSPORT_PROTO="${TRANSPORT_PROTO:-tcp}"
-    if [[ "$TRANSPORT_PROTO" == "wss" || "$TRANSPORT_PROTO" == "websocket" ]]; then
-      DEFAULT_SERVER_PORT=443
-    else
-      DEFAULT_SERVER_PORT=7001
-    fi
-    read -rp "Server bind port [${DEFAULT_SERVER_PORT}]: " SERVER_PORT
-    SERVER_PORT="${SERVER_PORT:-$DEFAULT_SERVER_PORT}"
+    read -rp "Server bind port [7001]: " SERVER_PORT
+    SERVER_PORT="${SERVER_PORT:-7001}"
     AUTH_TOKEN="123"
     warn "Auth token is set to the default value: 123 (must match the server, change later for real security)"
 
@@ -509,17 +485,17 @@ serverPort = ${SERVER_PORT}
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# tcp | kcp | quic | websocket | wss
-# If your network has packet loss, try kcp or quic for a more stable tunnel
-transport.protocol = "${TRANSPORT_PROTO}"
+# TCP only — no kcp/quic/websocket/wss.
+transport.protocol = "tcp"
 # Disabled to match frps — see the comment in frps.toml. With tcpMux off,
 # each proxy dials its own connection instead of sharing one, so a busy
 # proxy can no longer delay/jitter the others.
 transport.tcpMux = false
-# poolCount now actually matters (it's a no-op when tcpMux is on) — this
-# many connections per proxy are kept pre-dialed and ready, so a new
-# visitor doesn't pay a fresh handshake's latency.
-transport.poolCount = 5
+# poolCount = pre-dialed, ready-to-use connections kept per proxy. Raised
+# from the frp default so bursts of new connections don't each pay a
+# fresh TCP handshake's latency — matters more now that every proxy has
+# its own connection instead of sharing one mux'd stream.
+transport.poolCount = 20
 transport.heartbeatInterval = 30
 transport.heartbeatTimeout = 90
 # Same fix as the server side: 7200s (2h) is the kernel default and won't
