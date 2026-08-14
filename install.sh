@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
+#  - Fixed version: v0.57.0  (known stable release)
 #  - Pure TCP tunnel — NO UDP / NO Health Check / NO web dashboard
 #  - Optimized for stable latency (minimal jitter)
-#  - Always fetches the LATEST release from GitHub automatically
 #  - Works on Ubuntu 18.04 / 20.04 / 22.04 / 24.04+ (any systemd distro)
 #  - Supports amd64 / arm64 / armv7
 #  - Auto-fixes immutable /etc/resolv.conf & broken DNS
@@ -84,6 +84,7 @@ pick_free_port() {
 echo -e "${CYAN}"
 echo "==================================================="
 echo "        FRP Reverse Tunnel - One-Click Setup"
+echo "           (Fixed version: v0.57.0)"
 echo "==================================================="
 echo -e "${NC}"
 
@@ -186,26 +187,23 @@ case "$ARCH_RAW" in
 esac
 ok "Architecture: $FRP_ARCH"
 
-# --------------------- fetch latest release ---------------------------
-fix_dns_if_needed
-info "Fetching latest FRP release..."
-LATEST_TAG="$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)"
-[[ -n "$LATEST_TAG" && "$LATEST_TAG" != "null" ]] || fail "Failed to fetch release."
-VERSION="${LATEST_TAG#v}"
-ok "Latest version: $LATEST_TAG"
+# --------------------- FIXED VERSION: v0.57.0 ------------------------
+FRP_VERSION="0.57.0"
+FRP_TAG="v${FRP_VERSION}"
+ok "Using fixed FRP version: ${FRP_TAG}"
 
-FILENAME="frp_${VERSION}_linux_${FRP_ARCH}.tar.gz"
-DOWNLOAD_URL="https://github.com/fatedier/frp/releases/download/${LATEST_TAG}/${FILENAME}"
+FILENAME="frp_${FRP_VERSION}_linux_${FRP_ARCH}.tar.gz"
+DOWNLOAD_URL="https://github.com/fatedier/frp/releases/download/${FRP_TAG}/${FILENAME}"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-info "Downloading $DOWNLOAD_URL"
-curl -fL --retry 3 -o "${TMP_DIR}/${FILENAME}" "$DOWNLOAD_URL"
+info "Downloading ${DOWNLOAD_URL}..."
+curl -fL --retry 3 -o "${TMP_DIR}/${FILENAME}" "$DOWNLOAD_URL" || fail "Failed to download ${FILENAME}. Check architecture or network."
 
 info "Extracting..."
 tar -xzf "${TMP_DIR}/${FILENAME}" -C "$TMP_DIR"
-EXTRACTED_DIR="${TMP_DIR}/frp_${VERSION}_linux_${FRP_ARCH}"
+EXTRACTED_DIR="${TMP_DIR}/frp_${FRP_VERSION}_linux_${FRP_ARCH}"
 
 mkdir -p /etc/frp /var/log/frp
 
@@ -359,7 +357,7 @@ SERVICE_FILE="/etc/systemd/system/${BIN_NAME}.service"
 info "Writing systemd service..."
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=frp ${ROLE} (${BIN_NAME})
+Description=frp ${ROLE} (${BIN_NAME}) - ${FRP_TAG}
 After=network.target network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -396,10 +394,10 @@ systemctl --no-pager status "${BIN_NAME}" | head -n 8 || true
 
 echo ""
 echo -e "${GREEN}=====================================================${NC}"
-echo -e "${GREEN} ${BIN_NAME} installed/updated to ${LATEST_TAG}${NC}"
+echo -e "${GREEN} ${BIN_NAME} installed/updated to ${FRP_TAG}${NC}"
 echo -e "${GREEN}=====================================================${NC}"
 echo "  Config : ${CONFIG_PATH}"
 echo "  Logs   : journalctl -u ${BIN_NAME} -f"
 echo "  Restart: systemctl restart ${BIN_NAME}"
 echo ""
-echo "Run this script again to update to newer versions."
+echo "This script uses FIXED version ${FRP_TAG}. To switch to another version, edit the script."
