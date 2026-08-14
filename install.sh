@@ -439,68 +439,17 @@ if [[ "$ROLE" == "client" ]]; then
     read -rp "Protocol for these ports? [tcp/udp/both] (default tcp): " PORT_PROTO
     PORT_PROTO="${PORT_PROTO:-tcp}"
 
-    # ---- pre-flight: is anything actually listening on these ports yet? ----
-    # This is the #1 cause of "proxy shows offline / tunnel looks like it's
-    # dropping": frpc's healthCheck dials 127.0.0.1:<port> and gets
-    # "connection refused" because the local app (xray, a game server,
-    # whatever) either isn't running yet or is listening on a different
-    # port than what's being entered here. Catch that mismatch NOW, while
-    # it's obvious what's being typed, instead of discovering it later via
-    # a stream of health-check warnings in the logs.
-    echo ""
-    info "Checking whether anything is currently listening on those local ports..."
-    NOT_LISTENING=()
-    IFS=',' read -ra PRECHECK_ARR <<< "$PORTS_INPUT"
-    for RAW_PORT in "${PRECHECK_ARR[@]}"; do
-      P="$(echo "$RAW_PORT" | tr -d '[:space:]')"
-      [[ -z "$P" || ! "$P" =~ ^[0-9]+$ ]] && continue
-      if timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${P}" 2>/dev/null; then
-        ok "127.0.0.1:${P} — something is listening, good."
-      else
-        warn "127.0.0.1:${P} — nothing is listening here right now."
-        NOT_LISTENING+=("$P")
-      fi
-    done
-
-    if [[ "${#NOT_LISTENING[@]}" -gt 0 ]]; then
-      echo ""
-      warn "These local ports have nothing listening on them: ${NOT_LISTENING[*]}"
-      warn "The tunnel itself will still connect fine, but frpc will keep marking"
-      warn "these specific proxies as offline (and logging 'connection refused')"
-      warn "until the local service (e.g. x-ui, xray, v2ray) is actually running and"
-      warn "listening on that exact port. This is NOT a network/tunnel problem —"
-      warn "it will clear up by itself the moment the local app is up and"
-      warn "listening on the right port."
-      read -rp "Continue setting up the tunnel anyway? [Y/n]: " CONTINUE_ANYWAY
-      if [[ "$CONTINUE_ANYWAY" =~ ^[Nn]$ ]]; then
-        fail "Cancelled — start/fix your local service first, then re-run this script."
-      fi
-    fi
-
-    # ---- compression / encryption: OFF by default -------------------
+    # ---- compression / encryption: always off ------------------------
     # useCompression runs every packet through compression before it goes
     # over the tunnel. For traffic that's already high-entropy (games,
     # video, HTTPS, anything already encrypted) this buys nothing but
-    # still burns CPU and adds latency to every single packet. Combined
-    # with the tight healthCheck below, that extra latency was enough to
-    # make frpc mark the proxy offline and cycle it — this was the main
-    # cause of "disconnects after a few seconds / delayed, dropped
-    # packets" on TCP. Default both to off; only turn compression on if
-    # you're forwarding genuinely compressible, non-latency-sensitive
-    # traffic (e.g. plain-text logs, large text transfers).
+    # still burns CPU and adds latency to every single packet — this was
+    # the main cause of "disconnects after a few seconds / delayed,
+    # dropped packets" seen earlier. useEncryption is redundant too since
+    # the forwarded traffic (e.g. xray/x-ui) already handles its own
+    # encryption. Both hardcoded off — no prompt needed.
     USE_ENCRYPTION="false"
     USE_COMPRESSION="false"
-    if [[ "$PORT_PROTO" == "tcp" || "$PORT_PROTO" == "both" ]]; then
-      echo ""
-      echo "Encryption adds a small, mostly harmless CPU cost per connection."
-      echo "Compression adds real per-packet latency and is usually a net loss"
-      echo "for game/video/already-encrypted traffic — this was the most likely"
-      echo "cause of the drops/delays you were seeing, so it defaults to off."
-      read -rp "Enable transport encryption for these TCP proxies? [y/N]: " ENABLE_ENC
-      read -rp "Enable transport compression for these TCP proxies? [y/N]: " ENABLE_COMP
-      if [[ "$ENABLE_ENC" =~ ^[Yy]$ ]]; then USE_ENCRYPTION="true"; fi
-      if [[ "$ENABLE_COMP" =~ ^[Yy]$ ]]; then USE_COMPRESSION="true"; fi
-    fi
 
     # build the [[proxies]] blocks dynamically from user input
     PROXIES_BLOCK=""
