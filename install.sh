@@ -2,7 +2,7 @@
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
 #  - Pure server<->client tunnel — NO web dashboard / NO panel
-#  - Pins frp core binaries to v0.68.0 for reproducible/stable installs
+#  - Always fetches the LATEST release from GitHub automatically
 #  - Works on Ubuntu 18.04 / 20.04 / 22.04 / 24.04+ (any systemd distro)
 #  - Supports amd64 / arm64 / armv7
 #  - Auto-fixes immutable /etc/resolv.conf (resolvconf dpkg bug)
@@ -283,10 +283,11 @@ ok "Detected architecture: $FRP_ARCH"
 
 # --------------------- fetch latest release ---------------------------
 fix_dns_if_needed   # safety net: re-check right before we need real network access
-FRP_VERSION="0.68.0"
-LATEST_TAG="v${FRP_VERSION}"
-VERSION="${FRP_VERSION}"
-ok "Pinned FRP version: ${LATEST_TAG}"
+info "Fetching the latest FRP release from GitHub..."
+LATEST_TAG="$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | jq -r .tag_name)"
+[[ -n "$LATEST_TAG" && "$LATEST_TAG" != "null" ]] || fail "Could not fetch latest release. DNS/network to github.com is still not working on this machine — fix connectivity and re-run."
+VERSION="${LATEST_TAG#v}"
+ok "Latest version: $LATEST_TAG"
 
 FILENAME="frp_${VERSION}_linux_${FRP_ARCH}.tar.gz"
 DOWNLOAD_URL="https://github.com/fatedier/frp/releases/download/${LATEST_TAG}/${FILENAME}"
@@ -433,6 +434,54 @@ if [[ "$ROLE" == "client" ]]; then
     read -rp "Protocol for these ports? [tcp/udp/both] (default tcp): " PORT_PROTO
     PORT_PROTO="${PORT_PROTO:-tcp}"
 
+    # ---- pre-flight: is anything actually listening on these ports yet? ----
+    # This is the #1 cause of "proxy shows offline / tunnel looks like it's
+    # dropping": frpc's healthCheck dials 127.0.0.1:<port> and gets
+    # "connection refused" because the local app (xray, a game server,
+    # whatever) either isn't running yet or is listening on a different
+    # port than what's being entered here. Catch that mismatch NOW, while
+    # it's obvious what's being typed, instead of discovering it later via
+    # a stream of health-check warnings in the logs.
+    echo ""
+    info "Checking whether anything is currently listening on those local ports..."
+    NOT_LISTENING=()
+    IFS=',' read -ra PRECHECK_ARR <<< "$PORTS_INPUT"
+    for RAW_PORT in "${PRECHECK_ARR[@]}"; do
+      P="$(echo "$RAW_PORT" | tr -d '[:space:]')"
+      [[ -z "$P" || ! "$P" =~ ^[0-9]+$ ]] && continue
+      if timeout 2 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/${P}" 2>/dev/null; then
+        ok "127.0.0.1:${P} — something is listening, good."
+      else
+        warn "127.0.0.1:${P} — nothing is listening here right now."
+        NOT_LISTENING+=("$P")
+      fi
+    done
+
+    if [[ "${#NOT_LISTENING[@]}" -gt 0 ]]; then
+      echo ""
+      warn "These local ports have nothing listening on them: ${NOT_LISTENING[*]}"
+      warn "The tunnel itself will still connect fine, but frpc will keep marking"
+      warn "these specific proxies as offline (and logging 'connection refused')"
+      warn "until the local service (e.g. xray/v2ray) is actually running and"
+      warn "listening on that exact port. This is NOT a network/tunnel problem —"
+      warn "it will clear up by itself the moment the local app is up and"
+      warn "listening on the right port."
+      read -rp "Continue setting up the tunnel anyway? [Y/n]: " CONTINUE_ANYWAY
+      if [[ "$CONTINUE_ANYWAY" =~ ^[Nn]$ ]]; then
+        fail "Cancelled — start/fix your local service first, then re-run this script."
+      fi
+    fi
+
+    # ---- optional: make frpc wait for the local service on boot ----
+    # Even if the port is listening right now, on a reboot systemd starts
+    # units in parallel by default — frpc can come up and start failing
+    # health checks before xray/v2ray/whatever has finished starting.
+    # If that local service also runs under systemd, wiring an explicit
+    # After=/Wants= dependency here removes that race entirely.
+    echo ""
+    read -rp "Local systemd service name frpc should wait for, if any (e.g. xray) — leave blank if none: " LOCAL_DEP_SERVICE
+    LOCAL_DEP_SERVICE="$(echo "$LOCAL_DEP_SERVICE" | tr -d '[:space:]')"
+
     # ---- compression / encryption: OFF by default -------------------
     # useCompression runs every packet through compression before it goes
     # over the tunnel. For traffic that's already high-entropy (games,
@@ -479,10 +528,14 @@ localPort = ${PORT}
 remotePort = ${PORT}
 transport.useEncryption = ${USE_ENCRYPTION}
 transport.useCompression = ${USE_COMPRESSION}
-# Health checks are intentionally disabled by default. A TCP health check
-# probes 127.0.0.1:<localPort>; if the backend service is stopped or starts
-# late, FRP marks the proxy unhealthy even though frpc<->frps is healthy.
-# Add healthCheck.* manually only for backends that are guaranteed to listen.
+# Loosened from 3s/3fails (30s total) to 5s/5fails (~25-30s of SUSTAINED
+# failure, not one slow response) — the tight version was flapping the
+# proxy offline on any brief local CPU/latency blip, which looked like
+# random disconnects from the outside.
+healthCheck.type = \"tcp\"
+healthCheck.intervalSeconds = 10
+healthCheck.timeoutSeconds = 5
+healthCheck.maxFailed = 5
 "
       fi
 
@@ -522,13 +575,13 @@ transport.tcpMux = true
 # to one side sooner than the other.
 transport.tcpMuxKeepaliveInterval = 30
 transport.poolCount = 5
-transport.heartbeatInterval = -1
+transport.heartbeatInterval = 30
 transport.heartbeatTimeout = 90
 # Same fix as the server side: 7200s (2h) is the kernel default and won't
 # catch a dropped tunnel for hours. 30s lets a dead connection get noticed
 # and re-dialed quickly instead of sitting silently broken.
 transport.dialServerTimeout = 10
-transport.dialServerKeepalive = 30
+transport.dialServerKeepAlive = 30
 
 log.to = "console"
 log.level = "info"
@@ -615,11 +668,20 @@ SERVICE_FILE="/etc/systemd/system/${BIN_NAME}.service"
 # Always (re)write the service file — unlike the config, it holds no secrets
 # or user customization, and regenerating it keeps it in sync with fixes.
 info "Writing systemd service..."
+
+EXTRA_AFTER=""
+EXTRA_WANTS=""
+if [[ "${LOCAL_DEP_SERVICE:-}" != "" ]]; then
+  EXTRA_AFTER=" ${LOCAL_DEP_SERVICE}.service"
+  EXTRA_WANTS=" ${LOCAL_DEP_SERVICE}.service"
+  ok "frpc will start After=/Wants= ${LOCAL_DEP_SERVICE}.service"
+fi
+
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=frp ${ROLE} (${BIN_NAME})
-After=network.target network-online.target
-Wants=network-online.target
+After=network.target network-online.target${EXTRA_AFTER}
+Wants=network-online.target${EXTRA_WANTS}
 StartLimitIntervalSec=0
 
 [Service]
@@ -674,4 +736,4 @@ echo "  Live logs   : journalctl -u ${BIN_NAME} -f"
 echo "  Restart     : systemctl restart ${BIN_NAME}"
 echo "  Status      : sudo bash frp_setup.sh   (choose option 3)"
 echo ""
-echo "FRP core is pinned to v0.68.0; re-run this script to reinstall/repair that exact version."
+echo "Run this same script again anytime to auto-update to the latest FRP release."
