@@ -3,8 +3,10 @@
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
 #  - Version: v0.61.0 (latest stable)
 #  - TLS COMPLETELY REMOVED
-#  - TCP (tcpMux=false), QUIC, and KCP supported
-#  - JITTER OPTIMIZED: heartbeat 10s/60s, poolCount=10, keepalive=30s
+#  - Three transport modes:
+#      1) QUIC  → RECOMMENDED: UDP multi-stream, max bandwidth, lowest jitter
+#      2) TCP-MUXED → STABLE: tcpMux=true + poolCount=10, balanced bandwidth/stability
+#      3) TCP-RAW → MAX BW: tcpMux=false, each proxy = independent connection
 #  - Auto-fixes DNS, port conflicts, and applies aggressive sysctl tuning
 #  - Menu: server, client, status, uninstall
 #
@@ -74,7 +76,7 @@ pick_free_port() {
 
 # ---- Apply sysctl tuning for throughput + jitter stability --------
 apply_sysctl() {
-  info "Applying sysctl network tuning (throughput + jitter stability)..."
+  info "Applying sysctl network tuning..."
   cat > /etc/sysctl.d/99-frp-tune.conf <<'EOF'
 # Core buffers
 net.core.rmem_max = 33554432
@@ -99,10 +101,14 @@ net.ipv4.tcp_max_syn_backlog = 65536
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_max_tw_buckets = 2000000
 
-# Keepalive (tuned for NAT stability without excessive probes)
-net.ipv4.tcp_keepalive_time = 300
+# Keepalive (NAT-friendly)
+net.ipv4.tcp_keepalive_time = 120
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
+
+# Retries (fail faster on dead paths, reducing jitter from hanging retransmits)
+net.ipv4.tcp_retries2 = 5
+net.ipv4.tcp_syn_retries = 2
 
 # Port range & reuse
 net.ipv4.tcp_tw_reuse = 1
@@ -213,7 +219,7 @@ fix_proxy_blocks() {
 echo -e "${CYAN}"
 echo "==================================================="
 echo "   FRP Reverse Tunnel - One-Click Setup"
-echo "  (v0.61.0 | NO-TLS | Bandwidth + Low Jitter)"
+echo "     (v0.61.0 | NO-TLS | Stable & Fast)"
 echo "==================================================="
 echo -e "${NC}"
 
@@ -314,15 +320,15 @@ CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 
 # -------------------- Protocol choice (NO TLS) ----------------------
 echo ""
-echo "Select transport protocol:"
-echo "  1) TCP  — tcpMux=false, each proxy = independent connection (MAX throughput)"
-echo "  2) QUIC — UDP multi-stream, no HOL blocking, LOWEST JITTER (recommended)"
-echo "  3) KCP  — UDP-based fallback (v0.61.0 has NO internal tuning params)"
+echo "Select transport mode:"
+echo "  1) QUIC      → RECOMMENDED: UDP multi-stream, max bandwidth, LOWEST JITTER"
+echo "  2) TCP-MUXED → STABLE: tcpMux=true + poolCount=10, balanced bandwidth & stability"
+echo "  3) TCP-RAW   → MAX BW: tcpMux=false, each proxy = independent connection (higher jitter)"
 read -rp "Choose [1-3]: " PROTO_CHOICE
 case "$PROTO_CHOICE" in
-  1) PROTOCOL="tcp" ;;
-  2) PROTOCOL="quic" ;;
-  3) PROTOCOL="kcp" ;;
+  1) PROTOCOL="quic"; TCPMUX="n/a" ;;
+  2) PROTOCOL="tcp";  TCPMUX="true" ;;
+  3) PROTOCOL="tcp";  TCPMUX="false" ;;
   *) fail "Invalid protocol choice." ;;
 esac
 
@@ -358,7 +364,7 @@ tcpmuxHTTPConnectPort = 7005
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport (bandwidth + jitter stability) ----
+# ---- Transport ----
 transport.maxPoolCount = 200
 transport.heartbeatTimeout = 60
 
@@ -371,9 +377,18 @@ log.maxDays = 7
 detailedErrorsToClient = true
 EOF
 
-    if [[ "$PROTOCOL" == "tcp" ]]; then
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
       cat >> "$CONFIG_PATH" <<'EOF'
-# TCP: independent connections per proxy (max throughput)
+# TCP-MUXED: 10 multiplexed connections, warm pool = low jitter + good aggregate BW
+transport.tcpMux = true
+transport.tcpMuxKeepaliveInterval = 10
+transport.tcpKeepalive = 30
+EOF
+    fi
+
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
+      cat >> "$CONFIG_PATH" <<'EOF'
+# TCP-RAW: independent connections per proxy = max bandwidth, higher jitter
 transport.tcpMux = false
 transport.tcpKeepalive = 30
 EOF
@@ -381,7 +396,7 @@ EOF
 
     if [[ "$PROTOCOL" == "quic" ]]; then
       cat >> "$CONFIG_PATH" <<EOF
-# QUIC: UDP multi-stream, lowest jitter, no bandwidth lock
+# QUIC: native multi-stream UDP = lowest jitter + no bandwidth lock
 quicBindPort = ${BIND_PORT}
 transport.quic.keepalivePeriod = 10
 transport.quic.maxIdleTimeout = 60
@@ -389,28 +404,21 @@ transport.quic.maxIncomingStreams = 100000
 EOF
     fi
 
-    if [[ "$PROTOCOL" == "kcp" ]]; then
-      cat >> "$CONFIG_PATH" <<EOF
-# KCP: fallback only (no internal tuning in v0.61.0)
-kcpBindPort = ${BIND_PORT}
-EOF
-    fi
-
-    ok "Server config created for ${PROTOCOL}."
+    ok "Server config created for ${PROTOCOL} (tcpMux=${TCPMUX})."
   fi
 
   if [[ "$UFW_AVAIL" -eq 1 ]]; then
     ufw allow "${BIND_PORT}"/tcp >/dev/null 2>&1 || true
-    if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
+    if [[ "$PROTOCOL" == "quic" ]]; then
       ufw allow "${BIND_PORT}"/udp >/dev/null 2>&1 || true
-      ok "Opened ${BIND_PORT}/udp for ${PROTOCOL}."
+      ok "Opened ${BIND_PORT}/udp for QUIC."
     fi
     ufw allow 8080/tcp >/dev/null 2>&1 || true
     ufw allow 8443/tcp >/dev/null 2>&1 || true
     ufw allow 7005/tcp >/dev/null 2>&1 || true
     ok "Firewall (ufw) rules applied."
   else
-    warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using QUIC/KCP)."
+    warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using QUIC)."
   fi
 fi
 
@@ -425,14 +433,19 @@ if [[ "$ROLE" == "client" ]]; then
     strip_problematic_keys "$CONFIG_PATH"
     toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
     toml_set "$CONFIG_PATH" "transport.protocol" "\"${PROTOCOL}\""
-    # JITTER FIX: heartbeat 10s (not too aggressive), timeout 60s (tolerant)
     toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "10"
     toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "60"
     toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "30"
     toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "30"
     fix_proxy_blocks "$CONFIG_PATH"
 
-    if [[ "$PROTOCOL" == "tcp" ]]; then
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
+      toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
+      toml_set "$CONFIG_PATH" "transport.poolCount" "10"
+      toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "10"
+    fi
+
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
       toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
       toml_set "$CONFIG_PATH" "transport.poolCount" "10"
     fi
@@ -481,18 +494,24 @@ auth.token = "${AUTH_TOKEN}"
 
 # ---- Transport (jitter optimized) ----
 transport.protocol = "${PROTOCOL}"
-# Heartbeat: 10s interval = stable NAT keepalive without flooding
-# Heartbeat timeout: 60s = tolerant to temporary packet loss / RTT spikes
 transport.heartbeatInterval = 10
 transport.heartbeatTimeout = 60
 transport.dialServerTimeout = 30
 transport.dialServerKeepalive = 30
 EOF
 
-    if [[ "$PROTOCOL" == "tcp" ]]; then
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
       cat >> "$CONFIG_PATH" <<'EOF'
-# TCP: independent connections per proxy (max throughput)
-# poolCount keeps connections warm to reduce setup jitter
+# TCP-MUXED: warm pool of 10 connections = low jitter + aggregate bandwidth
+transport.tcpMux = true
+transport.tcpMuxKeepaliveInterval = 10
+transport.poolCount = 10
+EOF
+    fi
+
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
+      cat >> "$CONFIG_PATH" <<'EOF'
+# TCP-RAW: each proxy gets its own connection = max bandwidth
 transport.tcpMux = false
 transport.poolCount = 10
 EOF
@@ -521,7 +540,7 @@ EOF
     ok "Client config created at $CONFIG_PATH."
 
     info "Testing reachability to ${SERVER_ADDR}:${SERVER_PORT} (${PROTOCOL})..."
-    if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
+    if [[ "$PROTOCOL" == "quic" ]]; then
       if command -v nc >/dev/null 2>&1; then
         if nc -uzw3 "${SERVER_ADDR}" "${SERVER_PORT}" 2>/dev/null; then
           ok "UDP port appears reachable (best-effort; UDP checks are not fully reliable)."
@@ -554,7 +573,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 Restart=always
-RestartSec=1
+RestartSec=3
 ExecStart=/usr/local/bin/${BIN_NAME} -c ${CONFIG_PATH}
 LimitNOFILE=2097152
 NoNewPrivileges=true
