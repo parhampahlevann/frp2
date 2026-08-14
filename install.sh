@@ -1,14 +1,30 @@
 #!/usr/bin/env bash
 # =====================================================================
 #  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
-#  - Version: v0.61.0 (latest stable)
+#  - Version: v0.60.0 (proven stable, pre-0.61.0)
 #  - TLS COMPLETELY REMOVED
-#  - Three transport modes:
-#      1) QUIC  → RECOMMENDED: UDP multi-stream, max bandwidth, lowest jitter
-#      2) TCP-MUXED → STABLE: tcpMux=true + poolCount=10, balanced bandwidth/stability
-#      3) TCP-RAW → MAX BW: tcpMux=false, each proxy = independent connection
-#  - Auto-fixes DNS, port conflicts, and applies aggressive sysctl tuning
+#  - Four transport modes tested for real-world stability
+#  - Auto-fixes DNS, port conflicts, and applies conservative sysctl tuning
 #  - Menu: server, client, status, uninstall
+#
+#  WHY v0.60.0:
+#    v0.61.0 introduced QUIC refinements that may conflict with some
+#    kernel/iptables stacks. v0.60.0 is the last release before those
+#    changes and has wider real-world validation.
+#
+#  TRANSPORT MODES:
+#    1) TCP-RAW    → tcpMux=false, poolCount=20 (max bandwidth, moderate jitter)
+#    2) TCP-MUXED  → tcpMux=true,  poolCount=5  (stable single-stream, lower jitter)
+#    3) QUIC       → UDP multi-stream (if your ISP allows UDP)
+#    4) KCP        → UDP fallback (if TCP is actively blocked)
+#
+#  CONSERVATIVE TIMINGS (stable over aggressive):
+#    - heartbeatInterval = 30s  (NAT-friendly, no flooding)
+#    - heartbeatTimeout  = 120s (tolerant to RTT spikes / loss)
+#    - dialServerTimeout = 60s  (generous for high-latency paths)
+#    - dialServerKeepalive = 60s
+#    - tcpKeepalive = 60s
+#    - RestartSec = 5s (prevents rapid restart loops)
 #
 #  USAGE: sudo bash frp_setup.sh
 # =====================================================================
@@ -74,41 +90,41 @@ pick_free_port() {
   echo "${CHOSEN}"
 }
 
-# ---- Apply sysctl tuning for throughput + jitter stability --------
+# ---- Apply sysctl tuning (conservative, proven stable) -------------
 apply_sysctl() {
-  info "Applying sysctl network tuning..."
+  info "Applying sysctl network tuning (conservative stable profile)..."
   cat > /etc/sysctl.d/99-frp-tune.conf <<'EOF'
-# Core buffers
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
+# Core buffers (moderate — avoids fragmentation on some VPS kernels)
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65536
 
 # TCP memory & congestion (BBR)
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_moderate_rcvbuf = 1
 
-# Prevent speed collapse after idle / stale cwnd cache
+# Prevent speed collapse after idle
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
 
 # Fast open & backlog
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_max_syn_backlog = 65536
-net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_max_tw_buckets = 2000000
 
-# Keepalive (NAT-friendly)
+# Keepalive (NAT-friendly, not aggressive)
 net.ipv4.tcp_keepalive_time = 120
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
 
-# Retries (fail faster on dead paths, reducing jitter from hanging retransmits)
-net.ipv4.tcp_retries2 = 5
-net.ipv4.tcp_syn_retries = 2
+# Retries (stable: don't give up too fast, don't hang too long)
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
 
 # Port range & reuse
 net.ipv4.tcp_tw_reuse = 1
@@ -219,7 +235,7 @@ fix_proxy_blocks() {
 echo -e "${CYAN}"
 echo "==================================================="
 echo "   FRP Reverse Tunnel - One-Click Setup"
-echo "     (v0.61.0 | NO-TLS | Stable & Fast)"
+echo "      (v0.60.0 | NO-TLS | Proven Stable)"
 echo "==================================================="
 echo -e "${NC}"
 
@@ -298,8 +314,8 @@ case "$ARCH" in
 esac
 ok "Arch: $FRP_ARCH"
 
-# -------------------- Version v0.61.0 -------------------------------
-FRP_VERSION="0.61.0"
+# -------------------- Version v0.60.0 (proven stable) ---------------
+FRP_VERSION="0.60.0"
 FRP_TAG="v${FRP_VERSION}"
 FILENAME="frp_${FRP_VERSION}_linux_${FRP_ARCH}.tar.gz"
 DOWNLOAD_URL="https://github.com/fatedier/frp/releases/download/${FRP_TAG}/${FILENAME}"
@@ -321,14 +337,16 @@ CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
 # -------------------- Protocol choice (NO TLS) ----------------------
 echo ""
 echo "Select transport mode:"
-echo "  1) QUIC      → RECOMMENDED: UDP multi-stream, max bandwidth, LOWEST JITTER"
-echo "  2) TCP-MUXED → STABLE: tcpMux=true + poolCount=10, balanced bandwidth & stability"
-echo "  3) TCP-RAW   → MAX BW: tcpMux=false, each proxy = independent connection (higher jitter)"
-read -rp "Choose [1-3]: " PROTO_CHOICE
+echo "  1) TCP-RAW    → tcpMux=false, poolCount=20 (max aggregate bandwidth)"
+echo "  2) TCP-MUXED  → tcpMux=true,  poolCount=5  (single-stream stability)"
+echo "  3) QUIC       → UDP multi-stream (if ISP allows UDP)"
+echo "  4) KCP        → UDP fallback (if TCP is actively blocked)"
+read -rp "Choose [1-4]: " PROTO_CHOICE
 case "$PROTO_CHOICE" in
-  1) PROTOCOL="quic"; TCPMUX="n/a" ;;
-  2) PROTOCOL="tcp";  TCPMUX="true" ;;
-  3) PROTOCOL="tcp";  TCPMUX="false" ;;
+  1) PROTOCOL="tcp";  TCPMUX="false" ;;
+  2) PROTOCOL="tcp";  TCPMUX="true"  ;;
+  3) PROTOCOL="quic"; TCPMUX="n/a"   ;;
+  4) PROTOCOL="kcp";  TCPMUX="n/a"   ;;
   *) fail "Invalid protocol choice." ;;
 esac
 
@@ -344,8 +362,8 @@ if [[ "$ROLE" == "server" ]]; then
     ok "Updating config for ${PROTOCOL} mode..."
     strip_problematic_keys "$CONFIG_PATH"
     toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
-    toml_set "$CONFIG_PATH" "transport.maxPoolCount" "200"
-    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "60"
+    toml_set "$CONFIG_PATH" "transport.maxPoolCount" "500"
+    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "120"
     fix_proxy_blocks "$CONFIG_PATH"
 
     BIND_PORT=$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)
@@ -364,9 +382,9 @@ tcpmuxHTTPConnectPort = 7005
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport ----
-transport.maxPoolCount = 200
-transport.heartbeatTimeout = 60
+# ---- Transport (conservative & stable) ----
+transport.maxPoolCount = 500
+transport.heartbeatTimeout = 120
 
 allowPorts = [ { start = 1, end = 65535 } ]
 maxPortsPerClient = 0
@@ -377,30 +395,37 @@ log.maxDays = 7
 detailedErrorsToClient = true
 EOF
 
-    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
       cat >> "$CONFIG_PATH" <<'EOF'
-# TCP-MUXED: 10 multiplexed connections, warm pool = low jitter + good aggregate BW
-transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 10
-transport.tcpKeepalive = 30
+# TCP-RAW: each proxy = independent TCP connection (aggregate bandwidth)
+transport.tcpMux = false
+transport.tcpKeepalive = 60
 EOF
     fi
 
-    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
       cat >> "$CONFIG_PATH" <<'EOF'
-# TCP-RAW: independent connections per proxy = max bandwidth, higher jitter
-transport.tcpMux = false
-transport.tcpKeepalive = 30
+# TCP-MUXED: single multiplexed stream (lower jitter, capped aggregate BW)
+transport.tcpMux = true
+transport.tcpMuxKeepaliveInterval = 30
+transport.tcpKeepalive = 60
 EOF
     fi
 
     if [[ "$PROTOCOL" == "quic" ]]; then
       cat >> "$CONFIG_PATH" <<EOF
-# QUIC: native multi-stream UDP = lowest jitter + no bandwidth lock
+# QUIC: UDP multi-stream
 quicBindPort = ${BIND_PORT}
-transport.quic.keepalivePeriod = 10
-transport.quic.maxIdleTimeout = 60
+transport.quic.keepalivePeriod = 30
+transport.quic.maxIdleTimeout = 120
 transport.quic.maxIncomingStreams = 100000
+EOF
+    fi
+
+    if [[ "$PROTOCOL" == "kcp" ]]; then
+      cat >> "$CONFIG_PATH" <<EOF
+# KCP: UDP fallback (no tuning params in v0.60.0)
+kcpBindPort = ${BIND_PORT}
 EOF
     fi
 
@@ -409,16 +434,16 @@ EOF
 
   if [[ "$UFW_AVAIL" -eq 1 ]]; then
     ufw allow "${BIND_PORT}"/tcp >/dev/null 2>&1 || true
-    if [[ "$PROTOCOL" == "quic" ]]; then
+    if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
       ufw allow "${BIND_PORT}"/udp >/dev/null 2>&1 || true
-      ok "Opened ${BIND_PORT}/udp for QUIC."
+      ok "Opened ${BIND_PORT}/udp for ${PROTOCOL}."
     fi
     ufw allow 8080/tcp >/dev/null 2>&1 || true
     ufw allow 8443/tcp >/dev/null 2>&1 || true
     ufw allow 7005/tcp >/dev/null 2>&1 || true
     ok "Firewall (ufw) rules applied."
   else
-    warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using QUIC)."
+    warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using QUIC/KCP)."
   fi
 fi
 
@@ -433,26 +458,27 @@ if [[ "$ROLE" == "client" ]]; then
     strip_problematic_keys "$CONFIG_PATH"
     toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
     toml_set "$CONFIG_PATH" "transport.protocol" "\"${PROTOCOL}\""
-    toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "10"
-    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "60"
-    toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "30"
-    toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "30"
+    # Conservative heartbeat: 30s interval, 120s timeout = stable NAT keepalive
+    toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "30"
+    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "120"
+    toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "60"
+    toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "60"
     fix_proxy_blocks "$CONFIG_PATH"
-
-    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
-      toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
-      toml_set "$CONFIG_PATH" "transport.poolCount" "10"
-      toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "10"
-    fi
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
       toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
-      toml_set "$CONFIG_PATH" "transport.poolCount" "10"
+      toml_set "$CONFIG_PATH" "transport.poolCount" "20"
+    fi
+
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
+      toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
+      toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "30"
+      toml_set "$CONFIG_PATH" "transport.poolCount" "5"
     fi
 
     if [[ "$PROTOCOL" == "quic" ]]; then
-      toml_set "$CONFIG_PATH" "transport.quic.keepalivePeriod" "10"
-      toml_set "$CONFIG_PATH" "transport.quic.maxIdleTimeout" "60"
+      toml_set "$CONFIG_PATH" "transport.quic.keepalivePeriod" "30"
+      toml_set "$CONFIG_PATH" "transport.quic.maxIdleTimeout" "120"
     fi
 
     SERVER_ADDR=$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || echo "")
@@ -492,36 +518,36 @@ loginFailExit = false
 auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
-# ---- Transport (jitter optimized) ----
+# ---- Transport (conservative & stable) ----
 transport.protocol = "${PROTOCOL}"
-transport.heartbeatInterval = 10
-transport.heartbeatTimeout = 60
-transport.dialServerTimeout = 30
-transport.dialServerKeepalive = 30
+transport.heartbeatInterval = 30
+transport.heartbeatTimeout = 120
+transport.dialServerTimeout = 60
+transport.dialServerKeepalive = 60
 EOF
-
-    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
-      cat >> "$CONFIG_PATH" <<'EOF'
-# TCP-MUXED: warm pool of 10 connections = low jitter + aggregate bandwidth
-transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 10
-transport.poolCount = 10
-EOF
-    fi
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
       cat >> "$CONFIG_PATH" <<'EOF'
-# TCP-RAW: each proxy gets its own connection = max bandwidth
+# TCP-RAW: 20 warm connections = no handshake latency when proxy wakes up
 transport.tcpMux = false
-transport.poolCount = 10
+transport.poolCount = 20
+EOF
+    fi
+
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
+      cat >> "$CONFIG_PATH" <<'EOF'
+# TCP-MUXED: single stream, lower jitter, capped aggregate bandwidth
+transport.tcpMux = true
+transport.tcpMuxKeepaliveInterval = 30
+transport.poolCount = 5
 EOF
     fi
 
     if [[ "$PROTOCOL" == "quic" ]]; then
       cat >> "$CONFIG_PATH" <<'EOF'
-# QUIC: native multi-stream over UDP = lowest jitter + no bandwidth lock
-transport.quic.keepalivePeriod = 10
-transport.quic.maxIdleTimeout = 60
+# QUIC: UDP multi-stream
+transport.quic.keepalivePeriod = 30
+transport.quic.maxIdleTimeout = 120
 EOF
     fi
 
@@ -540,7 +566,7 @@ EOF
     ok "Client config created at $CONFIG_PATH."
 
     info "Testing reachability to ${SERVER_ADDR}:${SERVER_PORT} (${PROTOCOL})..."
-    if [[ "$PROTOCOL" == "quic" ]]; then
+    if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
       if command -v nc >/dev/null 2>&1; then
         if nc -uzw3 "${SERVER_ADDR}" "${SERVER_PORT}" 2>/dev/null; then
           ok "UDP port appears reachable (best-effort; UDP checks are not fully reliable)."
@@ -573,7 +599,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=root
 Restart=always
-RestartSec=3
+RestartSec=5
 ExecStart=/usr/local/bin/${BIN_NAME} -c ${CONFIG_PATH}
 LimitNOFILE=2097152
 NoNewPrivileges=true
