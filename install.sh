@@ -359,8 +359,13 @@ auth.method = "token"
 auth.token = "${AUTH_TOKEN}"
 
 # ---- stability / performance tuning (fixes common disconnect bugs) ----
-transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 30
+# tcpMux multiplexes every proxy's traffic over ONE shared TCP connection
+# to the server. With several proxies active at once, heavy traffic on
+# one proxy can head-of-line-block the others sharing that connection —
+# they all see jittery, up-and-down latency even though nothing is wrong
+# with the network path. Disabled so each proxy gets its own independent
+# connection instead.
+transport.tcpMux = false
 # tcpKeepalive is the OS-level TCP keepalive probe interval in seconds.
 # The old default (7200s = 2 hours) is the Linux kernel default and is
 # useless for catching a tunnel that drops within seconds — the OS would
@@ -472,16 +477,6 @@ if [[ "$ROLE" == "client" ]]; then
       fi
     fi
 
-    # ---- optional: make frpc wait for the local service on boot ----
-    # Even if the port is listening right now, on a reboot systemd starts
-    # units in parallel by default — frpc can come up and start failing
-    # health checks before xray/v2ray/whatever has finished starting.
-    # If that local service also runs under systemd, wiring an explicit
-    # After=/Wants= dependency here removes that race entirely.
-    echo ""
-    read -rp "Local systemd service name frpc should wait for, if any (e.g. x-ui) — leave blank if none: " LOCAL_DEP_SERVICE
-    LOCAL_DEP_SERVICE="$(echo "$LOCAL_DEP_SERVICE" | tr -d '[:space:]')"
-
     # ---- compression / encryption: OFF by default -------------------
     # useCompression runs every packet through compression before it goes
     # over the tunnel. For traffic that's already high-entropy (games,
@@ -568,12 +563,13 @@ auth.token = "${AUTH_TOKEN}"
 # tcp | kcp | quic | websocket | wss
 # If your network has packet loss, try kcp or quic for a more stable tunnel
 transport.protocol = "${TRANSPORT_PROTO}"
-transport.tcpMux = true
-# Must match frps' transport.tcpMuxKeepaliveInterval (also 30) — leaving
-# this unset means each side falls back to its own library default,
-# which isn't guaranteed to match and can make the mux session look idle
-# to one side sooner than the other.
-transport.tcpMuxKeepaliveInterval = 30
+# Disabled to match frps — see the comment in frps.toml. With tcpMux off,
+# each proxy dials its own connection instead of sharing one, so a busy
+# proxy can no longer delay/jitter the others.
+transport.tcpMux = false
+# poolCount now actually matters (it's a no-op when tcpMux is on) — this
+# many connections per proxy are kept pre-dialed and ready, so a new
+# visitor doesn't pay a fresh handshake's latency.
 transport.poolCount = 5
 transport.heartbeatInterval = 30
 transport.heartbeatTimeout = 90
@@ -669,19 +665,11 @@ SERVICE_FILE="/etc/systemd/system/${BIN_NAME}.service"
 # or user customization, and regenerating it keeps it in sync with fixes.
 info "Writing systemd service..."
 
-EXTRA_AFTER=""
-EXTRA_WANTS=""
-if [[ "${LOCAL_DEP_SERVICE:-}" != "" ]]; then
-  EXTRA_AFTER=" ${LOCAL_DEP_SERVICE}.service"
-  EXTRA_WANTS=" ${LOCAL_DEP_SERVICE}.service"
-  ok "frpc will start After=/Wants= ${LOCAL_DEP_SERVICE}.service"
-fi
-
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=frp ${ROLE} (${BIN_NAME})
-After=network.target network-online.target${EXTRA_AFTER}
-Wants=network-online.target${EXTRA_WANTS}
+After=network.target network-online.target
+Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
