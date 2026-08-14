@@ -319,8 +319,8 @@ if [[ "$ROLE" == "server" ]]; then
     BIND_PORT="$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo 443)"
   else
     echo ""
-    read -rp "Which protocol will the client(s) mainly use? [tcp/wss] (default wss): " SERVER_PROTO_HINT
-    SERVER_PROTO_HINT="${SERVER_PROTO_HINT:-wss}"
+    read -rp "Which protocol will the client(s) mainly use? [tcp/wss] (default tcp): " SERVER_PROTO_HINT
+    SERVER_PROTO_HINT="${SERVER_PROTO_HINT:-tcp}"
     if [[ "$SERVER_PROTO_HINT" == "wss" || "$SERVER_PROTO_HINT" == "websocket" ]]; then
       DEFAULT_BIND_PORT=443
       echo "Choosing the tunnel port. Default is 443 (blends in with normal HTTPS"
@@ -414,8 +414,8 @@ if [[ "$ROLE" == "client" ]]; then
     SERVER_PORT="$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)"
   else
     read -rp "Server public IP or domain: " SERVER_ADDR
-    read -rp "Transport protocol [tcp/kcp/quic/websocket/wss] (default wss): " TRANSPORT_PROTO
-    TRANSPORT_PROTO="${TRANSPORT_PROTO:-wss}"
+    read -rp "Transport protocol [tcp/kcp/quic/websocket/wss] (default tcp): " TRANSPORT_PROTO
+    TRANSPORT_PROTO="${TRANSPORT_PROTO:-tcp}"
     if [[ "$TRANSPORT_PROTO" == "wss" || "$TRANSPORT_PROTO" == "websocket" ]]; then
       DEFAULT_SERVER_PORT=443
     else
@@ -433,6 +433,31 @@ if [[ "$ROLE" == "client" ]]; then
     read -rp "Ports: " PORTS_INPUT
     read -rp "Protocol for these ports? [tcp/udp/both] (default tcp): " PORT_PROTO
     PORT_PROTO="${PORT_PROTO:-tcp}"
+
+    # ---- compression / encryption: OFF by default -------------------
+    # useCompression runs every packet through compression before it goes
+    # over the tunnel. For traffic that's already high-entropy (games,
+    # video, HTTPS, anything already encrypted) this buys nothing but
+    # still burns CPU and adds latency to every single packet. Combined
+    # with the tight healthCheck below, that extra latency was enough to
+    # make frpc mark the proxy offline and cycle it — this was the main
+    # cause of "disconnects after a few seconds / delayed, dropped
+    # packets" on TCP. Default both to off; only turn compression on if
+    # you're forwarding genuinely compressible, non-latency-sensitive
+    # traffic (e.g. plain-text logs, large text transfers).
+    USE_ENCRYPTION="false"
+    USE_COMPRESSION="false"
+    if [[ "$PORT_PROTO" == "tcp" || "$PORT_PROTO" == "both" ]]; then
+      echo ""
+      echo "Encryption adds a small, mostly harmless CPU cost per connection."
+      echo "Compression adds real per-packet latency and is usually a net loss"
+      echo "for game/video/already-encrypted traffic — this was the most likely"
+      echo "cause of the drops/delays you were seeing, so it defaults to off."
+      read -rp "Enable transport encryption for these TCP proxies? [y/N]: " ENABLE_ENC
+      read -rp "Enable transport compression for these TCP proxies? [y/N]: " ENABLE_COMP
+      if [[ "$ENABLE_ENC" =~ ^[Yy]$ ]]; then USE_ENCRYPTION="true"; fi
+      if [[ "$ENABLE_COMP" =~ ^[Yy]$ ]]; then USE_COMPRESSION="true"; fi
+    fi
 
     # build the [[proxies]] blocks dynamically from user input
     PROXIES_BLOCK=""
@@ -453,12 +478,16 @@ type = \"tcp\"
 localIP = \"127.0.0.1\"
 localPort = ${PORT}
 remotePort = ${PORT}
-transport.useEncryption = true
-transport.useCompression = true
+transport.useEncryption = ${USE_ENCRYPTION}
+transport.useCompression = ${USE_COMPRESSION}
+# Loosened from 3s/3fails (30s total) to 5s/5fails (~25-30s of SUSTAINED
+# failure, not one slow response) — the tight version was flapping the
+# proxy offline on any brief local CPU/latency blip, which looked like
+# random disconnects from the outside.
 healthCheck.type = \"tcp\"
 healthCheck.intervalSeconds = 10
-healthCheck.timeoutSeconds = 3
-healthCheck.maxFailed = 3
+healthCheck.timeoutSeconds = 5
+healthCheck.maxFailed = 5
 "
       fi
 
@@ -492,6 +521,11 @@ auth.token = "${AUTH_TOKEN}"
 # If your network has packet loss, try kcp or quic for a more stable tunnel
 transport.protocol = "${TRANSPORT_PROTO}"
 transport.tcpMux = true
+# Must match frps' transport.tcpMuxKeepaliveInterval (also 30) — leaving
+# this unset means each side falls back to its own library default,
+# which isn't guaranteed to match and can make the mux session look idle
+# to one side sooner than the other.
+transport.tcpMuxKeepaliveInterval = 30
 transport.poolCount = 5
 transport.heartbeatInterval = 30
 transport.heartbeatTimeout = 90
