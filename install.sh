@@ -1,30 +1,5 @@
 #!/usr/bin/env bash
 # =====================================================================
-# FRP HIGH-THROUGHPUT + STABLE INSTALLER / UPDATER
-# frps + frpc | FRP v0.60.0 | NO TLS | NO BANDWIDTH LIMIT
-#
-# Goals:
-# - Completely remove artificial bandwidth limits
-# - Maximum practical throughput + high stability
-# - TCP-RAW for maximum aggregate throughput
-# - TCP-MUXED for better stability (with correct heartbeat settings)
-# - QUIC recommended over KCP
-# - KCP only as fallback
-# - Conservative but throughput-oriented sysctl tuning
-# - BBR when supported by the kernel
-# - systemd auto-restart
-# - Config verification before service restart
-#
-# IMPORTANT FIXES compared to previous versions:
-# 1. When tcpMux=true → heartbeatInterval MUST be -1
-#    (official frp recommendation)
-# 2. Very high poolCount (e.g. 50) causes instability and connection limits
-# 3. maxPoolCount on server set to a more reasonable value
-# 4. Better coordinated keepalive / timeout settings
-#
-# This script does NOT remove real ISP / VPS / network path limitations.
-# It only removes artificial limits imposed by FRP itself.
-# =====================================================================
 set -euo pipefail
 
 # ============================= Colors ===============================
@@ -126,27 +101,23 @@ apply_sysctl() {
 # ====================================================================
 # FRP High Throughput Network Profile
 # ====================================================================
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
 net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65536
-net.ipv4.tcp_rmem = 4096 262144 67108864
-net.ipv4.tcp_wmem = 4096 262144 67108864
+net.core.netdev_max_backlog = 262144
+net.ipv4.tcp_rmem = 4096 16777216 134217728
+net.ipv4.tcp_wmem = 4096 16777216 134217728
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_max_syn_backlog = 65536
-net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_max_tw_buckets = 2000000
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
-net.ipv4.tcp_retries2 = 8
-net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_retries2 = 5
 net.ipv4.ip_local_port_range = 1024 65535
 EOF
 
