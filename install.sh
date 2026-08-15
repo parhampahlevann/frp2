@@ -1,503 +1,1000 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  FRP One-Click Installer / Updater  (frps + frpc, all-in-one)
-#  - Version: v0.60.0 (proven stable, pre-0.61.0)
-#  - TLS COMPLETELY REMOVED
-#  - Four transport modes tested for real-world stability
-#  - Auto-fixes DNS, port conflicts, and applies conservative sysctl tuning
-#  - Menu: server, client, status, uninstall
+#  FRP HIGH-THROUGHPUT INSTALLER / UPDATER
+#  frps + frpc | FRP v0.60.0 | NO TLS | NO BANDWIDTH LIMIT
 #
-#  WHY v0.60.0:
-#    v0.61.0 introduced QUIC refinements that may conflict with some
-#    kernel/iptables stacks. v0.60.0 is the last release before those
-#    changes and has wider real-world validation.
+#  اهداف:
+#    - حذف کامل bandwidth limit
+#    - حداکثر throughput عملی در حد ظرفیت واقعی شبکه
+#    - TCP-RAW برای بیشترین aggregate throughput
+#    - TCP-MUXED برای پایداری و کاهش connection overhead
+#    - QUIC برای مسیرهای مناسب UDP
+#    - KCP به عنوان UDP fallback
+#    - sysctl محافظه‌کارانه ولی مناسب throughput
+#    - BBR فقط در صورت پشتیبانی کرنل
+#    - systemd auto restart
+#    - config verification قبل از restart
 #
-#  TRANSPORT MODES:
-#    1) TCP-RAW    → tcpMux=false, poolCount=20 (max bandwidth, moderate jitter)
-#    2) TCP-MUXED  → tcpMux=true,  poolCount=5  (stable single-stream, lower jitter)
-#    3) QUIC       → UDP multi-stream (if your ISP allows UDP)
-#    4) KCP        → UDP fallback (if TCP is actively blocked)
-#
-#  CONSERVATIVE TIMINGS (stable over aggressive):
-#    - heartbeatInterval = 30s  (NAT-friendly, no flooding)
-#    - heartbeatTimeout  = 120s (tolerant to RTT spikes / loss)
-#    - dialServerTimeout = 60s  (generous for high-latency paths)
-#    - dialServerKeepalive = 60s
-#    - tcpKeepalive = 60s
-#    - RestartSec = 5s (prevents rapid restart loops)
-#
-#  USAGE: sudo bash frp_setup.sh
+#  IMPORTANT:
+#    این اسکریپت محدودیت ISP، VPS، provider، NIC، مسیر اینترنت یا
+#    congestion شبکه را حذف نمی‌کند؛ فقط محدودیت مصنوعی FRP را حذف می‌کند.
 # =====================================================================
+
 set -euo pipefail
 
-# ----------------------------- colors -------------------------------
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
-info()  { echo -e "${CYAN}==>${NC} $1"; }
-ok()    { echo -e "${GREEN}[OK]${NC} $1"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
-fail()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+# ============================= Colors ===============================
 
-# --------------------------- fixed shared token ----------------------
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+info() {
+    echo -e "${CYAN}==>${NC} $1"
+}
+
+ok() {
+    echo -e "${GREEN}[OK]${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}[!]${NC} $1"
+}
+
+fail() {
+    echo -e "${RED}[ERROR]${NC} $1"
+    exit 1
+}
+
+# ========================= Fixed Settings ===========================
+
+FRP_VERSION="0.60.0"
+FRP_TAG="v${FRP_VERSION}"
+
+# استفاده از همان token که در نسخه قبلی خودتان قرار داده بودید.
 FIXED_AUTH_TOKEN="7ZuESw25FFWCZQmrroruUEy4qVVB9dbmkG1BMSMD6WHx"
 
-# --------------------------- pre-flight -----------------------------
-[[ $EUID -eq 0 ]] || fail "Run as root (sudo)."
+FRP_DIR="/etc/frp"
+LOG_DIR="/var/log/frp"
+BIN_DIR="/usr/local/bin"
+SYSTEMD_DIR="/etc/systemd/system"
 
-if [[ -e /etc/resolv.conf ]] && command -v chattr >/dev/null 2>&1; then
-  chattr -i /etc/resolv.conf 2>/dev/null || true
-fi
-dpkg --configure -a >/dev/null 2>&1 || true
+SYSCTL_FILE="/etc/sysctl.d/99-frp-tune.conf"
 
-# ---- DNS self-check / auto-repair --------------------------------
-check_dns() { getent hosts github.com >/dev/null 2>&1; }
+# ============================= Root =================================
+
+[[ "${EUID}" -eq 0 ]] || fail "Run this script as root (sudo)."
+
+# ============================= Functions =============================
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+check_dns() {
+    getent hosts github.com >/dev/null 2>&1
+}
+
 fix_dns_if_needed() {
-  if check_dns; then return 0; fi
-  warn "DNS broken. Fixing..."
-  if [[ -L /etc/resolv.conf ]]; then
-    warn "/etc/resolv.conf is a symlink (systemd-resolved). Overriding temporarily."
-  fi
-  chattr -i /etc/resolv.conf 2>/dev/null || true
-  rm -f /etc/resolv.conf
-  cat > /etc/resolv.conf <<'EOF'
+    if check_dns; then
+        ok "DNS is working."
+        return 0
+    fi
+
+    warn "DNS resolution is broken. Attempting repair..."
+
+    if [[ -e /etc/resolv.conf ]] && command_exists chattr; then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+    fi
+
+    if [[ -L /etc/resolv.conf ]]; then
+        warn "/etc/resolv.conf is a symlink. Temporary resolver override will be used."
+    fi
+
+    rm -f /etc/resolv.conf
+
+    cat > /etc/resolv.conf <<'EOF'
 nameserver 1.1.1.1
 nameserver 8.8.8.8
 EOF
-  sleep 1
-  check_dns && ok "DNS fixed." || warn "DNS still broken. Fix manually."
-}
-fix_dns_if_needed
 
-# ---- Port conflict helper -----------------------------------------
+    sleep 1
+
+    if check_dns; then
+        ok "DNS repaired."
+    else
+        warn "DNS is still unavailable."
+    fi
+}
+
 port_in_use() {
-  local PORT="$1"
-  ss -tuln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${PORT}\$"
+    local PORT="$1"
+
+    if command_exists ss; then
+        ss -H -tuln 2>/dev/null |
+            awk '{print $5}' |
+            grep -qE "([.:]|^|\])${PORT}$"
+    else
+        return 1
+    fi
+}
+
+valid_port() {
+    local P="$1"
+
+    [[ "$P" =~ ^[0-9]+$ ]] &&
+    (( P >= 1 && P <= 65535 ))
 }
 
 pick_free_port() {
-  local DEFAULT_PORT="$1"
-  local LABEL="$2"
-  local CHOSEN="${DEFAULT_PORT}"
-  while true; do
-    read -rp "${LABEL} [${CHOSEN}]: " INPUT_PORT
-    CHOSEN="${INPUT_PORT:-$CHOSEN}"
-    if port_in_use "${CHOSEN}"; then
-      warn "Port ${CHOSEN} in use. Choose another."
-      CHOSEN=$((CHOSEN + 1))
-    else
-      break
-    fi
-  done
-  echo "${CHOSEN}"
+    local DEFAULT_PORT="$1"
+    local LABEL="$2"
+
+    local CHOSEN="$DEFAULT_PORT"
+    local INPUT_PORT=""
+
+    while true; do
+        read -rp "${LABEL} [${CHOSEN}]: " INPUT_PORT
+        CHOSEN="${INPUT_PORT:-$CHOSEN}"
+
+        if ! valid_port "$CHOSEN"; then
+            warn "Invalid port: ${CHOSEN}"
+            CHOSEN="$DEFAULT_PORT"
+            continue
+        fi
+
+        if port_in_use "$CHOSEN"; then
+            warn "TCP/UDP port ${CHOSEN} is already in use."
+            CHOSEN=$((CHOSEN + 1))
+            continue
+        fi
+
+        echo "$CHOSEN"
+        return 0
+    done
 }
 
-# ---- Apply sysctl tuning (conservative, proven stable) -------------
+# ============================= Sysctl ================================
+
 apply_sysctl() {
-  info "Applying sysctl network tuning (conservative stable profile)..."
-  cat > /etc/sysctl.d/99-frp-tune.conf <<'EOF'
-# Core buffers (moderate — avoids fragmentation on some VPS kernels)
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+    info "Applying high-throughput conservative network profile..."
+
+    cat > "$SYSCTL_FILE" <<'EOF'
+# ====================================================================
+# FRP High Throughput Network Profile
+# ====================================================================
+
+# Socket buffers
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+
+# Queueing / connection handling
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65536
 
-# TCP memory & congestion (BBR)
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_notsent_lowat = 16384
+# TCP autotuning
+net.ipv4.tcp_rmem = 4096 262144 67108864
+net.ipv4.tcp_wmem = 4096 262144 67108864
 net.ipv4.tcp_moderate_rcvbuf = 1
 
-# Prevent speed collapse after idle
+# Keep throughput after idle periods
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_no_metrics_save = 1
 
-# Fast open & backlog
+# TCP Fast Open
 net.ipv4.tcp_fastopen = 3
+
+# Connection backlog
 net.ipv4.tcp_max_syn_backlog = 65536
+
+# Reasonable FIN timeout
 net.ipv4.tcp_fin_timeout = 15
+
+# TIME_WAIT handling
+net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_max_tw_buckets = 2000000
 
-# Keepalive (NAT-friendly, not aggressive)
+# Keepalive
 net.ipv4.tcp_keepalive_time = 120
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 5
 
-# Retries (stable: don't give up too fast, don't hang too long)
+# Retries
 net.ipv4.tcp_retries2 = 8
 net.ipv4.tcp_syn_retries = 3
 
-# Port range & reuse
-net.ipv4.tcp_tw_reuse = 1
+# Large ephemeral range
 net.ipv4.ip_local_port_range = 1024 65535
 EOF
-  sysctl -p /etc/sysctl.d/99-frp-tune.conf >/dev/null 2>&1 || warn "Sysctl apply failed (ignore if not supported)."
-  ok "Sysctl tuning applied."
-}
 
-# ---- Diagnose common connection failures from logs ------------------
-diagnose_logs() {
-  local SVC="$1"
-  local LOG
-  LOG="$(journalctl -u "$SVC" -n 80 --no-pager 2>/dev/null || true)"
+    # Try to enable BBR only if supported.
+    if [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
+        if grep -qw "bbr" /proc/sys/net/ipv4/tcp_available_congestion_control; then
+            cat >> "$SYSCTL_FILE" <<'EOF'
 
-  if echo "$LOG" | grep -qiE "authorization failed|auth.*fail|token.*(invalid|mismatch)"; then
-    warn "Hint: authentication failed -> auth.token in frps.toml and frpc.toml do not match."
-  fi
-  if echo "$LOG" | grep -qiE "i/o timeout|dial tcp.*timeout|no route to host"; then
-    warn "Hint: network/timeout -> server unreachable on this port. Check firewall/security-group."
-  fi
-  if echo "$LOG" | grep -qiE "address already in use|bind: address already in use"; then
-    warn "Hint: port already in use -> another process is holding the bind port."
-  fi
-  if echo "$LOG" | grep -qiE "connection refused"; then
-    warn "Hint: connection refused -> frps is not listening on that IP/port yet, or a firewall is dropping it."
-  fi
-  if echo "$LOG" | grep -qiE "bandwidth limit|bandwidthLimit"; then
-    warn "Hint: bandwidth limit detected in config -> remove transport.bandwidthLimit from proxy blocks."
-  fi
-  return 0
-}
-
-# ---- Explicit tunnel-connected verdict -----------------------------
-tunnel_verdict() {
-  local SVC="$1"
-  local LOG
-  LOG="$(journalctl -u "$SVC" -n 80 --no-pager 2>/dev/null || true)"
-  if [[ "$SVC" == "frpc" ]]; then
-    if echo "$LOG" | grep -qi "login to server success"; then
-      ok "Tunnel status: CONNECTED (client successfully logged in to server)."
-    else
-      warn "Tunnel status: NOT CONNECTED (no successful login found in recent logs)."
+# BBR congestion control
+net.ipv4.tcp_congestion_control = bbr
+EOF
+            ok "BBR is supported by the kernel and will be enabled."
+        else
+            warn "BBR is not available on this kernel. Keeping the kernel default congestion control."
+        fi
     fi
-  elif [[ "$SVC" == "frps" ]]; then
-    if echo "$LOG" | grep -qi "client login info"; then
-      ok "Tunnel status: at least one client has logged in successfully."
+
+    if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
+        ok "Network tuning applied."
     else
-      warn "Tunnel status: no client has successfully logged in yet."
+        warn "Some sysctl parameters were rejected by this kernel."
     fi
-  fi
-  return 0
+
+    # Try fq qdisc because BBR works best with fq on many Linux systems.
+    if command_exists tc; then
+        local DEFAULT_QDISC=""
+        DEFAULT_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+
+        if [[ -e /sys/module/sch_fq ]]; then
+            sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+            ok "fq queue discipline enabled where supported."
+        elif [[ -n "$DEFAULT_QDISC" ]]; then
+            warn "fq module is unavailable; keeping existing qdisc."
+        fi
+    fi
 }
 
-# ---- Validate existing config; backup & rebuild if invalid --------
-validate_or_backup_config() {
-  local BIN="$1"
-  local CFG="$2"
-  if [[ ! -f "$CFG" ]]; then
-    return 0
-  fi
-  info "Validating existing config ${CFG} ..."
-  if "$BIN" verify -c "$CFG" >/tmp/${BIN}-verify-old.out 2>&1; then
-    ok "Existing config is valid."
-    return 0
-  else
-    warn "Existing config is INVALID. Backing up..."
-    mv "$CFG" "${CFG}.bak.$(date +%s)"
-    return 1
-  fi
-}
+# ========================== Config Helpers ===========================
 
-# ---- Inject or replace a key in a TOML file -----------------------
 toml_set() {
-  local FILE="$1"
-  local KEY="$2"
-  local VAL="$3"
-  local KEY_ESCAPED
-  KEY_ESCAPED="$(echo "$KEY" | sed 's/\./\\./g')"
-  if grep -qE "^${KEY_ESCAPED} *=" "$FILE" 2>/dev/null; then
-    sed -i -E "s/^(${KEY_ESCAPED} *=).*/\1 ${VAL}/" "$FILE"
-  else
-    echo "${KEY} = ${VAL}" >> "$FILE"
-  fi
+    local FILE="$1"
+    local KEY="$2"
+    local VALUE="$3"
+
+    local KEY_ESCAPED
+
+    KEY_ESCAPED="$(printf '%s' "$KEY" | sed 's/\./\\./g')"
+
+    if grep -qE "^${KEY_ESCAPED}[[:space:]]*=" "$FILE" 2>/dev/null; then
+        sed -i -E "s/^(${KEY_ESCAPED}[[:space:]]*=).*/\1 ${VALUE}/" "$FILE"
+    else
+        echo "${KEY} = ${VALUE}" >> "$FILE"
+    fi
 }
 
-# ---- Strip ALL problematic keys from existing configs ---------------
+remove_key() {
+    local FILE="$1"
+    local KEY="$2"
+
+    local KEY_ESCAPED
+    KEY_ESCAPED="$(printf '%s' "$KEY" | sed 's/\./\\./g')"
+
+    sed -i -E "/^${KEY_ESCAPED}[[:space:]]*=/d" "$FILE"
+}
+
 strip_problematic_keys() {
-  local FILE="$1"
-  sed -i '/^tls_enable/d' "$FILE"
-  sed -i '/^transport\.tls\./d' "$FILE"
-  sed -i '/^transport\.bandwidthLimit/d' "$FILE"
-  sed -i '/bandwidthLimit/d' "$FILE"
-  sed -i '/^transport\.useCompression/d' "$FILE"
-  sed -i '/^transport\.useEncryption/d' "$FILE"
-  sed -i '/^transport\.udpPacketSize/d' "$FILE"
-  sed -i '/^transport\.kcp\./d' "$FILE"
+    local FILE="$1"
+
+    # Legacy / unwanted TLS keys
+    sed -i '/^tls_enable[[:space:]]*=/d' "$FILE"
+    sed -i '/^transport\.tls\./d' "$FILE"
+
+    # ABSOLUTELY NO BANDWIDTH LIMIT
+    sed -i '/^transport\.bandwidthLimit[[:space:]]*=/d' "$FILE"
+    sed -i '/^transport\.bandwidthLimitMode[[:space:]]*=/d' "$FILE"
+
+    # Old / unnecessary transport settings
+    sed -i '/^transport\.udpPacketSize[[:space:]]*=/d' "$FILE"
+    sed -i '/^transport\.kcp\./d' "$FILE"
+
+    # Remove deprecated/previously injected values
+    sed -i '/^transport\.useCompression[[:space:]]*=/d' "$FILE"
+    sed -i '/^transport\.useEncryption[[:space:]]*=/d' "$FILE"
 }
 
-# ---- Ensure proxy blocks have compression=false, encryption=false --
-fix_proxy_blocks() {
-  local FILE="$1"
-  sed -i -E 's/^transport\.useCompression\s*=\s*.*/transport.useCompression = false/' "$FILE"
-  sed -i -E 's/^transport\.useEncryption\s*=\s*.*/transport.useEncryption = false/' "$FILE"
+ensure_no_bandwidth_limit() {
+    local FILE="$1"
+
+    # Delete any bandwidthLimit left by an older installation.
+    sed -i '/bandwidthLimit/d' "$FILE"
+
+    # Extra sanity check:
+    if grep -q "bandwidthLimit" "$FILE" 2>/dev/null; then
+        warn "Could not completely remove bandwidthLimit from ${FILE}"
+    fi
 }
 
-# ===================== Main Menu ===================================
+fix_proxy_transport() {
+    local FILE="$1"
+
+    # Disable compression/encryption inside every proxy block.
+    sed -i -E \
+        's/^[[:space:]]*transport\.useCompression[[:space:]]*=.*/transport.useCompression = false/' \
+        "$FILE" || true
+
+    sed -i -E \
+        's/^[[:space:]]*transport\.useEncryption[[:space:]]*=.*/transport.useEncryption = false/' \
+        "$FILE" || true
+
+    # Never permit a per-proxy bandwidth limiter.
+    sed -i '/^[[:space:]]*transport\.bandwidthLimit[[:space:]]*=/d' "$FILE"
+    sed -i '/^[[:space:]]*transport\.bandwidthLimitMode[[:space:]]*=/d' "$FILE"
+}
+
+backup_config() {
+    local FILE="$1"
+
+    if [[ -f "$FILE" ]]; then
+        local BACKUP
+        BACKUP="${FILE}.backup.$(date +%Y%m%d-%H%M%S)"
+
+        cp -a "$FILE" "$BACKUP"
+        ok "Existing config backed up: ${BACKUP}"
+    fi
+}
+
+verify_config() {
+    local BIN="$1"
+    local CFG="$2"
+
+    info "Validating ${CFG}..."
+
+    local OUT="/tmp/${BIN}-verify.out"
+
+    if "$BIN" verify -c "$CFG" >"$OUT" 2>&1; then
+        ok "${BIN} configuration is valid."
+        return 0
+    fi
+
+    cat "$OUT"
+    return 1
+}
+
+# ============================= Logs =================================
+
+diagnose_logs() {
+    local SERVICE="$1"
+
+    local LOG
+    LOG="$(journalctl -u "$SERVICE" -n 100 --no-pager 2>/dev/null || true)"
+
+    if echo "$LOG" |
+        grep -qiE "authorization failed|auth.*fail|token.*(invalid|mismatch)"; then
+        warn "Authentication failure detected. Check auth.token on both sides."
+    fi
+
+    if echo "$LOG" |
+        grep -qiE "i/o timeout|dial tcp.*timeout|no route to host"; then
+        warn "Network timeout detected. Check routing, firewall and provider security group."
+    fi
+
+    if echo "$LOG" |
+        grep -qiE "address already in use|bind: address already in use"; then
+        warn "Port conflict detected."
+    fi
+
+    if echo "$LOG" |
+        grep -qiE "connection refused"; then
+        warn "Connection refused. Check server bind port and firewall."
+    fi
+
+    if echo "$LOG" |
+        grep -qiE "bandwidthLimit"; then
+        warn "A bandwidthLimit string was found in logs/config."
+    fi
+}
+
+tunnel_verdict() {
+    local SERVICE="$1"
+
+    local LOG
+    LOG="$(journalctl -u "$SERVICE" -n 100 --no-pager 2>/dev/null || true)"
+
+    if [[ "$SERVICE" == "frpc" ]]; then
+        if echo "$LOG" | grep -qi "login to server success"; then
+            ok "FRPC tunnel: CONNECTED"
+        else
+            warn "FRPC tunnel: no successful login detected yet."
+        fi
+    fi
+
+    if [[ "$SERVICE" == "frps" ]]; then
+        if echo "$LOG" | grep -qi "client login info"; then
+            ok "FRPS tunnel: at least one client logged in."
+        else
+            warn "FRPS tunnel: no client login detected yet."
+        fi
+    fi
+}
+
+# =========================== Uninstall ===============================
+
+uninstall_frp() {
+    warn "This will remove frps/frpc installed by this script."
+
+    read -rp "Type 'yes' to confirm: " CONFIRM
+
+    [[ "$CONFIRM" == "yes" ]] || {
+        echo "Cancelled."
+        exit 0
+    }
+
+    for SERVICE in frps frpc; do
+        systemctl stop "$SERVICE" 2>/dev/null || true
+        systemctl disable "$SERVICE" 2>/dev/null || true
+        rm -f "${SYSTEMD_DIR}/${SERVICE}.service"
+    done
+
+    systemctl daemon-reload
+
+    rm -f "${BIN_DIR}/frps"
+    rm -f "${BIN_DIR}/frpc"
+
+    rm -rf "$FRP_DIR"
+    rm -rf "$LOG_DIR"
+
+    rm -f "$SYSCTL_FILE"
+
+    # Re-apply sysctl after deleting the FRP profile.
+    sysctl --system >/dev/null 2>&1 || true
+
+    if command_exists ufw; then
+        ufw delete allow 7001/tcp >/dev/null 2>&1 || true
+        ufw delete allow 7001/udp >/dev/null 2>&1 || true
+        ufw delete allow 8080/tcp >/dev/null 2>&1 || true
+        ufw delete allow 8443/tcp >/dev/null 2>&1 || true
+        ufw delete allow 7005/tcp >/dev/null 2>&1 || true
+    fi
+
+    ok "FRP installation removed."
+    exit 0
+}
+
+# ============================= Status ================================
+
+show_status() {
+    for SERVICE in frps frpc; do
+        echo ""
+        echo -e "${CYAN}================================================${NC}"
+        echo -e "${CYAN}${SERVICE}${NC}"
+        echo -e "${CYAN}================================================${NC}"
+
+        if systemctl list-unit-files 2>/dev/null |
+            grep -q "^${SERVICE}\.service"; then
+
+            if systemctl is-active --quiet "$SERVICE"; then
+                ok "Service RUNNING"
+            else
+                warn "Service NOT RUNNING"
+            fi
+
+            systemctl status "$SERVICE" \
+                --no-pager \
+                -l 2>&1 |
+                head -20 || true
+
+            echo ""
+            echo "Config: ${FRP_DIR}/${SERVICE}.toml"
+
+            if [[ -f "${FRP_DIR}/${SERVICE}.toml" ]]; then
+                ok "Config exists."
+
+                if grep -q "bandwidthLimit" "${FRP_DIR}/${SERVICE}.toml"; then
+                    warn "WARNING: bandwidthLimit exists in config!"
+                else
+                    ok "No bandwidthLimit found."
+                fi
+            else
+                warn "Config missing."
+            fi
+
+            echo ""
+            echo "Recent logs:"
+            journalctl -u "$SERVICE" -n 10 --no-pager 2>/dev/null || true
+
+            echo ""
+            tunnel_verdict "$SERVICE"
+            diagnose_logs "$SERVICE"
+
+        else
+            warn "${SERVICE} is not installed."
+        fi
+    done
+
+    exit 0
+}
+
+# =========================== Architecture ============================
+
+detect_arch() {
+    local ARCH
+    ARCH="$(uname -m)"
+
+    case "$ARCH" in
+        x86_64)
+            FRP_ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            FRP_ARCH="arm64"
+            ;;
+        armv7l|armv7)
+            FRP_ARCH="arm"
+            ;;
+        *)
+            fail "Unsupported architecture: ${ARCH}"
+            ;;
+    esac
+
+    ok "Architecture: ${FRP_ARCH}"
+}
+
+# =========================== Dependencies ============================
+
+install_dependencies() {
+    info "Installing required packages..."
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update -qq
+
+    apt-get install -y -qq \
+        curl \
+        tar \
+        jq \
+        openssl \
+        iproute2 \
+        ca-certificates \
+        netcat-openbsd \
+        procps \
+        sed \
+        grep \
+        gawk
+
+    ok "Dependencies installed."
+}
+
+# =========================== Download ================================
+
+download_frp() {
+    local FILENAME
+    FILENAME="frp_${FRP_VERSION}_linux_${FRP_ARCH}.tar.gz"
+
+    DOWNLOAD_URL="https://github.com/fatedier/frp/releases/download/${FRP_TAG}/${FILENAME}"
+
+    TMP_DIR="$(mktemp -d)"
+
+    trap 'rm -rf "${TMP_DIR}"' EXIT
+
+    info "Downloading FRP ${FRP_TAG}..."
+
+    curl \
+        -fL \
+        --retry 5 \
+        --retry-delay 2 \
+        --connect-timeout 15 \
+        --max-time 300 \
+        -o "${TMP_DIR}/${FILENAME}" \
+        "$DOWNLOAD_URL" ||
+        fail "FRP download failed."
+
+    tar -xzf \
+        "${TMP_DIR}/${FILENAME}" \
+        -C "${TMP_DIR}" ||
+        fail "Could not extract FRP archive."
+
+    EXTRACTED_DIR="${TMP_DIR}/frp_${FRP_VERSION}_linux_${FRP_ARCH}"
+
+    [[ -d "$EXTRACTED_DIR" ]] ||
+        fail "FRP extracted directory not found."
+
+    ok "FRP ${FRP_TAG} downloaded."
+}
+
+# ============================= Menu =================================
+
+clear 2>/dev/null || true
+
 echo -e "${CYAN}"
-echo "==================================================="
-echo "   FRP Reverse Tunnel - One-Click Setup"
-echo "      (v0.60.0 | NO-TLS | Proven Stable)"
-echo "==================================================="
+echo "=================================================================="
+echo "        FRP HIGH-THROUGHPUT INSTALLER"
+echo "             v${FRP_VERSION} | NO TLS"
+echo "         NO ARTIFICIAL BANDWIDTH LIMIT"
+echo "=================================================================="
 echo -e "${NC}"
 
-echo "What do you want to do?"
+echo "Select action:"
+echo ""
 echo "  1) Install / Update Server (frps)"
 echo "  2) Install / Update Client (frpc)"
 echo "  3) Status"
 echo "  4) Uninstall"
-read -rp "Choose [1-4]: " ROLE_CHOICE
-case "$ROLE_CHOICE" in
-  1) ROLE="server"; BIN_NAME="frps" ;;
-  2) ROLE="client"; BIN_NAME="frpc" ;;
-  3) ROLE="status" ;;
-  4) ROLE="uninstall" ;;
-  *) fail "Invalid choice." ;;
-esac
-
-# ------------------------------------------------------------------
-if [[ "$ROLE" == "status" ]]; then
-  for SVC in frps frpc; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${SVC}\.service"; then
-      echo -e "\n${CYAN}=== $SVC ===${NC}"
-      systemctl is-active --quiet "$SVC" && ok "process RUNNING" || warn "process NOT RUNNING"
-      systemctl status "$SVC" --no-pager -l 2>&1 | head -10 || true
-      echo "Config: /etc/frp/$SVC.toml"
-      [[ -f "/etc/frp/$SVC.toml" ]] && ok "Config present" || warn "Config missing"
-      echo "Last logs:"
-      journalctl -u "$SVC" -n 5 --no-pager 2>/dev/null || true
-      tunnel_verdict "$SVC"
-      diagnose_logs "$SVC"
-    else
-      echo -e "\n${CYAN}=== $SVC ===${NC}"
-      warn "Not installed (no systemd unit found)."
-    fi
-  done
-  exit 0
-fi
-
-if [[ "$ROLE" == "uninstall" ]]; then
-  warn "This will remove frps & frpc installed by this script."
-  read -rp "Type 'yes' to confirm: " CONFIRM
-  [[ "$CONFIRM" == "yes" ]] || exit 0
-  for SVC in frps frpc; do
-    systemctl stop "$SVC" 2>/dev/null || true
-    systemctl disable "$SVC" 2>/dev/null || true
-    rm -f /etc/systemd/system/${SVC}.service
-  done
-  systemctl daemon-reload
-  rm -f /usr/local/bin/frps /usr/local/bin/frpc
-  rm -rf /etc/frp /var/log/frp
-  rm -f /etc/sysctl.d/99-frp-tune.conf
-  ufw delete allow 7001/tcp 2>/dev/null || true
-  ufw delete allow 7001/udp 2>/dev/null || true
-  ufw delete allow 8080/tcp 2>/dev/null || true
-  ufw delete allow 8443/tcp 2>/dev/null || true
-  ufw delete allow 7005/tcp 2>/dev/null || true
-  echo -e "${GREEN}Removed.${NC}"
-  exit 0
-fi
-
-# -------------------- Install dependencies -------------------------
-info "Installing dependencies (curl, tar, jq)..."
-apt-get update -qq
-apt-get install -y -qq curl tar jq openssl || fail "Install failed."
-ok "Dependencies ready."
-
-UFW_AVAIL=$(command -v ufw >/dev/null && echo 1 || echo 0)
-
-# -------------------- Detect architecture --------------------------
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)   FRP_ARCH="amd64" ;;
-  aarch64)  FRP_ARCH="arm64" ;;
-  armv7l)   FRP_ARCH="arm" ;;
-  *) fail "Unsupported arch: $ARCH" ;;
-esac
-ok "Arch: $FRP_ARCH"
-
-# -------------------- Version v0.60.0 (proven stable) ---------------
-FRP_VERSION="0.60.0"
-FRP_TAG="v${FRP_VERSION}"
-FILENAME="frp_${FRP_VERSION}_linux_${FRP_ARCH}.tar.gz"
-DOWNLOAD_URL="https://github.com/fatedier/frp/releases/download/${FRP_TAG}/${FILENAME}"
-
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-info "Downloading ${FRP_TAG}..."
-curl -fL --retry 3 -o "${TMP_DIR}/${FILENAME}" "$DOWNLOAD_URL" || fail "Download failed."
-tar -xzf "${TMP_DIR}/${FILENAME}" -C "$TMP_DIR"
-EXTRACTED="${TMP_DIR}/frp_${FRP_VERSION}_linux_${FRP_ARCH}"
-
-mkdir -p /etc/frp /var/log/frp
-install -m 755 "${EXTRACTED}/${BIN_NAME}" "/usr/local/bin/${BIN_NAME}"
-ok "Binary installed."
-
-CONFIG_PATH="/etc/frp/${BIN_NAME}.toml"
-
-# -------------------- Protocol choice (NO TLS) ----------------------
 echo ""
-echo "Select transport mode:"
-echo "  1) TCP-RAW    → tcpMux=false, poolCount=20 (max aggregate bandwidth)"
-echo "  2) TCP-MUXED  → tcpMux=true,  poolCount=5  (single-stream stability)"
-echo "  3) QUIC       → UDP multi-stream (if ISP allows UDP)"
-echo "  4) KCP        → UDP fallback (if TCP is actively blocked)"
-read -rp "Choose [1-4]: " PROTO_CHOICE
-case "$PROTO_CHOICE" in
-  1) PROTOCOL="tcp";  TCPMUX="false" ;;
-  2) PROTOCOL="tcp";  TCPMUX="true"  ;;
-  3) PROTOCOL="quic"; TCPMUX="n/a"   ;;
-  4) PROTOCOL="kcp";  TCPMUX="n/a"   ;;
-  *) fail "Invalid protocol choice." ;;
+
+read -rp "Choose [1-4]: " ROLE_CHOICE
+
+case "$ROLE_CHOICE" in
+    1)
+        ROLE="server"
+        BIN_NAME="frps"
+        ;;
+    2)
+        ROLE="client"
+        BIN_NAME="frpc"
+        ;;
+    3)
+        show_status
+        ;;
+    4)
+        uninstall_frp
+        ;;
+    *)
+        fail "Invalid choice."
+        ;;
 esac
 
-warn "IMPORTANT: Protocol (${PROTOCOL}) must be set IDENTICALLY on server and client."
+# ======================== Preflight =================================
 
-# ------------------------------------------------------------------
+fix_dns_if_needed
+
+install_dependencies
+
+detect_arch
+
+mkdir -p "$FRP_DIR"
+mkdir -p "$LOG_DIR"
+
+chmod 700 "$FRP_DIR"
+
+# ========================== Download ================================
+
+download_frp
+
+install -m 0755 \
+    "${EXTRACTED_DIR}/${BIN_NAME}" \
+    "${BIN_DIR}/${BIN_NAME}"
+
+ok "${BIN_NAME} installed at ${BIN_DIR}/${BIN_NAME}"
+
+# ======================== Select Protocol ============================
+
+echo ""
+echo "=================================================================="
+echo "Transport mode"
+echo "=================================================================="
+echo ""
+echo "  1) TCP-RAW"
+echo "     tcpMux=false"
+echo "     poolCount=50"
+echo "     Recommended for maximum aggregate throughput"
+echo ""
+echo "  2) TCP-MUXED"
+echo "     tcpMux=true"
+echo "     poolCount=20"
+echo "     Recommended for stability / fewer underlying connections"
+echo ""
+echo "  3) QUIC"
+echo "     UDP transport"
+echo "     Useful when UDP path performs better"
+echo ""
+echo "  4) KCP"
+echo "     UDP transport"
+echo "     Fallback for difficult TCP paths"
+echo ""
+
+read -rp "Choose [1-4]: " PROTO_CHOICE
+
+case "$PROTO_CHOICE" in
+    1)
+        PROTOCOL="tcp"
+        TCPMUX="false"
+        PROTOCOL_LABEL="TCP-RAW"
+        ;;
+    2)
+        PROTOCOL="tcp"
+        TCPMUX="true"
+        PROTOCOL_LABEL="TCP-MUXED"
+        ;;
+    3)
+        PROTOCOL="quic"
+        TCPMUX="n/a"
+        PROTOCOL_LABEL="QUIC"
+        ;;
+    4)
+        PROTOCOL="kcp"
+        TCPMUX="n/a"
+        PROTOCOL_LABEL="KCP"
+        ;;
+    *)
+        fail "Invalid protocol choice."
+        ;;
+esac
+
+echo ""
+ok "Selected protocol: ${PROTOCOL_LABEL}"
+
+warn "Server and client must use the same transport protocol."
+
+# ========================== SERVER ==================================
+
 if [[ "$ROLE" == "server" ]]; then
-  AUTH_TOKEN="$FIXED_AUTH_TOKEN"
 
-  validate_or_backup_config "frps" "$CONFIG_PATH"
+    CONFIG_PATH="${FRP_DIR}/frps.toml"
 
-  if [[ -f "$CONFIG_PATH" ]]; then
-    ok "Updating config for ${PROTOCOL} mode..."
-    strip_problematic_keys "$CONFIG_PATH"
-    toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
-    toml_set "$CONFIG_PATH" "transport.maxPoolCount" "500"
-    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "120"
-    fix_proxy_blocks "$CONFIG_PATH"
+    backup_config "$CONFIG_PATH"
 
-    BIND_PORT=$(grep -E '^bindPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || true)
-    BIND_PORT="${BIND_PORT:-7001}"
-  else
-    BIND_PORT=$(pick_free_port "7001" "Bind port for tunnel control")
+    BIND_PORT=""
+
+    if [[ -f "$CONFIG_PATH" ]]; then
+        OLD_PORT="$(grep -E '^bindPort[[:space:]]*=' "$CONFIG_PATH" |
+            grep -oE '[0-9]+' |
+            head -1 || true)"
+
+        if valid_port "${OLD_PORT:-}"; then
+            BIND_PORT="$OLD_PORT"
+        fi
+    fi
+
+    if [[ -z "$BIND_PORT" ]]; then
+        BIND_PORT="$(pick_free_port "7001" "Server bind port")"
+    fi
+
+    # --------------------------------------------------------------
+    # Build a clean server config.
+    # --------------------------------------------------------------
 
     cat > "$CONFIG_PATH" <<EOF
-# ===================== frps.toml (server) =====================
+# ==================================================================
+# frps.toml
+# FRP ${FRP_TAG}
+# HIGH THROUGHPUT / NO BANDWIDTH LIMIT
+# TLS DISABLED
+# ==================================================================
+
 bindAddr = "0.0.0.0"
 bindPort = ${BIND_PORT}
+
+# HTTP/HTTPS reverse proxy ports
 vhostHTTPPort = 8080
 vhostHTTPSPort = 8443
+
+# TCP mux HTTP CONNECT port
 tcpmuxHTTPConnectPort = 7005
 
+# Authentication
 auth.method = "token"
-auth.token = "${AUTH_TOKEN}"
+auth.token = "${FIXED_AUTH_TOKEN}"
 
-# ---- Transport (conservative & stable) ----
+# ================================================================
+# SERVER TRANSPORT
+# ================================================================
+
+# Large maximum so the server does not artificially reduce the
+# client's requested connection pool.
 transport.maxPoolCount = 500
+
+# Stable heartbeat timeout.
 transport.heartbeatTimeout = 120
 
+# Keep proxy ports unrestricted.
 allowPorts = [ { start = 1, end = 65535 } ]
+
+# No artificial proxy count restriction.
 maxPortsPerClient = 0
 
+# Logging
 log.to = "/var/log/frp/frps.log"
 log.level = "info"
 log.maxDays = 7
+
 detailedErrorsToClient = true
 EOF
 
+    # --------------------------------------------------------------
+    # TCP settings
+    # --------------------------------------------------------------
+
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
-      cat >> "$CONFIG_PATH" <<'EOF'
-# TCP-RAW: each proxy = independent TCP connection (aggregate bandwidth)
+
+        cat >> "$CONFIG_PATH" <<'EOF'
+
+# ================================================================
+# TCP-RAW
+# ================================================================
+
 transport.tcpMux = false
 transport.tcpKeepalive = 60
 EOF
+
     fi
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
-      cat >> "$CONFIG_PATH" <<'EOF'
-# TCP-MUXED: single multiplexed stream (lower jitter, capped aggregate BW)
+
+        cat >> "$CONFIG_PATH" <<'EOF'
+
+# ================================================================
+# TCP-MUXED
+# ================================================================
+
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
 transport.tcpKeepalive = 60
 EOF
+
     fi
 
+    # --------------------------------------------------------------
+    # QUIC
+    # --------------------------------------------------------------
+
     if [[ "$PROTOCOL" == "quic" ]]; then
-      cat >> "$CONFIG_PATH" <<EOF
-# QUIC: UDP multi-stream
+
+        cat >> "$CONFIG_PATH" <<EOF
+
+# ================================================================
+# QUIC
+# ================================================================
+
 quicBindPort = ${BIND_PORT}
+
 transport.quic.keepalivePeriod = 30
 transport.quic.maxIdleTimeout = 120
 transport.quic.maxIncomingStreams = 100000
 EOF
+
     fi
+
+    # --------------------------------------------------------------
+    # KCP
+    # --------------------------------------------------------------
 
     if [[ "$PROTOCOL" == "kcp" ]]; then
-      cat >> "$CONFIG_PATH" <<EOF
-# KCP: UDP fallback (no tuning params in v0.60.0)
+
+        cat >> "$CONFIG_PATH" <<EOF
+
+# ================================================================
+# KCP
+# ================================================================
+
 kcpBindPort = ${BIND_PORT}
 EOF
+
     fi
 
-    ok "Server config created for ${PROTOCOL} (tcpMux=${TCPMUX})."
-  fi
+    # Absolute sanity check.
+    strip_problematic_keys "$CONFIG_PATH"
 
-  if [[ "$UFW_AVAIL" -eq 1 ]]; then
-    ufw allow "${BIND_PORT}"/tcp >/dev/null 2>&1 || true
-    if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
-      ufw allow "${BIND_PORT}"/udp >/dev/null 2>&1 || true
-      ok "Opened ${BIND_PORT}/udp for ${PROTOCOL}."
+    # Re-add required auth/protocol-independent values after cleanup.
+    toml_set "$CONFIG_PATH" "auth.method" "\"token\""
+    toml_set "$CONFIG_PATH" "auth.token" "\"${FIXED_AUTH_TOKEN}\""
+    toml_set "$CONFIG_PATH" "transport.maxPoolCount" "500"
+    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "120"
+
+    ensure_no_bandwidth_limit "$CONFIG_PATH"
+
+    ok "Server config generated."
+    echo ""
+    cat "$CONFIG_PATH"
+    echo ""
+
+    # --------------------------------------------------------------
+    # Firewall
+    # --------------------------------------------------------------
+
+    if command_exists ufw; then
+
+        ufw allow "${BIND_PORT}/tcp" >/dev/null 2>&1 || true
+
+        if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
+            ufw allow "${BIND_PORT}/udp" >/dev/null 2>&1 || true
+        fi
+
+        ufw allow 8080/tcp >/dev/null 2>&1 || true
+        ufw allow 8443/tcp >/dev/null 2>&1 || true
+        ufw allow 7005/tcp >/dev/null 2>&1 || true
+
+        ok "UFW rules applied."
+    else
+        warn "UFW is not installed. Open ${BIND_PORT}/tcp manually."
+
+        if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
+            warn "Also open ${BIND_PORT}/udp."
+        fi
     fi
-    ufw allow 8080/tcp >/dev/null 2>&1 || true
-    ufw allow 8443/tcp >/dev/null 2>&1 || true
-    ufw allow 7005/tcp >/dev/null 2>&1 || true
-    ok "Firewall (ufw) rules applied."
-  else
-    warn "ufw not installed – open ports manually (including UDP ${BIND_PORT} if using QUIC/KCP)."
-  fi
+
+    # --------------------------------------------------------------
+    # Verify
+    # --------------------------------------------------------------
+
+    verify_config "frps" "$CONFIG_PATH" ||
+        fail "frps config validation failed. Service was NOT restarted."
+
 fi
 
-# ------------------------------------------------------------------
+# =========================== CLIENT =================================
+
 if [[ "$ROLE" == "client" ]]; then
-  AUTH_TOKEN="$FIXED_AUTH_TOKEN"
 
-  validate_or_backup_config "frpc" "$CONFIG_PATH"
+    CONFIG_PATH="${FRP_DIR}/frpc.toml"
 
-  if [[ -f "$CONFIG_PATH" ]]; then
-    ok "Updating config for ${PROTOCOL} mode..."
-    strip_problematic_keys "$CONFIG_PATH"
-    toml_set "$CONFIG_PATH" "auth.token" "\"${AUTH_TOKEN}\""
-    toml_set "$CONFIG_PATH" "transport.protocol" "\"${PROTOCOL}\""
-    # Conservative heartbeat: 30s interval, 120s timeout = stable NAT keepalive
-    toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "30"
-    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "120"
-    toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "60"
-    toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "60"
-    fix_proxy_blocks "$CONFIG_PATH"
+    backup_config "$CONFIG_PATH"
 
-    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
-      toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
-      toml_set "$CONFIG_PATH" "transport.poolCount" "20"
+    SERVER_ADDR=""
+    SERVER_PORT=""
+
+    if [[ -f "$CONFIG_PATH" ]]; then
+
+        SERVER_ADDR="$(grep -E '^serverAddr[[:space:]]*=' "$CONFIG_PATH" |
+            sed -E 's/^[^=]+=[[:space:]]*"(.*)".*/\1/' |
+            head -1 || true)"
+
+        SERVER_PORT="$(grep -E '^serverPort[[:space:]]*=' "$CONFIG_PATH" |
+            grep -oE '[0-9]+' |
+            head -1 || true)"
     fi
 
-    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
-      toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
-      toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "30"
-      toml_set "$CONFIG_PATH" "transport.poolCount" "5"
+    if [[ -z "$SERVER_ADDR" ]]; then
+        read -rp "Server IP or domain: " SERVER_ADDR
+    else
+        echo "Existing server address: ${SERVER_ADDR}"
+        read -rp "Press ENTER to keep it, or enter new address: " NEW_SERVER_ADDR
+
+        if [[ -n "$NEW_SERVER_ADDR" ]]; then
+            SERVER_ADDR="$NEW_SERVER_ADDR"
+        fi
     fi
 
-    if [[ "$PROTOCOL" == "quic" ]]; then
-      toml_set "$CONFIG_PATH" "transport.quic.keepalivePeriod" "30"
-      toml_set "$CONFIG_PATH" "transport.quic.maxIdleTimeout" "120"
+    if ! valid_port "${SERVER_PORT:-}"; then
+        read -rp "Server bind port [7001]: " SERVER_PORT
+        SERVER_PORT="${SERVER_PORT:-7001}"
+    else
+        echo "Existing server port: ${SERVER_PORT}"
+        read -rp "Press ENTER to keep it, or enter new port: " NEW_SERVER_PORT
+
+        if [[ -n "$NEW_SERVER_PORT" ]]; then
+            if valid_port "$NEW_SERVER_PORT"; then
+                SERVER_PORT="$NEW_SERVER_PORT"
+            else
+                fail "Invalid server port."
+            fi
+        fi
     fi
 
-    SERVER_ADDR=$(grep -E '^serverAddr' "$CONFIG_PATH" | sed -E 's/.*"(.*)".*/\1/' || echo "")
-    SERVER_PORT=$(grep -E '^serverPort' "$CONFIG_PATH" | grep -oE '[0-9]+' || echo "")
-  else
-    read -rp "Server IP or domain: " SERVER_ADDR
-    read -rp "Server bind port [7001]: " SERVER_PORT
-    SERVER_PORT="${SERVER_PORT:-7001}"
+    # --------------------------------------------------------------
+    # Proxy ports
+    # --------------------------------------------------------------
 
-    echo "Enter TCP ports to forward (comma-separated, e.g. 80,443):"
-    read -rp "Ports: " PORTS_INPUT
+    read -rp \
+        "TCP ports to forward (comma-separated, e.g. 80,443,22) [keep existing if empty]: " \
+        PORTS_INPUT
 
-    PROXIES_BLOCK=""
-    IFS=',' read -ra PORTS <<< "$PORTS_INPUT"
-    for PORT in "${PORTS[@]}"; do
-      PORT=$(echo "$PORT" | tr -d ' ')
-      [[ -z "$PORT" ]] && continue
-      [[ ! "$PORT" =~ ^[0-9]+$ ]] && warn "Skipping invalid port: $PORT" && continue
-      PROXIES_BLOCK+="
+    if [[ -z "$PORTS_INPUT" && -f "$CONFIG_PATH" ]]; then
+
+        EXISTING_PROXY_BLOCK="$(sed -n '/^\[\[proxies\]\]/,$p' "$CONFIG_PATH" || true)"
+
+        if [[ -n "$EXISTING_PROXY_BLOCK" ]]; then
+            PROXIES_BLOCK="$EXISTING_PROXY_BLOCK"
+        else
+            warn "No existing proxy blocks found."
+            PORTS_INPUT=""
+        fi
+
+    else
+        PROXIES_BLOCK=""
+
+        IFS=',' read -ra PORTS <<< "$PORTS_INPUT"
+
+        for PORT in "${PORTS[@]}"; do
+
+            PORT="$(echo "$PORT" | tr -d '[:space:]')"
+
+            [[ -z "$PORT" ]] && continue
+
+            if ! valid_port "$PORT"; then
+                warn "Skipping invalid port: ${PORT}"
+                continue
+            fi
+
+            PROXIES_BLOCK+="
 [[proxies]]
 name = \"tcp-${PORT}\"
 type = \"tcp\"
@@ -507,150 +1004,419 @@ remotePort = ${PORT}
 transport.useCompression = false
 transport.useEncryption = false
 "
-    done
+        done
+    fi
+
+    [[ -n "$PROXIES_BLOCK" ]] ||
+        fail "No valid proxy configuration was provided."
+
+    # --------------------------------------------------------------
+    # Generate CLEAN frpc config
+    # --------------------------------------------------------------
 
     cat > "$CONFIG_PATH" <<EOF
-# ===================== frpc.toml (client) =====================
+# ==================================================================
+# frpc.toml
+# FRP ${FRP_TAG}
+# HIGH THROUGHPUT / NO BANDWIDTH LIMIT
+# TLS DISABLED
+# ==================================================================
+
 serverAddr = "${SERVER_ADDR}"
 serverPort = ${SERVER_PORT}
+
+# Keep reconnecting instead of exiting after an initial failure.
 loginFailExit = false
 
-auth.method = "token"
-auth.token = "${AUTH_TOKEN}"
+# ================================================================
+# AUTHENTICATION
+# ================================================================
 
-# ---- Transport (conservative & stable) ----
+auth.method = "token"
+auth.token = "${FIXED_AUTH_TOKEN}"
+
+# ================================================================
+# GLOBAL TRANSPORT
+# ================================================================
+
 transport.protocol = "${PROTOCOL}"
+
 transport.heartbeatInterval = 30
 transport.heartbeatTimeout = 120
+
 transport.dialServerTimeout = 60
 transport.dialServerKeepalive = 60
 EOF
 
+    # --------------------------------------------------------------
+    # TCP RAW
+    # --------------------------------------------------------------
+
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
-      cat >> "$CONFIG_PATH" <<'EOF'
-# TCP-RAW: 20 warm connections = no handshake latency when proxy wakes up
+
+        cat >> "$CONFIG_PATH" <<'EOF'
+
+# ================================================================
+# TCP-RAW
+# Maximum aggregate throughput mode.
+# ================================================================
+
 transport.tcpMux = false
-transport.poolCount = 20
+
+# Warm independent connections.
+transport.poolCount = 50
+
+transport.tcpKeepalive = 60
 EOF
+
     fi
+
+    # --------------------------------------------------------------
+    # TCP MUX
+    # --------------------------------------------------------------
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
-      cat >> "$CONFIG_PATH" <<'EOF'
-# TCP-MUXED: single stream, lower jitter, capped aggregate bandwidth
+
+        cat >> "$CONFIG_PATH" <<'EOF'
+
+# ================================================================
+# TCP-MUXED
+# ================================================================
+
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
-transport.poolCount = 5
+
+# Do not artificially starve work connections.
+transport.poolCount = 20
+
+transport.tcpKeepalive = 60
 EOF
+
     fi
 
+    # --------------------------------------------------------------
+    # QUIC
+    # --------------------------------------------------------------
+
     if [[ "$PROTOCOL" == "quic" ]]; then
-      cat >> "$CONFIG_PATH" <<'EOF'
-# QUIC: UDP multi-stream
+
+        cat >> "$CONFIG_PATH" <<'EOF'
+
+# ================================================================
+# QUIC
+# ================================================================
+
 transport.quic.keepalivePeriod = 30
 transport.quic.maxIdleTimeout = 120
 EOF
+
     fi
+
+    # --------------------------------------------------------------
+    # Logging
+    # --------------------------------------------------------------
 
     cat >> "$CONFIG_PATH" <<EOF
 
+# ================================================================
+# LOGGING
+# ================================================================
+
 log.to = "console"
 log.level = "info"
+log.maxDays = 7
 
-# ============= Auto-generated proxies (NO bandwidth limit) =============
+# ================================================================
+# PROXIES
+# NO bandwidthLimit
+# NO compression
+# NO proxy encryption
+# ================================================================
+
 ${PROXIES_BLOCK}
 EOF
 
-    if [[ ! -f "$CONFIG_PATH" ]]; then
-      fail "Failed to write config file at $CONFIG_PATH. Check disk space or permissions."
-    fi
-    ok "Client config created at $CONFIG_PATH."
+    # --------------------------------------------------------------
+    # Clean old problematic keys
+    # --------------------------------------------------------------
 
-    info "Testing reachability to ${SERVER_ADDR}:${SERVER_PORT} (${PROTOCOL})..."
-    if [[ "$PROTOCOL" == "quic" || "$PROTOCOL" == "kcp" ]]; then
-      if command -v nc >/dev/null 2>&1; then
-        if nc -uzw3 "${SERVER_ADDR}" "${SERVER_PORT}" 2>/dev/null; then
-          ok "UDP port appears reachable (best-effort; UDP checks are not fully reliable)."
-        else
-          warn "Could not confirm UDP reachability — this is normal for UDP."
-        fi
-      else
-        warn "nc not found — skipping UDP reachability test."
-      fi
-    else
-      if timeout 5 bash -c "cat < /dev/null > /dev/tcp/${SERVER_ADDR}/${SERVER_PORT}" 2>/dev/null; then
-        ok "Server reachable."
-      else
-        warn "Server NOT reachable – tunnel will fail. Check the server's firewall/security group for TCP ${SERVER_PORT}."
-      fi
+    strip_problematic_keys "$CONFIG_PATH"
+
+    # Re-assert mandatory values.
+    toml_set "$CONFIG_PATH" "serverAddr" "\"${SERVER_ADDR}\""
+    toml_set "$CONFIG_PATH" "serverPort" "${SERVER_PORT}"
+
+    toml_set "$CONFIG_PATH" "auth.method" "\"token\""
+    toml_set "$CONFIG_PATH" "auth.token" "\"${FIXED_AUTH_TOKEN}\""
+
+    toml_set "$CONFIG_PATH" "transport.protocol" "\"${PROTOCOL}\""
+    toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "30"
+    toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "120"
+    toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "60"
+    toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "60"
+
+    # Protocol-specific values after cleanup.
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
+        toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
+        toml_set "$CONFIG_PATH" "transport.poolCount" "50"
+        toml_set "$CONFIG_PATH" "transport.tcpKeepalive" "60"
     fi
-  fi
+
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
+        toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
+        toml_set "$CONFIG_PATH" "transport.poolCount" "20"
+        toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "30"
+        toml_set "$CONFIG_PATH" "transport.tcpKeepalive" "60"
+    fi
+
+    if [[ "$PROTOCOL" == "quic" ]]; then
+        toml_set "$CONFIG_PATH" "transport.quic.keepalivePeriod" "30"
+        toml_set "$CONFIG_PATH" "transport.quic.maxIdleTimeout" "120"
+    fi
+
+    # Make absolutely sure no artificial bandwidth limiter remains.
+    ensure_no_bandwidth_limit "$CONFIG_PATH"
+
+    # Make sure every proxy has compression/encryption disabled.
+    fix_proxy_transport "$CONFIG_PATH"
+
+    ok "Client config generated."
+    echo ""
+    cat "$CONFIG_PATH"
+    echo ""
+
+    # --------------------------------------------------------------
+    # Reachability test
+    # --------------------------------------------------------------
+
+    info "Testing server reachability: ${SERVER_ADDR}:${SERVER_PORT}"
+
+    if [[ "$PROTOCOL" == "tcp" ]]; then
+
+        if timeout 5 bash -c \
+            "cat < /dev/null > /dev/tcp/${SERVER_ADDR}/${SERVER_PORT}" \
+            2>/dev/null; then
+
+            ok "TCP server port is reachable."
+
+        else
+            warn "TCP server port is NOT reachable."
+            warn "Check firewall/security-group and server service."
+        fi
+
+    else
+
+        if command_exists nc; then
+
+            if nc -uzw3 \
+                "$SERVER_ADDR" \
+                "$SERVER_PORT" \
+                >/dev/null 2>&1; then
+
+                ok "UDP probe completed successfully."
+
+            else
+                warn "UDP reachability could not be confirmed."
+                warn "UDP probes are inherently best-effort."
+            fi
+
+        else
+            warn "nc is unavailable; UDP test skipped."
+        fi
+    fi
+
+    # --------------------------------------------------------------
+    # Verify
+    # --------------------------------------------------------------
+
+    verify_config "frpc" "$CONFIG_PATH" ||
+        fail "frpc configuration validation failed. Service was NOT restarted."
+
 fi
 
-# -------------------- Systemd Service -----------------------------
-SERVICE_FILE="/etc/systemd/system/${BIN_NAME}.service"
+# =========================== Systemd ================================
+
+SERVICE_FILE="${SYSTEMD_DIR}/${BIN_NAME}.service"
+
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=frp ${ROLE} (${BIN_NAME}) - ${FRP_TAG}
-After=network.target network-online.target
+Description=FRP ${ROLE} ${FRP_TAG} - High Throughput No Bandwidth Limit
+After=network-online.target
 Wants=network-online.target
+
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+
 User=root
+
+ExecStart=${BIN_DIR}/${BIN_NAME} -c ${CONFIG_PATH}
+
 Restart=always
 RestartSec=5
-ExecStart=/usr/local/bin/${BIN_NAME} -c ${CONFIG_PATH}
+
 LimitNOFILE=2097152
+LimitNPROC=infinity
+
 NoNewPrivileges=true
+
+# Give FRP ample scheduling priority without making it real-time.
+Nice=-5
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
 systemctl daemon-reload
 
-# Validate the generated configuration before restarting the service.
-if ! "${BIN_NAME}" verify -c "${CONFIG_PATH}" >/tmp/${BIN_NAME}-verify.out 2>&1; then
-  cat /tmp/${BIN_NAME}-verify.out
-  fail "${BIN_NAME} configuration validation failed. Service was NOT restarted."
-fi
-systemctl enable "${BIN_NAME}" >/dev/null 2>&1 || true
-systemctl restart "${BIN_NAME}"
-sleep 3
+# ========================= Final Verify =============================
 
-# ---- Verify service ----
-if systemctl is-active --quiet "${BIN_NAME}"; then
-  ok "${BIN_NAME} process is RUNNING"
-  tunnel_verdict "${BIN_NAME}"
-  diagnose_logs "${BIN_NAME}"
+if ! verify_config "$BIN_NAME" "$CONFIG_PATH"; then
+    fail "Configuration validation failed. Service was NOT restarted."
+fi
+
+# ============================ Start =================================
+
+systemctl enable "$BIN_NAME" >/dev/null 2>&1 || true
+
+systemctl restart "$BIN_NAME"
+
+sleep 4
+
+if systemctl is-active --quiet "$BIN_NAME"; then
+
+    ok "${BIN_NAME} service is RUNNING."
+
 else
-  warn "${BIN_NAME} failed to start. Showing logs:"
-  journalctl -u "${BIN_NAME}" -n 20 --no-pager 2>/dev/null || true
-  diagnose_logs "${BIN_NAME}"
-  exit 1
+
+    warn "${BIN_NAME} failed to start."
+
+    journalctl \
+        -u "$BIN_NAME" \
+        -n 50 \
+        --no-pager \
+        2>/dev/null || true
+
+    diagnose_logs "$BIN_NAME"
+
+    exit 1
 fi
 
-# ---- Apply sysctl tuning after successful start ----
+# ========================= Network Tune =============================
+
 apply_sysctl
 
+# =========================== Post Check =============================
+
 echo ""
-echo -e "${GREEN}=====================================================${NC}"
-echo -e "${GREEN} ${BIN_NAME} installed (${FRP_TAG})${NC}"
-echo -e "${GREEN} Protocol: ${PROTOCOL}   TLS: DISABLED${NC}"
-echo -e "${GREEN}=====================================================${NC}"
-echo "Config : ${CONFIG_PATH}"
-echo "Logs   : journalctl -u ${BIN_NAME} -f"
-echo "Restart: systemctl restart ${BIN_NAME}"
+
+if grep -q "bandwidthLimit" "$CONFIG_PATH" 2>/dev/null; then
+    warn "WARNING: bandwidthLimit is still present!"
+else
+    ok "Confirmed: no bandwidthLimit in ${CONFIG_PATH}"
+fi
+
+if grep -q "bandwidthLimitMode" "$CONFIG_PATH" 2>/dev/null; then
+    warn "WARNING: bandwidthLimitMode is still present!"
+else
+    ok "Confirmed: no bandwidthLimitMode in ${CONFIG_PATH}"
+fi
+
+tunnel_verdict "$BIN_NAME"
+diagnose_logs "$BIN_NAME"
+
+# ======================= Server Summary =============================
+
+echo ""
+echo -e "${GREEN}================================================================${NC}"
+echo -e "${GREEN}        FRP ${FRP_TAG} INSTALLATION COMPLETE${NC}"
+echo -e "${GREEN}================================================================${NC}"
+echo ""
+echo "Role        : ${ROLE}"
+echo "Binary      : ${BIN_NAME}"
+echo "Version     : ${FRP_TAG}"
+echo "Protocol    : ${PROTOCOL_LABEL}"
+echo "TLS         : DISABLED"
+echo "Bandwidth   : NO FRP LIMIT"
+echo "Compression : DISABLED"
+echo "Proxy Crypto: DISABLED"
+echo ""
+echo "Config      : ${CONFIG_PATH}"
+echo "Service     : ${BIN_NAME}"
+echo "Logs        : journalctl -u ${BIN_NAME} -f"
+echo "Restart     : systemctl restart ${BIN_NAME}"
+echo "Status      : systemctl status ${BIN_NAME}"
+echo ""
+
+# ========================= Client Summary ===========================
+
+if [[ "$ROLE" == "client" ]]; then
+
+    echo -e "${CYAN}================ CLIENT SETTINGS =================${NC}"
+    echo "Server address : ${SERVER_ADDR}"
+    echo "Server port    : ${SERVER_PORT}"
+    echo "Protocol       : ${PROTOCOL_LABEL}"
+    echo "TLS            : DISABLED"
+    echo "Bandwidth      : UNLIMITED by FRP"
+    echo ""
+
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
+        echo "TCP mux        : false"
+        echo "Pool count     : 50"
+    elif [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
+        echo "TCP mux        : true"
+        echo "Pool count     : 20"
+    fi
+
+    echo -e "${CYAN}==================================================${NC}"
+fi
+
+# ========================= Server Summary ===========================
 
 if [[ "$ROLE" == "server" ]]; then
-  PUB_IP="$(curl -fsSL --max-time 3 https://ifconfig.me 2>/dev/null || echo "<could not detect - use your known server IP>")"
-  echo ""
-  echo -e "${CYAN}================ CONNECTION SUMMARY =================${NC}"
-  echo -e "Give these EXACT values when setting up the client (frpc):"
-  echo -e "  Server address : ${GREEN}${PUB_IP}${NC}"
-  echo -e "  Server port    : ${GREEN}${BIND_PORT}${NC}"
-  echo -e "  Auth token     : ${GREEN}${AUTH_TOKEN}${NC}"
-  echo -e "  Protocol       : ${GREEN}${PROTOCOL}${NC}"
-  echo -e "  TLS            : ${GREEN}DISABLED${NC}"
-  echo -e "${CYAN}=======================================================${NC}"
+
+    PUB_IP="$(
+        curl \
+            -4 \
+            -fsSL \
+            --max-time 5 \
+            https://ifconfig.me \
+            2>/dev/null ||
+        echo "<detect manually>"
+    )"
+
+    echo -e "${CYAN}================ SERVER SETTINGS =================${NC}"
+    echo "Server address : ${PUB_IP}"
+    echo "Server port    : ${BIND_PORT}"
+    echo "Protocol       : ${PROTOCOL_LABEL}"
+    echo "TLS            : DISABLED"
+    echo "Bandwidth      : UNLIMITED by FRP"
+    echo "Auth token     : ${FIXED_AUTH_TOKEN}"
+    echo ""
+
+    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
+        echo "TCP mux        : false"
+        echo "Server pool    : max 500"
+        echo "Client pool    : recommended 50"
+    elif [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
+        echo "TCP mux        : true"
+        echo "Server pool    : max 500"
+        echo "Client pool    : recommended 20"
+    elif [[ "$PROTOCOL" == "quic" ]]; then
+        echo "UDP port       : ${BIND_PORT}"
+        echo "QUIC streams   : 100000"
+    elif [[ "$PROTOCOL" == "kcp" ]]; then
+        echo "UDP port       : ${BIND_PORT}"
+    fi
+
+    echo -e "${CYAN}==================================================${NC}"
 fi
+
+echo ""
+ok "Installation finished."
+echo ""
+
+# =====================================================================
+# END
+# =====================================================================
