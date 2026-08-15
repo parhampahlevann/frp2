@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 # =====================================================================
+# FRP High-Throughput Installer (fixed)
+# - No TLS, no bandwidth limit
+# - Global keys are ALWAYS written before [[proxies]] to avoid them
+#   being parsed as proxy-scoped fields (this was the root cause of
+#   "unknown field ... in ProxyConfig" errors)
+# - Simple TCP-RAW is the default / recommended mode: no tcpMux,
+#   no custom heartbeat, direct connection, no extra profile needed
+# =====================================================================
 set -euo pipefail
 
 # ============================= Colors ===============================
@@ -129,14 +137,36 @@ EOF
 }
 
 # ========================== Config Helpers ===========================
+# CRITICAL FIX: any key we set/append must land BEFORE the first
+# [[proxies]] table header, otherwise TOML parses it as belonging to
+# the last proxy entry -> "unknown field ... in ProxyConfig".
 toml_set() {
     local FILE="$1"
     local KEY="$2"
     local VALUE="$3"
     local KEY_ESCAPED
     KEY_ESCAPED="$(printf '%s' "$KEY" | sed 's/\./\\./g')"
+
     if grep -qE "^${KEY_ESCAPED}[[:space:]]*=" "$FILE" 2>/dev/null; then
+        # Key already exists somewhere: update it in place, wherever it is.
         sed -i -E "s/^(${KEY_ESCAPED}[[:space:]]*=).*/\1 ${VALUE}/" "$FILE"
+        return 0
+    fi
+
+    if grep -qE '^\[\[proxies\]\]' "$FILE" 2>/dev/null; then
+        # Insert the new global key on the line just before the first
+        # [[proxies]] table header, never after it.
+        local TMP
+        TMP="$(mktemp)"
+        awk -v key="$KEY" -v val="$VALUE" '
+            !done && /^\[\[proxies\]\]/ {
+                print key " = " val
+                print ""
+                done=1
+            }
+            { print }
+        ' "$FILE" > "$TMP"
+        mv "$TMP" "$FILE"
     else
         echo "${KEY} = ${VALUE}" >> "$FILE"
     fi
@@ -152,7 +182,10 @@ strip_problematic_keys() {
     sed -i '/^transport\.kcp\./d' "$FILE"
     sed -i '/^transport\.useCompression[[:space:]]*=/d' "$FILE"
     sed -i '/^transport\.useEncryption[[:space:]]*=/d' "$FILE"
-    # tcpKeepalive can cause "unknown field" errors on some 0.60.0 builds
+    # tcpKeepalive / heartbeatInterval / heartbeatTimeout are frequent
+    # sources of "unknown field" errors on 0.60.0 builds when they end
+    # up misplaced relative to [[proxies]]. We manage heartbeat only
+    # through the safe path below, so strip any stray copies here.
     sed -i '/^transport\.tcpKeepalive[[:space:]]*=/d' "$FILE"
 }
 
@@ -213,6 +246,9 @@ diagnose_logs() {
     fi
     if echo "$LOG" | grep -qiE "bandwidthLimit"; then
         warn "A bandwidthLimit string was found in logs/config."
+    fi
+    if echo "$LOG" | grep -qiE "unknown field"; then
+        warn "TOML 'unknown field' error detected — a global key likely landed after [[proxies]]. Re-run this installer (config generation was fixed)."
     fi
     if echo "$LOG" | grep -qiE "keepalive timeout|heartbeat"; then
         warn "Keepalive/heartbeat related messages found. Check heartbeat settings."
@@ -347,7 +383,7 @@ download_frp() {
 clear 2>/dev/null || true
 echo -e "${CYAN}"
 echo "=================================================================="
-echo " FRP HIGH-THROUGHPUT + STABLE INSTALLER"
+echo " FRP HIGH-THROUGHPUT + STABLE INSTALLER (fixed)"
 echo " v${FRP_VERSION} | NO TLS | NO BANDWIDTH LIMIT"
 echo "=================================================================="
 echo -e "${NC}"
@@ -386,15 +422,13 @@ echo "=================================================================="
 echo "Transport mode"
 echo "=================================================================="
 echo ""
-echo " 1) TCP-RAW"
-echo "    tcpMux=false | poolCount=10"
-echo "    Best for maximum aggregate throughput"
+echo " 1) TCP-RAW  (recommended: simplest, direct connection)"
+echo "    tcpMux=false | no custom heartbeat | no extra profile"
 echo ""
-echo " 2) TCP-MUXED (recommended for stability)"
-echo "    tcpMux=true | poolCount=5 | heartbeatInterval=-1"
-echo "    Best balance of stability + performance"
+echo " 2) TCP-MUXED"
+echo "    tcpMux=true | poolCount=5 | heartbeat auto-disabled by frp"
 echo ""
-echo " 3) QUIC (strongly recommended over KCP)"
+echo " 3) QUIC"
 echo "    UDP | good multiplexing"
 echo ""
 echo " 4) KCP"
@@ -449,6 +483,7 @@ if [[ "$ROLE" == "server" ]]; then
         BIND_PORT="$(pick_free_port "7001" "Server bind port")"
     fi
 
+    # Server config has no [[proxies]] table, so plain heredoc is safe.
     cat > "$CONFIG_PATH" <<EOF
 # ==================================================================
 # frps.toml
@@ -494,11 +529,9 @@ EOF
 
 # ================================================================
 # TCP-MUXED (stable)
-# When tcpMux=true, heartbeatTimeout should be -1
 # ================================================================
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
-transport.heartbeatTimeout = -1
 EOF
     fi
 
@@ -589,16 +622,15 @@ if [[ "$ROLE" == "client" ]]; then
 
     read -rp "TCP ports to forward (comma-separated, e.g. 80,443,22) [keep existing if empty]: " PORTS_INPUT
 
+    PROXIES_BLOCK=""
     if [[ -z "$PORTS_INPUT" && -f "$CONFIG_PATH" ]]; then
         EXISTING_PROXY_BLOCK="$(sed -n '/^\[\[proxies\]\]/,$p' "$CONFIG_PATH" || true)"
         if [[ -n "$EXISTING_PROXY_BLOCK" ]]; then
             PROXIES_BLOCK="$EXISTING_PROXY_BLOCK"
         else
             warn "No existing proxy blocks found."
-            PORTS_INPUT=""
         fi
     else
-        PROXIES_BLOCK=""
         IFS=',' read -ra PORTS <<< "$PORTS_INPUT"
         for PORT in "${PORTS[@]}"; do
             PORT="$(echo "$PORT" | tr -d '[:space:]')"
@@ -614,14 +646,15 @@ type = \"tcp\"
 localIP = \"127.0.0.1\"
 localPort = ${PORT}
 remotePort = ${PORT}
-transport.useCompression = false
-transport.useEncryption = false
 "
         done
     fi
 
     [[ -n "$PROXIES_BLOCK" ]] || fail "No valid proxy configuration was provided."
 
+    # IMPORTANT: every global (non-proxy) key is written here, BEFORE
+    # PROXIES_BLOCK is appended. Nothing global is added after this
+    # point — that is what caused "unknown field" errors before.
     cat > "$CONFIG_PATH" <<EOF
 # ==================================================================
 # frpc.toml
@@ -646,8 +679,9 @@ EOF
         cat >> "$CONFIG_PATH" <<'EOF'
 
 # ================================================================
-# TCP-RAW
+# TCP-RAW — direct connection, no mux, no custom heartbeat
 # ================================================================
+transport.tcpMux = false
 EOF
     fi
 
@@ -656,13 +690,13 @@ EOF
 
 # ================================================================
 # TCP-MUXED (stable)
-# Official rule: when tcpMux=true → heartbeatInterval must be -1
+# heartbeatInterval/heartbeatTimeout are intentionally NOT set:
+# frp automatically disables heartbeat when tcpMux is enabled, and
+# setting them manually is a common cause of TOML field errors.
 # ================================================================
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
 transport.poolCount = 5
-transport.heartbeatInterval = -1
-transport.heartbeatTimeout = 90
 EOF
     fi
 
@@ -689,33 +723,33 @@ log.maxDays = 7
 # ================================================================
 # PROXIES
 # NO bandwidthLimit | NO compression | NO proxy encryption
+# Nothing global is written after this point.
 # ================================================================
 ${PROXIES_BLOCK}
 EOF
 
     strip_problematic_keys "$CONFIG_PATH"
+    ensure_no_bandwidth_limit "$CONFIG_PATH"
+    fix_proxy_transport "$CONFIG_PATH"
 
+    # All keys below already exist in the heredoc above (before
+    # [[proxies]]), so toml_set will update them in place. The
+    # if-branch in toml_set that inserts-before-[[proxies]] only
+    # triggers for a key that is genuinely missing.
     toml_set "$CONFIG_PATH" "serverAddr" "\"${SERVER_ADDR}\""
     toml_set "$CONFIG_PATH" "serverPort" "${SERVER_PORT}"
     toml_set "$CONFIG_PATH" "auth.method" "\"token\""
     toml_set "$CONFIG_PATH" "auth.token" "\"${FIXED_AUTH_TOKEN}\""
     toml_set "$CONFIG_PATH" "transport.protocol" "\"${PROTOCOL}\""
 
-    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
-        toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
-    fi
-
-    if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
-        toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
+    if [[ "$PROTOCOL" == "tcp" ]]; then
+        toml_set "$CONFIG_PATH" "transport.tcpMux" "${TCPMUX}"
     fi
 
     if [[ "$PROTOCOL" == "quic" ]]; then
         toml_set "$CONFIG_PATH" "transport.quic.keepalivePeriod" "10"
         toml_set "$CONFIG_PATH" "transport.quic.maxIdleTimeout" "30"
     fi
-
-    ensure_no_bandwidth_limit "$CONFIG_PATH"
-    fix_proxy_transport "$CONFIG_PATH"
 
     ok "Client config generated."
     echo ""
@@ -827,13 +861,10 @@ if [[ "$ROLE" == "client" ]]; then
     echo "Server port    : ${SERVER_PORT}"
     echo "Protocol       : ${PROTOCOL_LABEL}"
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
-        echo "TCP mux        : false"
-        echo "Pool count     : 10"
-        echo "Heartbeat      : 20s"
+        echo "TCP mux        : false (direct connection)"
     elif [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
         echo "TCP mux        : true"
         echo "Pool count     : 5"
-        echo "Heartbeat      : -1 (disabled - correct for mux)"
     fi
     echo -e "${CYAN}==================================================${NC}"
 fi
@@ -846,7 +877,7 @@ if [[ "$ROLE" == "server" ]]; then
     echo "Protocol       : ${PROTOCOL_LABEL}"
     echo "Auth token     : ${FIXED_AUTH_TOKEN}"
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
-        echo "TCP mux        : true | heartbeatTimeout = -1"
+        echo "TCP mux        : true"
         echo "maxPoolCount   : 50"
     elif [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
         echo "TCP mux        : false"
@@ -863,7 +894,7 @@ echo ""
 ok "Installation finished."
 echo ""
 echo -e "${YELLOW}Recommendations:${NC}"
-echo "  • Prefer option 2 (TCP-MUXED) for best stability"
+echo "  • TCP-RAW (option 1) is the simplest and most direct — no mux, no profile"
 echo "  • Prefer QUIC over KCP when UDP works well"
 echo "  • Monitor logs after install: journalctl -u ${BIN_NAME} -f"
 echo ""
