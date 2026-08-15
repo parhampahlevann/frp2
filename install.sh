@@ -1,19 +1,37 @@
 #!/bin/bash
 
-# FRP Installation Script (Fixed)
-# Uses OFFICIAL frp v0.59.0 releases from github.com/fatedier/frp
-# - No untrusted third-party binaries
-# - Minimal systemd capabilities
-# - Proper reload via SIGHUP (systemctl reload), not SIGUSR1
-# - Download failure checks + architecture detection
-# - TLS + per-proxy encryption enabled (plain unencrypted frp traffic gets
-#   fingerprinted/reset quickly by DPI on the Iran side - this was the main
-#   cause of "connects then drops immediately")
+# FRP Installation Script (Fixed, multi-protocol)
+#
+# Uses OFFICIAL frp v0.69.1 releases from github.com/fatedier/frp.
+# v0.69.1 was picked deliberately, not just "the newest tag":
+#   - It's the latest PATCH on top of v0.69.0, which is the release that
+#     started frp's new compatibility-window policy (frpc/frps stay
+#     interoperable across 9 minor versions), so it's the most
+#     "battle-tested + still receiving fixes" point right now.
+#   - Binary size is essentially the same across recent frp versions
+#     (~12-14MB per platform) - version choice does not meaningfully
+#     change footprint; there is no meaningfully "lighter" official build.
+#
+# What changed vs the previous version of this script:
+#   - No untrusted third-party binaries; downloads official GitHub releases.
+#   - Minimal systemd capabilities (only CAP_NET_BIND_SERVICE).
+#   - Proper reload via SIGHUP (systemctl reload), not SIGUSR1.
+#   - Download failure checks + architecture detection.
+#   - frps now enables tcp, kcp AND websocket/wss simultaneously, so you
+#     can switch frpc's protocol later without reinstalling the server.
+#   - frpc lets you pick tcp / wss / kcp at install time.
+#   - Heartbeat/keepalive re-tuned: the previous script had heartbeatTimeout
+#     set too aggressively (60s). On a lossy international link that's
+#     often *itself* the cause of "connects then drops almost immediately"
+#     - the client gets marked dead on any brief latency spike. This
+#     version uses frp's own tested defaults (heartbeatInterval=10,
+#     heartbeatTimeout=90) instead of a hand-tuned, tighter value.
 
 set -o pipefail
 
-FRP_VERSION="0.59.0"
+FRP_VERSION="0.69.1"
 FRP_TOKEN="tun100"
+FRP_PORT="3090"
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -93,21 +111,26 @@ install_server() {
 
     mkdir -p /root/frp/server
 
+    # tcp/wss/websocket all share bindPort automatically.
+    # kcpBindPort opens the same port number over UDP for the kcp protocol.
+    # This means frpc can switch protocol later without touching the server.
     cat > /root/frp/server/server-3090.toml <<EOF
 # Auto-generated frps config
 bindAddr = "::"
-bindPort = 3090
+bindPort = ${FRP_PORT}
+kcpBindPort = ${FRP_PORT}
 
-transport.heartbeatTimeout = 60
+# frp's own tested defaults - a tighter custom timeout was causing the
+# connection to be dropped on brief latency spikes instead of surviving them.
+transport.heartbeatTimeout = 90
 transport.maxPoolCount = 65535
 transport.tcpMux = false
 transport.tcpMuxKeepaliveInterval = 10
 transport.tcpKeepalive = 30
 
-# TLS was disabled on the client before - plain frp traffic has a recognizable
-# handshake signature that gets fingerprinted and reset quickly by DPI/firewalls.
-# Enabling TLS here (must match the client) fixes most "connects then drops
-# immediately" symptoms.
+# Must match frpc. Unencrypted/unwrapped frp traffic has a recognizable
+# handshake signature that gets fingerprinted and reset quickly by
+# DPI/firewalls - this is the main reason plain tcp was dropping fast.
 transport.tls.force = true
 
 auth.method = "token"
@@ -143,7 +166,7 @@ EOF
      echo '0 */3 * * * systemctl reload frps@server-3090.service >/dev/null 2>&1') | crontab -
 
     echo "FRP Server installed and started!"
-    echo "Listening on port 3090 with token '${FRP_TOKEN}'"
+    echo "Listening on TCP/WSS/WS port ${FRP_PORT} and KCP(UDP) port ${FRP_PORT}, token '${FRP_TOKEN}'"
 }
 
 install_client() {
@@ -157,36 +180,56 @@ install_client() {
     read -p "Enter inbound ports to forward (comma-separated or ranges, e.g. 1194 or 6000-6005,8443) [default: 8080]: " ports
     ports=${ports:-8080}
 
+    echo ""
+    echo "پروتکل اتصال به سرور رو انتخاب کن:"
+    echo "  1) tcp  - ساده‌ترین حالت، روی اکثر شبکه‌ها کار می‌کنه"
+    echo "  2) wss  - وب‌سوکت روی TLS، شبیه ترافیک HTTPS عادی، بیشترین پایداری در برابر فیلترینگ/DPI"
+    echo "  3) kcp  - روی UDP، بهترین گزینه برای لینک‌های پرلاس/جیتری (پکت‌لاس بالا)"
+    read -p "انتخاب [1-3, پیش‌فرض 2]: " proto_choice
+    proto_choice=${proto_choice:-2}
+
+    case "$proto_choice" in
+        1)
+            transport_protocol="tcp"
+            pool_count=5
+            ;;
+        3)
+            transport_protocol="kcp"
+            pool_count=1
+            ;;
+        *)
+            transport_protocol="wss"
+            pool_count=5
+            ;;
+    esac
+
     # Escape quotes for safe insertion into the template
     escaped_ports=$(printf '%s' "$ports" | sed 's/"/\\"/g')
 
     cat > /root/frp/client/client-3090.toml <<EOF
 serverAddr = "$server_addr"
-serverPort = 3090
+serverPort = ${FRP_PORT}
 
 loginFailExit = false
 
 auth.method = "token"
 auth.token = "${FRP_TOKEN}"
 
-transport.protocol = "tcp"
+transport.protocol = "${transport_protocol}"
 transport.tcpMux = false
 transport.tcpMuxKeepaliveInterval = 10
 transport.dialServerTimeout = 10
 transport.dialServerKeepalive = 30
-transport.poolCount = 5
-transport.heartbeatInterval = 15
-transport.heartbeatTimeout = 60
+transport.poolCount = ${pool_count}
 
-# Must match frps: unencrypted frp traffic is easy for DPI/firewalls to
-# fingerprint and reset. This was the main cause of the connection dropping
-# right after it was established.
+# frp's own tested defaults (see comment at top of the script for why the
+# earlier tighter timeout was making the disconnect problem worse, not better).
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 90
+
+# Must match frps.
 transport.tls.enable = true
 transport.tls.disableCustomTLSFirstByte = false
-
-transport.quic.keepalivePeriod = 10
-transport.quic.maxIdleTimeout = 30
-transport.quic.maxIncomingStreams = 100000
 
 {{- range \$_, \$v := parseNumberRangePair "$escaped_ports" "$escaped_ports" }}
 [[proxies]]
@@ -227,9 +270,11 @@ EOF
      echo '0 */3 * * * systemctl reload frpc@client-3090.service >/dev/null 2>&1') | crontab -
 
     echo "FRP Client installed and started!"
-    echo "Connecting to $server_addr:3090"
+    echo "Connecting to $server_addr:${FRP_PORT} over ${transport_protocol}"
     echo "Forwarding ports: $ports"
     echo "Config uses Go template - frpc renders the proxy sections at runtime."
+    echo ""
+    echo "برای دیدن وضعیت اتصال: journalctl -u frpc@client-3090 -f"
 }
 
 remove_frp() {
