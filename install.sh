@@ -18,6 +18,11 @@
 #  IMPORTANT:
 #    این اسکریپت محدودیت ISP، VPS، provider، NIC، مسیر اینترنت یا
 #    congestion شبکه را حذف نمی‌کند؛ فقط محدودیت مصنوعی FRP را حذف می‌کند.
+#
+#  PATCH NOTE:
+#    transport.tcpKeepalive حذف شد چون در schema رسمی frp v0.60.0
+#    برای frps.toml / frpc.toml کلید معتبری نیست و باعث خطای
+#    "json: unknown field \"tcpKeepalive\"" در frpc verify می‌شد.
 # =====================================================================
 
 set -euo pipefail
@@ -290,6 +295,9 @@ strip_problematic_keys() {
     # Remove deprecated/previously injected values
     sed -i '/^transport\.useCompression[[:space:]]*=/d' "$FILE"
     sed -i '/^transport\.useEncryption[[:space:]]*=/d' "$FILE"
+
+    # Invalid / unsupported keys in frp v0.60.0 schema
+    sed -i '/^transport\.tcpKeepalive[[:space:]]*=/d' "$FILE"
 }
 
 ensure_no_bandwidth_limit() {
@@ -802,7 +810,6 @@ EOF
 # ================================================================
 
 transport.tcpMux = false
-transport.tcpKeepalive = 60
 EOF
 
     fi
@@ -817,7 +824,6 @@ EOF
 
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
-transport.tcpKeepalive = 60
 EOF
 
     fi
@@ -1065,8 +1071,6 @@ transport.tcpMux = false
 
 # Warm independent connections.
 transport.poolCount = 50
-
-transport.tcpKeepalive = 60
 EOF
 
     fi
@@ -1088,8 +1092,6 @@ transport.tcpMuxKeepaliveInterval = 30
 
 # Do not artificially starve work connections.
 transport.poolCount = 20
-
-transport.tcpKeepalive = 60
 EOF
 
     fi
@@ -1159,14 +1161,12 @@ EOF
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
         toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
         toml_set "$CONFIG_PATH" "transport.poolCount" "50"
-        toml_set "$CONFIG_PATH" "transport.tcpKeepalive" "60"
     fi
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
         toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
         toml_set "$CONFIG_PATH" "transport.poolCount" "20"
         toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "30"
-        toml_set "$CONFIG_PATH" "transport.tcpKeepalive" "60"
     fi
 
     if [[ "$PROTOCOL" == "quic" ]]; then
