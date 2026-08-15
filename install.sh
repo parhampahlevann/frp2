@@ -640,8 +640,6 @@ auth.token = "${FIXED_AUTH_TOKEN}"
 # GLOBAL TRANSPORT
 # ================================================================
 transport.protocol = "${PROTOCOL}"
-transport.dialServerTimeout = 30
-transport.dialServerKeepalive = 60
 EOF
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
@@ -705,9 +703,6 @@ EOF
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
         toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
-        toml_set "$CONFIG_PATH" "transport.poolCount" "10"
-        toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "20"
-        toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "90"
     fi
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
