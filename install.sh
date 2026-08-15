@@ -1,15 +1,18 @@
 #!/bin/bash
 
 # FRP Installation Script (Fixed)
-# Uses OFFICIAL frp v0.58.0 releases from github.com/fatedier/frp
+# Uses OFFICIAL frp v0.59.0 releases from github.com/fatedier/frp
 # - No untrusted third-party binaries
 # - Minimal systemd capabilities
 # - Proper reload via SIGHUP (systemctl reload), not SIGUSR1
 # - Download failure checks + architecture detection
+# - TLS + per-proxy encryption enabled (plain unencrypted frp traffic gets
+#   fingerprinted/reset quickly by DPI on the Iran side - this was the main
+#   cause of "connects then drops immediately")
 
 set -o pipefail
 
-FRP_VERSION="0.58.0"
+FRP_VERSION="0.59.0"
 FRP_TOKEN="tun100"
 
 require_root() {
@@ -95,11 +98,17 @@ install_server() {
 bindAddr = "::"
 bindPort = 3090
 
-transport.heartbeatTimeout = 90
+transport.heartbeatTimeout = 60
 transport.maxPoolCount = 65535
 transport.tcpMux = false
 transport.tcpMuxKeepaliveInterval = 10
-transport.tcpKeepalive = 120
+transport.tcpKeepalive = 30
+
+# TLS was disabled on the client before - plain frp traffic has a recognizable
+# handshake signature that gets fingerprinted and reset quickly by DPI/firewalls.
+# Enabling TLS here (must match the client) fixes most "connects then drops
+# immediately" symptoms.
+transport.tls.force = true
 
 auth.method = "token"
 auth.token = "${FRP_TOKEN}"
@@ -164,11 +173,17 @@ transport.protocol = "tcp"
 transport.tcpMux = false
 transport.tcpMuxKeepaliveInterval = 10
 transport.dialServerTimeout = 10
-transport.dialServerKeepalive = 120
-transport.poolCount = 20
-transport.heartbeatInterval = 30
-transport.heartbeatTimeout = 90
-transport.tls.enable = false
+transport.dialServerKeepalive = 30
+transport.poolCount = 5
+transport.heartbeatInterval = 15
+transport.heartbeatTimeout = 60
+
+# Must match frps: unencrypted frp traffic is easy for DPI/firewalls to
+# fingerprint and reset. This was the main cause of the connection dropping
+# right after it was established.
+transport.tls.enable = true
+transport.tls.disableCustomTLSFirstByte = false
+
 transport.quic.keepalivePeriod = 10
 transport.quic.maxIdleTimeout = 30
 transport.quic.maxIncomingStreams = 100000
@@ -180,8 +195,8 @@ type = "tcp"
 localIP = "127.0.0.1"
 localPort = {{ \$v.First }}
 remotePort = {{ \$v.Second }}
-transport.useEncryption = false
-transport.useCompression = false
+transport.useEncryption = true
+transport.useCompression = true
 {{- end }}
 EOF
 
