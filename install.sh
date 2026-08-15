@@ -486,7 +486,6 @@ EOF
 # TCP-RAW
 # ================================================================
 transport.tcpMux = false
-transport.heartbeatTimeout = 90
 EOF
     fi
 
@@ -651,10 +650,6 @@ EOF
 # ================================================================
 # TCP-RAW
 # ================================================================
-transport.tcpMux = false
-transport.poolCount = 10
-transport.heartbeatInterval = 20
-transport.heartbeatTimeout = 90
 EOF
     fi
 
@@ -707,8 +702,6 @@ EOF
     toml_set "$CONFIG_PATH" "auth.method" "\"token\""
     toml_set "$CONFIG_PATH" "auth.token" "\"${FIXED_AUTH_TOKEN}\""
     toml_set "$CONFIG_PATH" "transport.protocol" "\"${PROTOCOL}\""
-    toml_set "$CONFIG_PATH" "transport.dialServerTimeout" "30"
-    toml_set "$CONFIG_PATH" "transport.dialServerKeepalive" "60"
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "false" ]]; then
         toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
@@ -718,11 +711,7 @@ EOF
     fi
 
     if [[ "$PROTOCOL" == "tcp" && "$TCPMUX" == "true" ]]; then
-        toml_set "$CONFIG_PATH" "transport.tcpMux" "true"
-        toml_set "$CONFIG_PATH" "transport.tcpMuxKeepaliveInterval" "30"
-        toml_set "$CONFIG_PATH" "transport.poolCount" "5"
-        toml_set "$CONFIG_PATH" "transport.heartbeatInterval" "-1"
-        toml_set "$CONFIG_PATH" "transport.heartbeatTimeout" "90"
+        toml_set "$CONFIG_PATH" "transport.tcpMux" "false"
     fi
 
     if [[ "$PROTOCOL" == "quic" ]]; then
