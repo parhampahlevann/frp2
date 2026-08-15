@@ -101,24 +101,6 @@ apply_sysctl() {
 # ====================================================================
 # FRP High Throughput Network Profile
 # ====================================================================
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.core.rmem_default = 16777216
-net.core.wmem_default = 16777216
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 262144
-net.ipv4.tcp_rmem = 4096 16777216 134217728
-net.ipv4.tcp_wmem = 4096 16777216 134217728
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 6
-net.ipv4.tcp_retries2 = 5
-net.ipv4.ip_local_port_range = 1024 65535
 EOF
 
     if [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
