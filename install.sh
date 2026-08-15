@@ -3,26 +3,27 @@
 # FRP HIGH-THROUGHPUT + STABLE INSTALLER / UPDATER
 # frps + frpc | FRP v0.60.0 | NO TLS | NO BANDWIDTH LIMIT
 #
-# اهداف:
-# - حذف کامل bandwidth limit
-# - حداکثر throughput عملی + پایداری بالا
-# - TCP-RAW برای throughput بالا
-# - TCP-MUXED برای پایداری (با heartbeat صحیح)
-# - QUIC توصیه می‌شود به جای KCP
-# - KCP فقط fallback
-# - sysctl مناسب throughput
-# - BBR در صورت پشتیبانی
-# - systemd auto restart
-# - config verification قبل از restart
+# Goals:
+# - Completely remove artificial bandwidth limits
+# - Maximum practical throughput + high stability
+# - TCP-RAW for maximum aggregate throughput
+# - TCP-MUXED for better stability (with correct heartbeat settings)
+# - QUIC recommended over KCP
+# - KCP only as fallback
+# - Conservative but throughput-oriented sysctl tuning
+# - BBR when supported by the kernel
+# - systemd auto-restart
+# - Config verification before service restart
 #
-# IMPORTANT FIXES (نسبت به نسخه قبلی):
-# 1. وقتی tcpMux=true باشد → heartbeatInterval باید -1 باشد
-#    (قانون رسمی frp از نسخه‌های جدید)
-# 2. poolCount خیلی بالا (۵۰) باعث قطع‌وصلی و محدودیت‌های شبکه می‌شود
-# 3. maxPoolCount سرور منطقی‌تر شد
-# 4. تنظیمات keepalive و timeout هماهنگ‌تر
+# IMPORTANT FIXES compared to previous versions:
+# 1. When tcpMux=true → heartbeatInterval MUST be -1
+#    (official frp recommendation)
+# 2. Very high poolCount (e.g. 50) causes instability and connection limits
+# 3. maxPoolCount on server set to a more reasonable value
+# 4. Better coordinated keepalive / timeout settings
 #
-# این اسکریپت محدودیت واقعی ISP/VPS/مسیر اینترنت را حذف نمی‌کند.
+# This script does NOT remove real ISP / VPS / network path limitations.
+# It only removes artificial limits imposed by FRP itself.
 # =====================================================================
 set -euo pipefail
 
@@ -198,7 +199,7 @@ strip_problematic_keys() {
     sed -i '/^transport\.kcp\./d' "$FILE"
     sed -i '/^transport\.useCompression[[:space:]]*=/d' "$FILE"
     sed -i '/^transport\.useEncryption[[:space:]]*=/d' "$FILE"
-    # tcpKeepalive در بعضی نسخه‌های ۰.۶۰.۰ باعث خطای schema می‌شود
+    # tcpKeepalive can cause "unknown field" errors on some 0.60.0 builds
     sed -i '/^transport\.tcpKeepalive[[:space:]]*=/d' "$FILE"
 }
 
@@ -355,9 +356,9 @@ detect_arch() {
     local ARCH
     ARCH="$(uname -m)"
     case "$ARCH" in
-        x86_64) FRP_ARCH="amd64" ;;
+        x86_64)     FRP_ARCH="amd64" ;;
         aarch64|arm64) FRP_ARCH="arm64" ;;
-        armv7l|armv7) FRP_ARCH="arm" ;;
+        armv7l|armv7)  FRP_ARCH="arm" ;;
         *) fail "Unsupported architecture: ${ARCH}" ;;
     esac
     ok "Architecture: ${FRP_ARCH}"
@@ -434,17 +435,17 @@ echo "=================================================================="
 echo ""
 echo " 1) TCP-RAW"
 echo "    tcpMux=false | poolCount=10"
-echo "    بهترین برای حداکثر throughput"
+echo "    Best for maximum aggregate throughput"
 echo ""
-echo " 2) TCP-MUXED (توصیه برای پایداری)"
+echo " 2) TCP-MUXED (recommended for stability)"
 echo "    tcpMux=true | poolCount=5 | heartbeatInterval=-1"
-echo "    بهترین تعادل پایداری + سرعت"
+echo "    Best balance of stability + performance"
 echo ""
-echo " 3) QUIC (توصیه قوی به جای KCP)"
-echo "    UDP | multiplexing خوب"
+echo " 3) QUIC (strongly recommended over KCP)"
+echo "    UDP | good multiplexing"
 echo ""
 echo " 4) KCP"
-echo "    فقط fallback | معمولاً سرعت پایین‌تر از انتظار"
+echo "    Fallback only | usually lower speed than expected"
 echo ""
 read -rp "Choose [1-4]: " PROTO_CHOICE
 
@@ -468,7 +469,7 @@ case "$PROTO_CHOICE" in
         PROTOCOL="kcp"
         TCPMUX="n/a"
         PROTOCOL_LABEL="KCP"
-        warn "KCP معمولاً روی مسیرهای معمولی سرعت کمتری نسبت به TCP/QUIC دارد."
+        warn "KCP usually delivers lower throughput than TCP/QUIC on clean paths."
         ;;
     *)
         fail "Invalid protocol choice."
@@ -540,8 +541,8 @@ EOF
         cat >> "$CONFIG_PATH" <<'EOF'
 
 # ================================================================
-# TCP-MUXED (پایدار)
-# وقتی tcpMux=true باشد heartbeatTimeout باید -1 باشد
+# TCP-MUXED (stable)
+# When tcpMux=true, heartbeatTimeout should be -1
 # ================================================================
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
@@ -708,8 +709,8 @@ EOF
         cat >> "$CONFIG_PATH" <<'EOF'
 
 # ================================================================
-# TCP-MUXED (پایدار)
-# قانون رسمی: وقتی tcpMux=true → heartbeatInterval باید -1 باشد
+# TCP-MUXED (stable)
+# Official rule: when tcpMux=true → heartbeatInterval must be -1
 # ================================================================
 transport.tcpMux = true
 transport.tcpMuxKeepaliveInterval = 30
@@ -730,7 +731,6 @@ transport.quic.maxIdleTimeout = 30
 EOF
     fi
 
-    # Logging + Proxies
     cat >> "$CONFIG_PATH" <<EOF
 
 # ================================================================
@@ -749,7 +749,6 @@ EOF
 
     strip_problematic_keys "$CONFIG_PATH"
 
-    # Re-assert mandatory values
     toml_set "$CONFIG_PATH" "serverAddr" "\"${SERVER_ADDR}\""
     toml_set "$CONFIG_PATH" "serverPort" "${SERVER_PORT}"
     toml_set "$CONFIG_PATH" "auth.method" "\"token\""
@@ -926,8 +925,8 @@ fi
 echo ""
 ok "Installation finished."
 echo ""
-echo -e "${YELLOW}توصیه:${NC}"
-echo "  • برای پایداری بیشتر گزینه ۲ (TCP-MUXED) را انتخاب کنید"
-echo "  • اگر UDP خوب کار می‌کند، QUIC را ترجیح دهید به KCP"
-echo "  • بعد از نصب لاگ را چند دقیقه مانیتور کنید: journalctl -u ${BIN_NAME} -f"
+echo -e "${YELLOW}Recommendations:${NC}"
+echo "  • Prefer option 2 (TCP-MUXED) for best stability"
+echo "  • Prefer QUIC over KCP when UDP works well"
+echo "  • Monitor logs after install: journalctl -u ${BIN_NAME} -f"
 echo ""
