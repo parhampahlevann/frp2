@@ -1,20 +1,26 @@
 #!/bin/bash
 
 # =============================================================================
-# FRP Ultra-Stable Installation Script (v2.2 - Bugfix Edition)
+# FRP Iran-Optimized Installation Script (v3.0)
 # =============================================================================
-# Version: frp v0.69.1  |  Script v2.2
-# Fixes in v2.2:
-#   - Removed transport.heartbeatInterval from server config (client-only field)
-#   - Removed transport.tls.disableCustomTLSFirstByte from server config (client-only field)
-#   - Moved StartLimitIntervalSec / StartLimitBurst to [Unit] section in systemd
+# Version: frp v0.69.1  |  Script v3.0
+# Optimized for: Iran / High-censorship networks
+# Key changes:
+#   - Default port: 443 (blends with HTTPS)
+#   - Default protocol: http2 (harder to fingerprint than websocket)
+#   - tcpMux enabled for traffic blending
+#   - TLS SNI/domain fronting support
+#   - Proxy chaining (socks5/http) for existing tunnel users
+#   - UDP/KCP disabled by default (blocked in Iran)
+#   - Removed client-only fields from server config
+#   - StartLimitIntervalSec / StartLimitBurst in [Unit]
 # =============================================================================
 
 set -o pipefail
 
 FRP_VERSION="0.69.1"
 FRP_TOKEN="tun100"
-FRP_PORT="3090"
+FRP_PORT="443"
 ADMIN_PORT_S="7500"
 ADMIN_PORT_C="7400"
 
@@ -23,6 +29,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 require_root() {
@@ -47,6 +54,7 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()  { echo -e "${BLUE}[STEP]${NC}  $1"; }
 log_ok()    { echo -e "${CYAN}[OK]${NC}    $1"; }
+log_ir()    { echo -e "${MAGENTA}[IRAN]${NC}  $1"; }
 
 download_frp_binary() {
     local bin_name="$1"
@@ -62,7 +70,7 @@ download_frp_binary() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
-    log_step "Downloading ${bin_name} (frp v${FRP_VERSION}, ${arch}) from official GitHub release..."
+    log_step "Downloading ${bin_name} (frp v${FRP_VERSION}, ${arch})..."
     if ! curl -fL --retry 5 --retry-delay 3 --connect-timeout 15 -o "${tmp_dir}/frp.tar.gz" "$url"; then
         log_error "Download failed: $url"
         rm -rf "$tmp_dir"
@@ -83,7 +91,7 @@ download_frp_binary() {
 
     install -m 755 "${tmp_dir}/${pkg}/${bin_name}" "/usr/local/bin/${bin_name}"
     rm -rf "$tmp_dir"
-    log_info "${bin_name} installed successfully at /usr/local/bin/${bin_name}"
+    log_info "${bin_name} installed at /usr/local/bin/${bin_name}"
 }
 
 tune_tcp_for_frp() {
@@ -134,7 +142,7 @@ open_firewall_port() {
 }
 
 install_watchdog() {
-    log_step "Installing Watchdog for health monitoring and auto-healing..."
+    log_step "Installing Watchdog for health monitoring..."
 
     cat > /usr/local/bin/frp-watchdog.sh <<'WATCHDOG_EOF'
 #!/bin/bash
@@ -165,18 +173,18 @@ check_frps() {
         log_msg "WATCHDOG: frps process NOT RUNNING"
         fail=1
     fi
-    if ! ss -tlnp 2>/dev/null | grep -q ":3090"; then
-        if ! netstat -tlnp 2>/dev/null | grep -q ":3090"; then
-            log_msg "WATCHDOG: frps NOT LISTENING on port 3090"
+    if ! ss -tlnp 2>/dev/null | grep -q ":${FRP_PORT}"; then
+        if ! netstat -tlnp 2>/dev/null | grep -q ":${FRP_PORT}"; then
+            log_msg "WATCHDOG: frps NOT LISTENING on port ${FRP_PORT}"
             fail=1
         fi
     fi
     if ! check_admin_api "7500" "admin" "tun100"; then
-        log_msg "WATCHDOG: frps admin API not responding (may be starting)"
+        log_msg "WATCHDOG: frps admin API not responding"
     fi
     if [ "$fail" -eq 1 ]; then
-        log_msg "WATCHDOG: RESTARTING frps@server-3090..."
-        systemctl restart frps@server-3090.service >/dev/null 2>&1
+        log_msg "WATCHDOG: RESTARTING frps@server-${FRP_PORT}..."
+        systemctl restart frps@server-${FRP_PORT}.service >/dev/null 2>&1
         sleep 5
         if pgrep -x "frps" >/dev/null 2>&1; then
             log_msg "WATCHDOG: frps restarted OK"
@@ -204,8 +212,8 @@ check_frpc() {
         fi
     fi
     if [ "$fail" -eq 1 ]; then
-        log_msg "WATCHDOG: RESTARTING frpc@client-3090..."
-        systemctl restart frpc@client-3090.service >/dev/null 2>&1
+        log_msg "WATCHDOG: RESTARTING frpc@client-${FRP_PORT}..."
+        systemctl restart frpc@client-${FRP_PORT}.service >/dev/null 2>&1
         sleep 10
         if pgrep -x "frpc" >/dev/null 2>&1; then
             log_msg "WATCHDOG: frpc restarted OK"
@@ -326,7 +334,7 @@ PROXY
 show_menu() {
     clear
     echo "============================================"
-    echo "     FRP Ultra-Stable Tunnel Setup          "
+    echo "     FRP Iran-Optimized Tunnel Setup        "
     echo "         (frp v${FRP_VERSION})                "
     echo "============================================"
     echo "1) Install FRP Server (frps)"
@@ -340,24 +348,22 @@ show_menu() {
 
 install_server() {
     log_step "=== Installing FRP Server (frps) ==="
+    log_ir "Iran-optimized: Port 443, HTTP/2 ready, UDP disabled"
 
     download_frp_binary "frps"
     mkdir -p /root/frp/server /var/log
 
     open_firewall_port "$FRP_PORT" "tcp"
-    open_firewall_port "$FRP_PORT" "udp"
     open_firewall_port "$ADMIN_PORT_S" "tcp"
 
-    # BUGFIX v2.2:
-    # - Removed transport.heartbeatInterval (client-only field in frp v0.69.1)
-    # - Removed transport.tls.disableCustomTLSFirstByte (client-only field)
-    cat > /root/frp/server/server-3090.toml <<EOF
-# FRP Server Configuration (Auto-generated)
-# frp v${FRP_VERSION}  |  Ultra-Stable Edition
+    cat > /root/frp/server/server-${FRP_PORT}.toml <<EOF
+# FRP Server Configuration - Iran Optimized
+# frp v${FRP_VERSION}  |  Port ${FRP_PORT}  |  TCP Only
 
 bindAddr = "::"
 bindPort = ${FRP_PORT}
-kcpBindPort = ${FRP_PORT}
+# KCP/UDP disabled - blocked in Iran
+kcpBindPort = 0
 
 # Web Dashboard
 webServer.addr = "0.0.0.0"
@@ -374,7 +380,7 @@ log.disablePrintColor = true
 # Transport - server side
 transport.heartbeatTimeout = 90
 transport.maxPoolCount = 65535
-transport.tcpMux = false
+transport.tcpMux = true
 transport.tcpKeepalive = 30
 
 # TLS - force TLS connections
@@ -385,8 +391,6 @@ auth.method = "token"
 auth.token = "${FRP_TOKEN}"
 EOF
 
-    # BUGFIX v2.2:
-    # - Moved StartLimitIntervalSec and StartLimitBurst to [Unit] section
     cat > /etc/systemd/system/frps@.service <<'EOF'
 [Unit]
 Description=FRP Server Service (%i)
@@ -414,40 +418,41 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable frps@server-3090.service
-    systemctl restart frps@server-3090.service
+    systemctl enable frps@server-${FRP_PORT}.service
+    systemctl restart frps@server-${FRP_PORT}.service
 
     tune_tcp_for_frp
     install_watchdog
 
     sleep 3
 
-    if systemctl is-active --quiet frps@server-3090.service; then
+    if systemctl is-active --quiet frps@server-${FRP_PORT}.service; then
         log_info "FRP Server installed and running!"
         echo ""
         echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║  Server Status: RUNNING                              ║${NC}"
-        echo -e "${GREEN}║  Bind Port:     ${FRP_PORT} (TCP+UDP)                       ║${NC}"
+        echo -e "${GREEN}║  Bind Port:     ${FRP_PORT} (TCP Only)                      ║${NC}"
         echo -e "${GREEN}║  Dashboard:    http://YOUR_IP:${ADMIN_PORT_S}              ║${NC}"
         echo -e "${GREEN}║  Dashboard PW: ${FRP_TOKEN}                          ║${NC}"
         echo -e "${GREEN}║  Token:        ${FRP_TOKEN}                          ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
         echo ""
-        log_info "View logs: journalctl -u frps@server-3090 -f"
+        log_info "View logs: journalctl -u frps@server-${FRP_PORT} -f"
         log_info "Dashboard: http://YOUR_IP:${ADMIN_PORT_S}"
     else
         log_error "Failed to start server!"
-        journalctl -u frps@server-3090 --no-pager -n 20
+        journalctl -u frps@server-${FRP_PORT} --no-pager -n 20
     fi
 }
 
 install_client() {
     log_step "=== Installing FRP Client (frpc) ==="
+    log_ir "Iran-optimized: HTTP/2 default, TLS camouflage, proxy support"
 
     download_frp_binary "frpc"
     mkdir -p /root/frp/client /var/log
 
-    read -p "Enter server address (IPv4 or IPv6): " server_addr
+    read -p "Enter server address (IP or domain): " server_addr
     while [ -z "$server_addr" ]; do
         log_warn "Server address cannot be empty!"
         read -p "Enter server address: " server_addr
@@ -460,27 +465,31 @@ install_client() {
 
     echo ""
     echo "Select connection protocol:"
-    echo "  1) tcp       - Simplest, works on most networks"
-    echo "  2) websocket - Looks like HTTPS traffic, best DPI resistance"
-    echo "  3) kcp       - Over UDP, best for high packet-loss links"
-    echo "  4) quic      - Modern UDP protocol, better alternative to KCP"
-    read -p "Select [1-4, default 2]: " proto_choice
-    proto_choice=${proto_choice:-2}
+    echo "  1) http2     - RECOMMENDED: Looks like HTTPS, hardest to block"
+    echo "  2) websocket - Good, but easier to fingerprint than http2"
+    echo "  3) tcp       - Simplest, no obfuscation (NOT recommended for Iran)"
+    echo "  4) kcp       - UDP-based, usually BLOCKED in Iran"
+    echo "  5) quic      - UDP-based, usually BLOCKED in Iran"
+    read -p "Select [1-5, default 1]: " proto_choice
+    proto_choice=${proto_choice:-1}
 
     local transport_protocol
     local pool_count
     local kcp_config=""
+    local iran_warn=""
 
     case "$proto_choice" in
-        1)
-            transport_protocol="tcp"
-            pool_count=5
-            ;;
         3)
+            transport_protocol="tcp"
+            pool_count=10
+            iran_warn="WARNING: Plain TCP is easily detected in Iran. Consider HTTP/2."
+            ;;
+        4)
             transport_protocol="kcp"
             pool_count=1
+            iran_warn="WARNING: KCP uses UDP which is heavily filtered in Iran."
             kcp_config='
-# KCP tuning for lossy international links
+# KCP tuning for lossy links
 transport.kcp.mtu = 1350
 transport.kcp.sndwnd = 128
 transport.kcp.rcvwnd = 1024
@@ -489,19 +498,90 @@ transport.kcp.parityshard = 3
 transport.kcp.dscp = 46
 '
             ;;
-        4)
+        5)
             transport_protocol="quic"
             pool_count=1
+            iran_warn="WARNING: QUIC uses UDP which is heavily filtered in Iran."
+            ;;
+        2)
+            transport_protocol="websocket"
+            pool_count=10
             ;;
         *)
-            transport_protocol="websocket"
-            pool_count=5
+            transport_protocol="http2"
+            pool_count=10
             ;;
     esac
 
-    cat > /root/frp/client/client-3090.toml <<EOF
-# FRP Client Configuration (Auto-generated)
-# frp v${FRP_VERSION}  |  Ultra-Stable Edition
+    if [ -n "$iran_warn" ]; then
+        log_warn "$iran_warn"
+    fi
+
+    echo ""
+    echo "TLS / Domain Fronting Options:"
+    echo "  1) Basic TLS (default) - Encrypted but SNI reveals your server IP"
+    echo "  2) Domain Fronting     - Fake SNI to a real site (e.g., microsoft.com)"
+    echo "  3) Real Domain         - Your own domain with valid certificate"
+    read -p "Select [1-3, default 1]: " tls_choice
+    tls_choice=${tls_choice:-1}
+
+    local tls_config=""
+    local sni_note=""
+
+    case "$tls_choice" in
+        2)
+            read -p "Enter fake SNI domain [default: www.microsoft.com]: " fake_sni
+            fake_sni=${fake_sni:-www.microsoft.com}
+            tls_config="transport.tls.enable = true
+transport.tls.disableCustomTLSFirstByte = true
+transport.tls.serverName = \"${fake_sni}\""
+            sni_note="SNI: ${fake_sni} (domain fronting)"
+            log_ir "Domain fronting active: SNI will show ${fake_sni}"
+            ;;
+        3)
+            read -p "Enter your real domain: " real_domain
+            while [ -z "$real_domain" ]; do
+                log_warn "Domain cannot be empty!"
+                read -p "Enter your real domain: " real_domain
+            done
+            tls_config="transport.tls.enable = true
+transport.tls.disableCustomTLSFirstByte = true
+transport.tls.serverName = \"${real_domain}\""
+            sni_note="SNI: ${real_domain} (real domain)"
+            ;;
+        *)
+            tls_config="transport.tls.enable = true
+transport.tls.disableCustomTLSFirstByte = true"
+            sni_note="SNI: ${server_addr} (basic TLS)"
+            ;;
+    esac
+
+    echo ""
+    echo "Proxy Chaining (optional):"
+    echo "  If you already have a working proxy (Shadowsocks/V2Ray/Xray),"
+    echo "  FRP can tunnel through it for extra stability."
+    read -p "Use existing proxy? (y/n) [default: n]: " use_proxy
+
+    local proxy_config=""
+    if [[ "$use_proxy" =~ ^[Yy]$ ]]; then
+        echo "  1) SOCKS5 (e.g., V2Ray/Xray default: 127.0.0.1:10808)"
+        echo "  2) HTTP   (e.g., local HTTP proxy)"
+        read -p "Select proxy type [1-2, default 1]: " proxy_type
+        proxy_type=${proxy_type:-1}
+        read -p "Enter proxy address [default: 127.0.0.1:10808]: " proxy_addr
+        proxy_addr=${proxy_addr:-127.0.0.1:10808}
+
+        if [ "$proxy_type" = "2" ]; then
+            proxy_config="transport.proxyURL = \"http://${proxy_addr}\""
+        else
+            proxy_config="transport.proxyURL = \"socks5://${proxy_addr}\""
+        fi
+        log_ir "Proxy chaining enabled: ${proxy_config}"
+    fi
+
+    cat > /root/frp/client/client-${FRP_PORT}.toml <<EOF
+# FRP Client Configuration - Iran Optimized
+# frp v${FRP_VERSION}  |  Protocol: ${transport_protocol}  |  Port: ${FRP_PORT}
 
 serverAddr = "${server_addr}"
 serverPort = ${FRP_PORT}
@@ -527,7 +607,7 @@ auth.token = "${FRP_TOKEN}"
 # Protocol
 transport.protocol = "${transport_protocol}"
 transport.poolCount = ${pool_count}
-transport.tcpMux = false
+transport.tcpMux = true
 transport.dialServerTimeout = 15
 transport.dialServerKeepalive = 30
 
@@ -535,22 +615,20 @@ transport.dialServerKeepalive = 30
 transport.heartbeatInterval = 15
 transport.heartbeatTimeout = 90
 
-# TLS - DPI Evasion
-transport.tls.enable = true
-transport.tls.disableCustomTLSFirstByte = true
+# TLS Configuration
+${tls_config}
 
+${proxy_config}
 ${kcp_config}
 EOF
 
-    generate_tcp_proxies "$ports" "/root/frp/client/client-3090.toml"
+    generate_tcp_proxies "$ports" "/root/frp/client/client-${FRP_PORT}.toml"
 
     if [[ "$forward_udp" =~ ^[Yy]$ ]]; then
-        log_info "Adding UDP forwarding..."
-        generate_udp_proxies "$ports" "/root/frp/client/client-3090.toml"
+        log_warn "Adding UDP forwarding... (may not work in Iran)"
+        generate_udp_proxies "$ports" "/root/frp/client/client-${FRP_PORT}.toml"
     fi
 
-    # BUGFIX v2.2:
-    # - Moved StartLimitIntervalSec and StartLimitBurst to [Unit] section
     cat > /etc/systemd/system/frpc@.service <<'EOF'
 [Unit]
 Description=FRP Client Service (%i)
@@ -578,8 +656,8 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable frpc@client-3090.service
-    systemctl restart frpc@client-3090.service
+    systemctl enable frpc@client-${FRP_PORT}.service
+    systemctl restart frpc@client-${FRP_PORT}.service
 
     tune_tcp_for_frp
     install_watchdog
@@ -607,18 +685,22 @@ EOF
         echo -e "${GREEN}║  Client Status: CONNECTED                            ║${NC}"
         echo -e "${GREEN}║  Server:        ${server_addr}:${FRP_PORT}                  ║${NC}"
         echo -e "${GREEN}║  Protocol:     ${transport_protocol}                          ║${NC}"
+        echo -e "${GREEN}║  ${sni_note}                    ║${NC}"
         echo -e "${GREEN}║  TCP Ports:    ${ports}                              ║${NC}"
         if [[ "$forward_udp" =~ ^[Yy]$ ]]; then
         echo -e "${GREEN}║  UDP Ports:    ${ports} (also forwarded)              ║${NC}"
         fi
+        if [ -n "$proxy_config" ]; then
+        echo -e "${GREEN}║  Proxy:        ENABLED                               ║${NC}"
+        fi
         echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
     else
         log_warn "Connection not yet established. This may take a few seconds."
-        echo -e "${YELLOW}Check status: journalctl -u frpc@client-3090 -f${NC}"
+        echo -e "${YELLOW}Check status: journalctl -u frpc@client-${FRP_PORT} -f${NC}"
     fi
 
     echo ""
-    log_info "View logs: journalctl -u frpc@client-3090 -f"
+    log_info "View logs: journalctl -u frpc@client-${FRP_PORT} -f"
     log_info "Check status: curl -u admin:${FRP_TOKEN} http://127.0.0.1:${ADMIN_PORT_C}/api/status"
 }
 
@@ -633,7 +715,7 @@ check_status() {
         has_service=true
         echo ""
         echo "--- FRP Server (frps) ---"
-        systemctl status frps@server-3090.service --no-pager 2>/dev/null || echo "Not installed"
+        systemctl status frps@server-${FRP_PORT}.service --no-pager 2>/dev/null || echo "Not installed"
 
         if [ -f /var/log/frp-watchdog.log ]; then
             echo ""
@@ -646,7 +728,7 @@ check_status() {
         has_service=true
         echo ""
         echo "--- FRP Client (frpc) ---"
-        systemctl status frpc@client-3090.service --no-pager 2>/dev/null || echo "Not installed"
+        systemctl status frpc@client-${FRP_PORT}.service --no-pager 2>/dev/null || echo "Not installed"
 
         echo ""
         echo "--- Connection Status ---"
@@ -665,8 +747,8 @@ check_status() {
 remove_frp() {
     log_step "=== Removing FRP ==="
 
-    systemctl stop frps@server-3090.service frpc@client-3090.service 2>/dev/null || true
-    systemctl disable frps@server-3090.service frpc@client-3090.service 2>/dev/null || true
+    systemctl stop frps@server-${FRP_PORT}.service frpc@client-${FRP_PORT}.service 2>/dev/null || true
+    systemctl disable frps@server-${FRP_PORT}.service frpc@client-${FRP_PORT}.service 2>/dev/null || true
 
     rm -f /etc/systemd/system/frps@.service /etc/systemd/system/frpc@.service
     rm -rf /root/frp
