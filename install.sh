@@ -1,19 +1,13 @@
 #!/bin/bash
 
 # =============================================================================
-# FRP Ultra-Stable Installation Script (v2.1 - English Edition)
+# FRP Ultra-Stable Installation Script (v2.2 - Bugfix Edition)
 # =============================================================================
-# Version: frp v0.69.1  |  Script v2.1
-# Features:
-#   - Official GitHub binaries only
-#   - Multi-protocol: TCP / WebSocket / KCP / QUIC
-#   - DPI-evasion TLS (disableCustomTLSFirstByte = true)
-#   - Built-in Web Dashboard for monitoring
-#   - Automatic Watchdog (health-check + auto-restart)
-#   - OS-level TCP tuning for long-haul links
-#   - Robust proxy config generation (no Go-template bugs)
-#   - UDP forwarding support
-#   - Connection test after install
+# Version: frp v0.69.1  |  Script v2.2
+# Fixes in v2.2:
+#   - Removed transport.heartbeatInterval from server config (client-only field)
+#   - Removed transport.tls.disableCustomTLSFirstByte from server config (client-only field)
+#   - Moved StartLimitIntervalSec / StartLimitBurst to [Unit] section in systemd
 # =============================================================================
 
 set -o pipefail
@@ -21,20 +15,15 @@ set -o pipefail
 FRP_VERSION="0.69.1"
 FRP_TOKEN="tun100"
 FRP_PORT="3090"
-ADMIN_PORT_S="7500"   # Server dashboard
-ADMIN_PORT_C="7400"   # Client admin (localhost only)
+ADMIN_PORT_S="7500"
+ADMIN_PORT_C="7400"
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
-
-# =============================================================================
-# Helper Functions
-# =============================================================================
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -58,10 +47,6 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()  { echo -e "${BLUE}[STEP]${NC}  $1"; }
 log_ok()    { echo -e "${CYAN}[OK]${NC}    $1"; }
-
-# =============================================================================
-# Download & Install Binary
-# =============================================================================
 
 download_frp_binary() {
     local bin_name="$1"
@@ -101,36 +86,21 @@ download_frp_binary() {
     log_info "${bin_name} installed successfully at /usr/local/bin/${bin_name}"
 }
 
-# =============================================================================
-# TCP Tuning for Long-Haul Stability
-# =============================================================================
-
 tune_tcp_for_frp() {
     log_step "Applying TCP kernel tuning for tunnel stability..."
 
     cat > /etc/sysctl.d/99-frp-tuning.conf <<'EOF'
 # FRP Long-Haul TCP Optimization
-# Faster detection of dead connections
 net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
-
-# Higher connection limits
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
-
-# Connection tracking timeout for established connections
 net.netfilter.nf_conntrack_tcp_timeout_established = 600
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
-
-# Reuse TIME_WAIT sockets
 net.ipv4.tcp_tw_reuse = 1
-
-# Disable slow start after idle
 net.ipv4.tcp_slow_start_after_idle = 0
-
-# Increase buffer sizes
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
@@ -145,10 +115,6 @@ remove_tcp_tuning() {
     rm -f /etc/sysctl.d/99-frp-tuning.conf
     sysctl --system >/dev/null 2>&1
 }
-
-# =============================================================================
-# Firewall Configuration
-# =============================================================================
 
 open_firewall_port() {
     local port="$1"
@@ -167,20 +133,13 @@ open_firewall_port() {
     fi
 }
 
-# =============================================================================
-# Watchdog Installation
-# =============================================================================
-
 install_watchdog() {
     log_step "Installing Watchdog for health monitoring and auto-healing..."
 
     cat > /usr/local/bin/frp-watchdog.sh <<'WATCHDOG_EOF'
 #!/bin/bash
-# FRP Watchdog - Auto-healing health monitor
-# Runs every minute via cron
-
 LOG_FILE="/var/log/frp-watchdog.log"
-MAX_LOG_SIZE=1048576  # 1MB
+MAX_LOG_SIZE=1048576
 
 log_msg() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -202,26 +161,19 @@ check_admin_api() {
 
 check_frps() {
     local fail=0
-
-    # 1. Process check
     if ! pgrep -x "frps" >/dev/null 2>&1; then
         log_msg "WATCHDOG: frps process NOT RUNNING"
         fail=1
     fi
-
-    # 2. Port check (TCP)
     if ! ss -tlnp 2>/dev/null | grep -q ":3090"; then
         if ! netstat -tlnp 2>/dev/null | grep -q ":3090"; then
             log_msg "WATCHDOG: frps NOT LISTENING on port 3090"
             fail=1
         fi
     fi
-
-    # 3. Admin API check (optional, don't fail immediately)
     if ! check_admin_api "7500" "admin" "tun100"; then
         log_msg "WATCHDOG: frps admin API not responding (may be starting)"
     fi
-
     if [ "$fail" -eq 1 ]; then
         log_msg "WATCHDOG: RESTARTING frps@server-3090..."
         systemctl restart frps@server-3090.service >/dev/null 2>&1
@@ -236,19 +188,14 @@ check_frps() {
 
 check_frpc() {
     local fail=0
-
-    # 1. Process check
     if ! pgrep -x "frpc" >/dev/null 2>&1; then
         log_msg "WATCHDOG: frpc process NOT RUNNING"
         fail=1
     fi
-
-    # 2. Admin API check (client admin on localhost:7400)
     if ! check_admin_api "7400" "admin" "tun100"; then
         log_msg "WATCHDOG: frpc admin API not responding"
         fail=1
     else
-        # 3. Check if online via API
         local status
         status=$(curl -sf --max-time 5 -u "admin:tun100" "http://127.0.0.1:7400/api/status" 2>/dev/null)
         if [ -n "$status" ] && echo "$status" | grep -q '"online":false'; then
@@ -256,7 +203,6 @@ check_frpc() {
             fail=1
         fi
     fi
-
     if [ "$fail" -eq 1 ]; then
         log_msg "WATCHDOG: RESTARTING frpc@client-3090..."
         systemctl restart frpc@client-3090.service >/dev/null 2>&1
@@ -269,7 +215,6 @@ check_frpc() {
     fi
 }
 
-# Main
 rotate_log
 case "$1" in
     frps) check_frps ;;
@@ -280,7 +225,6 @@ WATCHDOG_EOF
 
     chmod 755 /usr/local/bin/frp-watchdog.sh
 
-    # Install cron job (runs every minute)
     (crontab -l 2>/dev/null | grep -v 'frp-watchdog' ; \
      echo "* * * * * /usr/local/bin/frp-watchdog.sh frps >/dev/null 2>&1" ; \
      echo "* * * * * /usr/local/bin/frp-watchdog.sh frpc >/dev/null 2>&1") | crontab -
@@ -294,10 +238,6 @@ remove_watchdog() {
     (crontab -l 2>/dev/null | grep -v 'frp-watchdog') | crontab -
     rm -f /var/log/frp-watchdog.log /var/log/frp-watchdog.log.old
 }
-
-# =============================================================================
-# Proxy Config Generator (Bash-based, no Go-template bugs)
-# =============================================================================
 
 generate_tcp_proxies() {
     local ports="$1"
@@ -383,10 +323,6 @@ PROXY
     done
 }
 
-# =============================================================================
-# Menu
-# =============================================================================
-
 show_menu() {
     clear
     echo "============================================"
@@ -402,33 +338,28 @@ show_menu() {
     read -p "Choose an option [1-5]: " choice
 }
 
-# =============================================================================
-# Server Installation
-# =============================================================================
-
 install_server() {
     log_step "=== Installing FRP Server (frps) ==="
 
     download_frp_binary "frps"
     mkdir -p /root/frp/server /var/log
 
-    # Open firewall
     open_firewall_port "$FRP_PORT" "tcp"
     open_firewall_port "$FRP_PORT" "udp"
     open_firewall_port "$ADMIN_PORT_S" "tcp"
 
-    # Generate server config
+    # BUGFIX v2.2:
+    # - Removed transport.heartbeatInterval (client-only field in frp v0.69.1)
+    # - Removed transport.tls.disableCustomTLSFirstByte (client-only field)
     cat > /root/frp/server/server-3090.toml <<EOF
-# ============================================
 # FRP Server Configuration (Auto-generated)
 # frp v${FRP_VERSION}  |  Ultra-Stable Edition
-# ============================================
 
 bindAddr = "::"
 bindPort = ${FRP_PORT}
 kcpBindPort = ${FRP_PORT}
 
-# Web Dashboard for monitoring
+# Web Dashboard
 webServer.addr = "0.0.0.0"
 webServer.port = ${ADMIN_PORT_S}
 webServer.user = "admin"
@@ -440,30 +371,30 @@ log.level = "info"
 log.maxDays = 30
 log.disablePrintColor = true
 
-# Transport - tuned for long-haul international links
+# Transport - server side
 transport.heartbeatTimeout = 90
-transport.heartbeatInterval = 15
 transport.maxPoolCount = 65535
 transport.tcpMux = false
 transport.tcpKeepalive = 30
 
-# TLS - DPI Evasion (CRITICAL FIX)
-# disableCustomTLSFirstByte=true makes TLS handshake look like standard HTTPS
+# TLS - force TLS connections
 transport.tls.force = true
-transport.tls.disableCustomTLSFirstByte = true
 
 # Authentication
 auth.method = "token"
 auth.token = "${FRP_TOKEN}"
 EOF
 
-    # Systemd service with restart limits
+    # BUGFIX v2.2:
+    # - Moved StartLimitIntervalSec and StartLimitBurst to [Unit] section
     cat > /etc/systemd/system/frps@.service <<'EOF'
 [Unit]
 Description=FRP Server Service (%i)
 Documentation=https://gofrp.org/en/docs/overview/
 After=network-online.target nss-lookup.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -474,8 +405,6 @@ ExecReload=/bin/kill -HUP $MAINPID
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=always
 RestartSec=10s
-StartLimitIntervalSec=300
-StartLimitBurst=5
 LimitNOFILE=1048576
 LimitNPROC=65535
 TimeoutStopSec=30
@@ -488,16 +417,11 @@ EOF
     systemctl enable frps@server-3090.service
     systemctl restart frps@server-3090.service
 
-    # TCP tuning
     tune_tcp_for_frp
-
-    # Install watchdog
     install_watchdog
 
-    # Wait for startup
     sleep 3
 
-    # Verify
     if systemctl is-active --quiet frps@server-3090.service; then
         log_info "FRP Server installed and running!"
         echo ""
@@ -516,10 +440,6 @@ EOF
         journalctl -u frps@server-3090 --no-pager -n 20
     fi
 }
-
-# =============================================================================
-# Client Installation
-# =============================================================================
 
 install_client() {
     log_step "=== Installing FRP Client (frpc) ==="
@@ -559,7 +479,6 @@ install_client() {
         3)
             transport_protocol="kcp"
             pool_count=1
-            # KCP tuning for high packet-loss links
             kcp_config='
 # KCP tuning for lossy international links
 transport.kcp.mtu = 1350
@@ -580,12 +499,9 @@ transport.kcp.dscp = 46
             ;;
     esac
 
-    # Generate client config
     cat > /root/frp/client/client-3090.toml <<EOF
-# ============================================
 # FRP Client Configuration (Auto-generated)
 # frp v${FRP_VERSION}  |  Ultra-Stable Edition
-# ============================================
 
 serverAddr = "${server_addr}"
 serverPort = ${FRP_PORT}
@@ -615,18 +531,17 @@ transport.tcpMux = false
 transport.dialServerTimeout = 15
 transport.dialServerKeepalive = 30
 
-# Heartbeat - tuned for long-haul links
+# Heartbeat - client side only
 transport.heartbeatInterval = 15
 transport.heartbeatTimeout = 90
 
-# TLS - DPI Evasion (CRITICAL FIX)
+# TLS - DPI Evasion
 transport.tls.enable = true
 transport.tls.disableCustomTLSFirstByte = true
 
 ${kcp_config}
 EOF
 
-    # Generate proxy configs
     generate_tcp_proxies "$ports" "/root/frp/client/client-3090.toml"
 
     if [[ "$forward_udp" =~ ^[Yy]$ ]]; then
@@ -634,13 +549,16 @@ EOF
         generate_udp_proxies "$ports" "/root/frp/client/client-3090.toml"
     fi
 
-    # Systemd service
+    # BUGFIX v2.2:
+    # - Moved StartLimitIntervalSec and StartLimitBurst to [Unit] section
     cat > /etc/systemd/system/frpc@.service <<'EOF'
 [Unit]
 Description=FRP Client Service (%i)
 Documentation=https://gofrp.org/en/docs/overview/
 After=network-online.target nss-lookup.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -651,8 +569,6 @@ ExecReload=/bin/kill -HUP $MAINPID
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=always
 RestartSec=10s
-StartLimitIntervalSec=300
-StartLimitBurst=5
 LimitNOFILE=1048576
 LimitNPROC=65535
 TimeoutStopSec=30
@@ -665,17 +581,12 @@ EOF
     systemctl enable frpc@client-3090.service
     systemctl restart frpc@client-3090.service
 
-    # TCP tuning
     tune_tcp_for_frp
-
-    # Install watchdog
     install_watchdog
 
-    # Wait for connection
     log_step "Waiting for connection to establish..."
     sleep 5
 
-    # Connection test
     local connected=false
     for i in {1..6}; do
         if pgrep -x "frpc" >/dev/null 2>&1; then
@@ -710,10 +621,6 @@ EOF
     log_info "View logs: journalctl -u frpc@client-3090 -f"
     log_info "Check status: curl -u admin:${FRP_TOKEN} http://127.0.0.1:${ADMIN_PORT_C}/api/status"
 }
-
-# =============================================================================
-# Status Check
-# =============================================================================
 
 check_status() {
     echo "============================================"
@@ -755,10 +662,6 @@ check_status() {
     sysctl net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes 2>/dev/null || true
 }
 
-# =============================================================================
-# Removal
-# =============================================================================
-
 remove_frp() {
     log_step "=== Removing FRP ==="
 
@@ -776,10 +679,6 @@ remove_frp() {
 
     log_info "FRP removed completely."
 }
-
-# =============================================================================
-# Main Loop
-# =============================================================================
 
 require_root
 
