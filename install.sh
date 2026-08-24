@@ -80,15 +80,6 @@ download_frp_binary() {
 
 # ---------------------------------------------------------------------------
 # TCP / kernel tuning
-#
-# PERF FIX: added BBR congestion control (falls back to cubic if the module
-# isn't available). BBR behaves far better than the default cubic algorithm
-# on high-latency / lossy paths -- exactly what long international hops out
-# of Iran usually look like -- and is the single biggest lever for raw
-# throughput under load. Also widened the local ephemeral port range and
-# lowered FIN timeout, because disabling tcpMux (see install_client) means
-# frpc now opens many more *real* short-lived TCP connections instead of
-# multiplexing everything over one, so ports need to recycle faster.
 # ---------------------------------------------------------------------------
 tune_tcp_for_frp() {
     log_step "Applying TCP kernel tuning for tunnel stability/performance..."
@@ -154,36 +145,20 @@ open_firewall_port() {
 }
 
 # ---------------------------------------------------------------------------
+# Check if a port is already in use
+# ---------------------------------------------------------------------------
+check_port_in_use() {
+    local port="$1"
+    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        return 0
+    elif netstat -tlnp 2>/dev/null | grep -q ":${port} "; then
+        return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # Watchdog
-#
-# BUG FIX (this was silently breaking recovery entirely): the watchdog body
-# used to be written with a quoted heredoc ('WATCHDOG_EOF'), which is correct
-# for protecting the script's own runtime $(...) / arithmetic expressions --
-# but it also meant ${FRP_PORT} was NEVER substituted. The deployed watchdog
-# had no FRP_PORT variable of its own, so every reference to it resolved to
-# an empty string at runtime. Concretely: `systemctl restart
-# frps@server-${FRP_PORT}.service` became `systemctl restart
-# frps@server-.service` -- a unit that doesn't exist -- so restarts silently
-# failed every single time. The port-listening check had the same problem
-# (`grep -q ":"` matches almost anything, so that check was a no-op too).
-# Net effect: if frps/frpc ever actually hung or crashed under load, the
-# watchdog could never bring it back.
-#
-# Fix: write the needed values into the top of the generated script with a
-# small *unquoted* heredoc first, then append the rest of the logic with the
-# quoted heredoc as before so its own runtime expansions stay protected.
-#
-# PERF FIX: the old watchdog restarted the service on the very first failed
-# admin-API probe. Under real (heavy) traffic, frpc/frps can take a moment
-# to answer the local dashboard API simply because the Go runtime is busy
-# servicing tunnel traffic -- that is not the same as being dead. Restarting
-# on every such blip drops all active connections and is a very plausible
-# explanation for "tunnel gets bad under heavy load": it was restarting
-# itself. Now: a real crash (process gone / port not listening) still
-# restarts immediately, but a slow/unresponsive admin API needs 3
-# consecutive failed checks (3 minutes) before it triggers a restart, and
-# restarts are rate-limited to at most once every 5 minutes. A file lock
-# also stops overlapping cron runs if a check itself gets stuck.
 # ---------------------------------------------------------------------------
 install_watchdog() {
     log_step "Installing watchdog for health monitoring..."
@@ -360,9 +335,6 @@ remove_watchdog() {
     rm -rf /var/run/frp-watchdog
 }
 
-# Counts individual ports represented by a comma-separated list that may
-# include ranges (e.g. "8080,9000-9010"). Used to size the connection pool
-# safely -- see the note in install_client.
 count_ports() {
     local ports="$1"
     local IFS=','
@@ -382,17 +354,6 @@ count_ports() {
     echo "$total"
 }
 
-# ---------------------------------------------------------------------------
-# PERF FIX: useEncryption/useCompression used to be set to true on every
-# single proxy. The server config already forces transport.tls.force = true,
-# which encrypts the *entire* frpc<->frps connection -- so useEncryption on
-# top of that was encrypting every byte twice for no security benefit, just
-# CPU cost. useCompression tries to gzip traffic that, in the vast majority
-# of real tunnels (HTTPS, video, already-compressed data), has almost no
-# redundancy left to squeeze out; it just burns CPU per connection and adds
-# latency, and that cost multiplies with every concurrent connection under
-# heavy load. Both are dropped from the generated proxy blocks.
-# ---------------------------------------------------------------------------
 generate_tcp_proxies() {
     local ports="$1"
     local config_file="$2"
@@ -488,6 +449,15 @@ install_server() {
     log_step "=== Installing FRP Server (frps) ==="
     log_ir "Iran-optimized: Port 443, TLS-only, KCP/UDP disabled"
 
+    # FIX: Check if port 443 is already in use (e.g. by nginx/apache)
+    if check_port_in_use "$FRP_PORT"; then
+        log_error "Port ${FRP_PORT} is already in use by another service!"
+        log_warn "Common culprits: nginx, apache, caddy, or another frps instance."
+        log_warn "Stop the existing service or change FRP_PORT in this script."
+        ss -tlnp | grep ":${FRP_PORT} " || netstat -tlnp | grep ":${FRP_PORT} "
+        read -p "Press Enter to continue anyway (not recommended), or Ctrl+C to abort..."
+    fi
+
     download_frp_binary "frps"
     mkdir -p /root/frp/server /var/log
 
@@ -498,8 +468,14 @@ install_server() {
 # FRP Server Configuration - Iran Optimized
 # frp v${FRP_VERSION}  |  Port ${FRP_PORT}  |  TCP Only
 
-bindAddr = "::"
+# FIX: bind to 0.0.0.0 for IPv4 compatibility. "::" can fail on IPv4-only
+# systems or when net.ipv6.bindv6only=1
+bindAddr = "0.0.0.0"
 bindPort = ${FRP_PORT}
+
+# FIX: also bind proxy ports to IPv4 so they are reachable from outside
+proxyBindAddr = "0.0.0.0"
+
 # NOTE: kcpBindPort is intentionally left unset (not "= 0"). Setting it to 0
 # does not disable KCP -- it tells Go to bind an OS-assigned random UDP
 # port, which silently opens an unintended UDP listener. Per frp's own
@@ -519,30 +495,31 @@ log.maxDays = 30
 log.disablePrintColor = true
 
 # Transport - server side
-# PERF FIX: tcpMux disabled. With tcpMux on, every proxied connection
-# between frpc and frps is multiplexed as a logical stream over a SINGLE
-# real TCP connection. Under real load (many concurrent connections, or a
-# lossy/high-latency path like international links out of Iran), that one
-# connection's congestion window becomes the hard ceiling on total
-# throughput -- frp's own issue tracker has reports of tcp_mux dropping
-# throughput from ~100Mbps to ~10-15Mbps on the exact same link. Disabling
-# it lets frpc open real parallel connections instead (sized by
-# transport.poolCount on the client), each with its own congestion window.
+# tcpMux disabled. With tcpMux on, every proxied connection between frpc
+# and frps is multiplexed as a logical stream over a SINGLE real TCP
+# connection. Under heavy/lossy links (international hops out of Iran),
+# that one connection's congestion window becomes a hard ceiling on total
+# throughput. Disabling it lets frpc open real parallel connections instead.
 transport.tcpMux = false
 transport.tcpKeepalive = 30
+# FIX: add heartbeatTimeout to match client and prevent false timeouts
+transport.heartbeatTimeout = 120
 # Upper bound on how many pooled connections a single proxy may request.
-# 65535 (the old default here) had no real justification; 100 per proxy is
-# already generous headroom over what the client will realistically ask for.
 transport.maxPoolCount = 100
 
-# TLS - force TLS connections (this is the ONLY encryption layer needed;
-# per-proxy useEncryption is deliberately NOT set on the client side, see
-# generate_tcp_proxies/generate_udp_proxies)
+# TLS - force TLS connections. Since v0.50.0+ TLS is default, but we force
+# it explicitly so plaintext connections are rejected.
 transport.tls.force = true
 
 # Authentication
 auth.method = "token"
 auth.token = "${FRP_TOKEN}"
+
+# FIX: limit how many ports a single client can bind (0 = unlimited)
+maxPortsPerClient = 0
+
+# FIX: don't send detailed internal errors to clients (security)
+detailedErrorsToClient = false
 EOF
 
     cat > /etc/systemd/system/frps@.service <<'EOF'
@@ -596,13 +573,14 @@ EOF
         log_info "Dashboard: http://YOUR_IP:${ADMIN_PORT_S}"
     else
         log_error "Failed to start server!"
-        journalctl -u frps@server-${FRP_PORT} --no-pager -n 20
+        log_warn "Common causes: port ${FRP_PORT} already in use, or config error."
+        journalctl -u frps@server-${FRP_PORT} --no-pager -n 30
     fi
 }
 
 install_client() {
     log_step "=== Installing FRP Client (frpc) ==="
-    log_ir "Iran-optimized: HTTP/2 default, TLS camouflage, proxy support"
+    log_ir "Iran-optimized: WSS default, TLS camouflage, proxy support"
 
     download_frp_binary "frpc"
     mkdir -p /root/frp/client /var/log
@@ -621,23 +599,18 @@ install_client() {
     echo ""
     echo "Expected concurrent connection load (affects connection pool size):"
     echo "  1) Light  - a few users / casual browsing"
-    echo "  2) Medium - typical single-user, multiple tabs/apps"
-    echo "  3) Heavy  - many simultaneous connections / multiple users [default]"
-    read -p "Select [1-3, default 3]: " load_choice
-    load_choice=${load_choice:-3}
+    echo "  2) Medium - typical single-user, multiple tabs/apps [default]"
+    echo "  3) Heavy  - many simultaneous connections / multiple users"
+    read -p "Select [1-3, default 2]: " load_choice
+    load_choice=${load_choice:-2}
 
     local base_pool
     case "$load_choice" in
         1) base_pool=8 ;;
-        2) base_pool=20 ;;
-        *) base_pool=40 ;;
+        3) base_pool=40 ;;
+        *) base_pool=20 ;;
     esac
 
-    # PERF FIX: transport.poolCount pre-establishes real connections per
-    # proxy so new traffic doesn't pay a fresh TCP+TLS handshake every time
-    # (this matters now that tcpMux is off). But poolCount applies PER
-    # proxy, and a port range can expand into many proxies -- multiplying
-    # blindly could open thousands of idle connections. Cap the total.
     local n_ports
     n_ports=$(count_ports "$ports")
     [ "$n_ports" -lt 1 ] && n_ports=1
@@ -653,9 +626,11 @@ install_client() {
 
     echo ""
     echo "Select connection protocol:"
-    echo "  1) http2     - RECOMMENDED: Looks like HTTPS, hardest to block [default]"
-    echo "  2) websocket - Good, but easier to fingerprint than http2"
-    echo "  3) tcp       - Simplest, no obfuscation (NOT recommended for Iran)"
+    # FIX: replaced invalid "http2" with "wss" which is officially supported
+    # and looks just like HTTPS (WebSocket Secure)
+    echo "  1) wss       - RECOMMENDED: WebSocket over TLS, looks like HTTPS, hardest to block"
+    echo "  2) websocket - WebSocket without TLS, easier to fingerprint"
+    echo "  3) tcp       - Simplest TLS, no obfuscation (NOT recommended for Iran)"
     echo "  4) kcp       - UDP-based, usually BLOCKED in Iran"
     echo "  5) quic      - UDP-based, usually BLOCKED in Iran"
     read -p "Select [1-5, default 1]: " proto_choice
@@ -668,7 +643,7 @@ install_client() {
     case "$proto_choice" in
         3)
             transport_protocol="tcp"
-            iran_warn="WARNING: Plain TCP is easily detected in Iran. Consider HTTP/2."
+            iran_warn="WARNING: Plain TCP with TLS is detectable in Iran. Consider WSS."
             ;;
         4)
             transport_protocol="kcp"
@@ -691,7 +666,7 @@ transport.kcp.dscp = 46
             transport_protocol="websocket"
             ;;
         *)
-            transport_protocol="http2"
+            transport_protocol="wss"
             ;;
     esac
 
@@ -714,6 +689,8 @@ transport.kcp.dscp = 46
         2)
             read -p "Enter fake SNI domain [default: www.microsoft.com]: " fake_sni
             fake_sni=${fake_sni:-www.microsoft.com}
+            # FIX: since v0.50.0+ TLS is enabled by default and disableCustomTLSFirstByte
+            # defaults to true. We keep them explicit for clarity.
             tls_config="transport.tls.enable = true
 transport.tls.disableCustomTLSFirstByte = true
 transport.tls.serverName = \"${fake_sni}\""
@@ -768,6 +745,7 @@ transport.tls.disableCustomTLSFirstByte = true"
 serverAddr = "${server_addr}"
 serverPort = ${FRP_PORT}
 
+# Don't exit if first login fails (keep retrying)
 loginFailExit = false
 
 # Admin API (localhost only) - used by watchdog
@@ -789,25 +767,32 @@ auth.token = "${FRP_TOKEN}"
 # Protocol
 transport.protocol = "${transport_protocol}"
 
-# PERF FIX: tcpMux disabled (must match the server). See the note in
-# install_server for why -- single-mux-connection throughput collapses
-# under heavy/lossy conditions. transport.poolCount below is what makes
-# this fast: it pre-opens real parallel connections per proxy instead of
-# funnelling everything through one.
+# tcpMux disabled (must match the server). See server config for why.
 transport.tcpMux = false
+
+# Pre-establish connections so new traffic doesn't pay a fresh TCP+TLS
+# handshake every time. poolCount is the total pre-opened connections.
 transport.poolCount = ${pool_count}
+
+# TCP keepalive for the underlying connection
 transport.tcpKeepalive = 30
+
+# Timeout for initial connection to server
 transport.dialServerTimeout = 15
+
+# Keepalive probe interval for the control connection
 transport.dialServerKeepalive = 30
 
-# Heartbeat (only meaningful with tcpMux disabled; with tcpMux on, frp
-# ignores these and relies on tcpMux's own keepalive instead). Timeout is
-# set generously to tolerate packet loss on a degraded international link
-# without triggering false disconnects.
+# Heartbeat settings (meaningful when tcpMux is disabled).
+# Default interval is 10s, timeout is 90s. We use gentler settings
+# for lossy international links to avoid false disconnects.
 transport.heartbeatInterval = 20
 transport.heartbeatTimeout = 120
 
 # TLS Configuration
+# NOTE: Since frp v0.50.0+, TLS is enabled by default on the client and
+# disableCustomTLSFirstByte defaults to true. We keep them explicit here
+# to ensure standard TLS handshakes (looks like real HTTPS/WSS).
 ${tls_config}
 
 ${proxy_config}
@@ -857,12 +842,13 @@ EOF
     log_step "Waiting for connection to establish..."
     sleep 5
 
+    # FIX: actually check for "online":true instead of just non-empty response
     local connected=false
-    for i in {1..6}; do
+    for i in {1..10}; do
         if pgrep -x "frpc" >/dev/null 2>&1; then
             local status
             status=$(curl -sf --max-time 3 -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null)
-            if [ -n "$status" ]; then
+            if [ -n "$status" ] && echo "$status" | grep -q '"online":true'; then
                 connected=true
                 break
             fi
@@ -878,7 +864,7 @@ EOF
         echo -e "${GREEN}║  Server:        ${server_addr}:${FRP_PORT}                  ║${NC}"
         echo -e "${GREEN}║  Protocol:     ${transport_protocol}                          ║${NC}"
         echo -e "${GREEN}║  ${sni_note}                    ║${NC}"
-        echo -e "${GREEN}║  tcpMux:       DISABLED (pool=${pool_count}/proxy, parallel conns) ║${NC}"
+        echo -e "${GREEN}║  tcpMux:       DISABLED (pool=${pool_count}, parallel conns) ║${NC}"
         echo -e "${GREEN}║  TCP Ports:    ${ports}                              ║${NC}"
         if [[ "$forward_udp" =~ ^[Yy]$ ]]; then
         echo -e "${GREEN}║  UDP Ports:    ${ports} (also forwarded)              ║${NC}"
@@ -889,8 +875,10 @@ EOF
         echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
         log_info "If it's still slow: rerun and pick the 'Heavy' load profile, or manually raise transport.poolCount in the .toml and restart the service."
     else
-        log_warn "Connection not yet established. This may take a few seconds."
-        echo -e "${YELLOW}Check status: journalctl -u frpc@client-${FRP_PORT} -f${NC}"
+        log_warn "Connection not yet established or client is offline."
+        log_warn "If you previously used 'http2' protocol, re-run and select 'wss' instead."
+        echo -e "${YELLOW}Check logs: journalctl -u frpc@client-${FRP_PORT} -f${NC}"
+        echo -e "${YELLOW}Check config: cat /root/frp/client/client-${FRP_PORT}.toml${NC}"
     fi
 
     echo ""
@@ -926,7 +914,18 @@ check_status() {
 
         echo ""
         echo "--- Connection Status ---"
-        curl -sf --max-time 3 -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null || echo "Admin API not available (client may be starting)"
+        local status
+        status=$(curl -sf --max-time 3 -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null)
+        if [ -n "$status" ]; then
+            if echo "$status" | grep -q '"online":true'; then
+                echo -e "${GREEN}Client is ONLINE and connected to server.${NC}"
+            else
+                echo -e "${RED}Client is RUNNING but NOT connected to server (offline).${NC}"
+                echo "Raw status: $status"
+            fi
+        else
+            echo "Admin API not available (client may be starting or not installed)"
+        fi
     fi
 
     if [ "$has_service" = false ]; then
