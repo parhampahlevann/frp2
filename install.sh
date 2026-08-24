@@ -3,7 +3,7 @@ set -o pipefail
 
 FRP_VERSION="0.71.0"
 FRP_TOKEN="tun100"
-FRP_PORT="443"
+FRP_PORT="8443"
 ADMIN_PORT_S="7500"
 ADMIN_PORT_C="7400"
 
@@ -420,8 +420,8 @@ show_menu() {
     echo "     FRP Iran-Optimized Tunnel Setup        "
     echo "         (frp v${FRP_VERSION})                "
     echo "============================================"
-    echo "1) Install FRP Server (frps)"
-    echo "2) Install FRP Client (frpc)"
+    echo "1) Install FRP Server (frps) - IRAN"
+    echo "2) Install FRP Client (frpc) - OUTSIDE"
     echo "3) Check Status / Health"
     echo "4) Remove FRP"
     echo "5) Exit"
@@ -430,13 +430,13 @@ show_menu() {
 }
 
 install_server() {
-    log_step "=== Installing FRP Server (frps) ==="
-    log_ir "Iran-optimized: Port 443, TLS-only, KCP/UDP disabled"
+    log_step "=== Installing FRP Server (frps) on IRAN ==="
+    log_ir "Reverse tunnel: frpc (outside) -> frps (Iran)"
 
     if check_port_in_use "$FRP_PORT"; then
-        log_error "Port ${FRP_PORT} is already in use by another service!"
+        log_error "Port ${FRP_PORT} is already in use!"
         ss -tlnp | grep ":${FRP_PORT} " || netstat -tlnp | grep ":${FRP_PORT} "
-        read -p "Press Enter to continue anyway (not recommended), or Ctrl+C to abort..."
+        read -p "Press Enter to continue anyway, or Ctrl+C to abort..."
     fi
 
     download_frp_binary "frps"
@@ -508,11 +508,14 @@ EOF
         log_info "FRP Server installed and running!"
         echo ""
         echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║  Server Status: RUNNING                              ║${NC}"
+        echo -e "${GREEN}║  Server (IRAN) Status: RUNNING                       ║${NC}"
         echo -e "${GREEN}║  Bind Port:     ${FRP_PORT} (TCP Only)                      ║${NC}"
-        echo -e "${GREEN}║  Dashboard:    http://YOUR_IP:${ADMIN_PORT_S}              ║${NC}"
+        echo -e "${GREEN}║  Dashboard:    http://IRAN_IP:${ADMIN_PORT_S}              ║${NC}"
         echo -e "${GREEN}║  Token:        ${FRP_TOKEN}                          ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        log_warn "IMPORTANT: Make sure port ${FRP_PORT} is open in your cloud firewall!"
+        log_warn "Test from outside: nc -vz IRAN_IP ${FRP_PORT}"
     else
         log_error "Failed to start server!"
         journalctl -u frps@server-${FRP_PORT} --no-pager -n 30
@@ -520,17 +523,27 @@ EOF
 }
 
 install_client() {
-    log_step "=== Installing FRP Client (frpc) ==="
-    log_ir "Iran-optimized: WSS default, TLS camouflage"
+    log_step "=== Installing FRP Client (frpc) on OUTSIDE server ==="
+    log_ir "Connecting to Iran server via WSS/TLS"
 
     download_frp_binary "frpc"
     mkdir -p /root/frp/client /var/log
 
-    read -p "Enter server address (IP or domain): " server_addr
+    read -p "Enter Iran server address (IP or domain): " server_addr
     while [ -z "$server_addr" ]; do
         log_warn "Server address cannot be empty!"
-        read -p "Enter server address: " server_addr
+        read -p "Enter Iran server address: " server_addr
     done
+
+    log_step "Testing reachability to ${server_addr}:${FRP_PORT}..."
+    if nc -z -w 5 "$server_addr" "$FRP_PORT" 2>/dev/null; then
+        log_ok "Port ${FRP_PORT} is reachable from this server!"
+    else
+        log_warn "Port ${FRP_PORT} seems UNREACHABLE from here."
+        log_warn "If this is a timeout, your Iran IP may be blocked by this datacenter."
+        log_warn "Solution: use proxy chaining (Shadowsocks/V2Ray) during install."
+        read -p "Press Enter to continue anyway, or Ctrl+C to abort..."
+    fi
 
     read -p "Enter inbound ports to forward [default: 8080]: " ports
     ports=${ports:-8080}
@@ -666,8 +679,11 @@ transport.kcp.parityshard = 3
     fi
 
     # -----------------------------------------------------------------------
-    # FIX: Removed transport.tcpKeepalive from client config - it's a
-    # SERVER-ONLY field. Client equivalent is dialServerKeepalive (optional).
+    # FIXED CLIENT CONFIG:
+    # - Removed transport.tcpKeepalive (SERVER-ONLY field, caused crash)
+    # - Removed heartbeatInterval/Timeout/dialServerTimeout/Keepalive 
+    #   to avoid potential unknown-field errors in v0.71.0
+    # - Kept only validated fields: protocol, tcpMux, poolCount
     # -----------------------------------------------------------------------
     cat > /root/frp/client/client-${FRP_PORT}.toml <<EOF
 serverAddr = "${server_addr}"
@@ -704,11 +720,11 @@ EOF
         generate_udp_proxies "$ports" "/root/frp/client/client-${FRP_PORT}.toml"
     fi
 
-    # DEBUG: Test frpc directly BEFORE systemd to capture exact error
-    log_step "Testing frpc config validity (8 seconds)..."
+    # DEBUG: Test frpc directly BEFORE systemd to catch parse errors
+    log_step "Testing frpc config validity (10 seconds)..."
     echo ""
     echo -e "${CYAN}========== DIRECT FRPC TEST ==========${NC}"
-    timeout 8 /usr/local/bin/frpc -c /root/frp/client/client-${FRP_PORT}.toml 2>&1 || true
+    timeout 10 /usr/local/bin/frpc -c /root/frp/client/client-${FRP_PORT}.toml 2>&1 || true
     echo -e "${CYAN}========== END OF TEST ==========${NC}"
     echo ""
     read -p "If you see an error above, press Ctrl+C to fix it. Otherwise press Enter to continue..."
@@ -761,10 +777,10 @@ EOF
 
     echo ""
     if [ "$connected" = true ]; then
-        log_info "FRP Client installed and connected!"
+        log_info "FRP Client installed and connected to Iran!"
         echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║  Client Status: CONNECTED                            ║${NC}"
-        echo -e "${GREEN}║  Server:        ${server_addr}:${FRP_PORT}                  ║${NC}"
+        echo -e "${GREEN}║  Client (OUTSIDE) Status: CONNECTED                  ║${NC}"
+        echo -e "${GREEN}║  Iran Server:   ${server_addr}:${FRP_PORT}                  ║${NC}"
         echo -e "${GREEN}║  Protocol:     ${transport_protocol}                          ║${NC}"
         echo -e "${GREEN}║  ${sni_note}                    ║${NC}"
         echo -e "${GREEN}║  Pool:         ${pool_count} pre-opened connections            ║${NC}"
@@ -778,8 +794,17 @@ EOF
         echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
     else
         log_warn "Connection not established."
+        log_warn "Common causes for reverse tunnel (outside -> Iran):"
+        log_warn "  1. Iran IP is blocked from your datacenter"
+        log_warn "  2. Iran cloud firewall blocks port ${FRP_PORT}"
+        log_warn "  3. TLS/SNI fingerprint detected"
         echo -e "${YELLOW}Check logs: journalctl -u frpc@client-${FRP_PORT} -f${NC}"
         echo -e "${YELLOW}Check config: cat /root/frp/client/client-${FRP_PORT}.toml${NC}"
+        echo ""
+        log_info "Debug commands:"
+        echo "  nc -vz ${server_addr} ${FRP_PORT}"
+        echo "  curl -v --max-time 10 https://${server_addr}:${FRP_PORT}"
+        echo "  journalctl -u frpc@client-${FRP_PORT} --no-pager -n 30"
     fi
 
     echo ""
@@ -796,7 +821,7 @@ check_status() {
     if systemctl list-units --type=service | grep -q 'frps@'; then
         has_service=true
         echo ""
-        echo "--- FRP Server (frps) ---"
+        echo "--- FRP Server (frps) - IRAN ---"
         systemctl status frps@server-${FRP_PORT}.service --no-pager 2>/dev/null || echo "Not installed"
 
         if [ -f /var/log/frp-watchdog.log ]; then
@@ -809,7 +834,7 @@ check_status() {
     if systemctl list-units --type=service | grep -q 'frpc@'; then
         has_service=true
         echo ""
-        echo "--- FRP Client (frpc) ---"
+        echo "--- FRP Client (frpc) - OUTSIDE ---"
         systemctl status frpc@client-${FRP_PORT}.service --no-pager 2>/dev/null || echo "Not installed"
 
         echo ""
@@ -818,9 +843,9 @@ check_status() {
         status=$(curl -sf --max-time 3 -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null)
         if [ -n "$status" ]; then
             if echo "$status" | grep -q '"online":true'; then
-                echo -e "${GREEN}Client is ONLINE.${NC}"
+                echo -e "${GREEN}Client is ONLINE and connected to Iran server.${NC}"
             else
-                echo -e "${RED}Client is RUNNING but OFFLINE.${NC}"
+                echo -e "${RED}Client is RUNNING but OFFLINE (cannot reach Iran).${NC}"
                 echo "Raw: $status"
             fi
         else
