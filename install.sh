@@ -1,5 +1,4 @@
-
-fixed_script_v2 = r'''#!/bin/bash
+#!/bin/bash
 set -o pipefail
 
 FRP_VERSION="0.71.0"
@@ -667,10 +666,7 @@ transport.kcp.parityshard = 3
     fi
 
     # -----------------------------------------------------------------------
-    # DEBUG FIX: Write a minimal, clean config. Removed keys that might cause
-    # parse issues: dialServerKeepalive, heartbeatInterval/Timeout.
-    # Also removed redundant tls.enable/disableCustomTLSFirstByte since
-    # v0.50.0+ defaults them to true anyway.
+    # MINIMAL CLIENT CONFIG - only essentials to avoid parse errors
     # -----------------------------------------------------------------------
     cat > /root/frp/client/client-${FRP_PORT}.toml <<EOF
 serverAddr = "${server_addr}"
@@ -708,16 +704,16 @@ EOF
         generate_udp_proxies "$ports" "/root/frp/client/client-${FRP_PORT}.toml"
     fi
 
-    # DEBUG FIX: Test frpc manually BEFORE systemd to capture exact error
-    log_step "Testing frpc config validity..."
+    # DEBUG: Test frpc directly BEFORE systemd to capture exact error
+    log_step "Testing frpc config validity (8 seconds)..."
     echo ""
-    echo -e "${CYAN}--- Running frpc directly for 8 seconds to see error ---${NC}"
+    echo -e "${CYAN}========== DIRECT FRPC TEST ==========${NC}"
     timeout 8 /usr/local/bin/frpc -c /root/frp/client/client-${FRP_PORT}.toml 2>&1 || true
-    echo -e "${CYAN}--- End of direct test ---${NC}"
+    echo -e "${CYAN}========== END OF TEST ==========${NC}"
     echo ""
     read -p "If you see an error above, press Ctrl+C to fix it. Otherwise press Enter to continue..."
 
-    # Reset log level to info for normal operation
+    # Switch back to info level for normal operation
     sed -i 's/^log.level = "debug"/log.level = "info"/' /root/frp/client/client-${FRP_PORT}.toml
 
     cat > /etc/systemd/system/frpc@.service <<'EOF'
@@ -877,9 +873,3 @@ while true; do
     echo
     read -p "Press Enter to continue..."
 done
-'''
-
-with open('/mnt/agents/output/frp-setup-debug.sh', 'w') as f:
-    f.write(fixed_script_v2)
-
-print("Debug script saved.")
