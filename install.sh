@@ -1,24 +1,7 @@
 #!/bin/bash
-
-# =============================================================================
-# FRP Iran-Optimized Installation Script (v3.0)
-# =============================================================================
-# Version: frp v0.69.1  |  Script v3.0
-# Optimized for: Iran / High-censorship networks
-# Key changes:
-#   - Default port: 443 (blends with HTTPS)
-#   - Default protocol: http2 (harder to fingerprint than websocket)
-#   - tcpMux enabled for traffic blending
-#   - TLS SNI/domain fronting support
-#   - Proxy chaining (socks5/http) for existing tunnel users
-#   - UDP/KCP disabled by default (blocked in Iran)
-#   - Removed client-only fields from server config
-#   - StartLimitIntervalSec / StartLimitBurst in [Unit]
-# =============================================================================
-
 set -o pipefail
 
-FRP_VERSION="0.69.1"
+FRP_VERSION="0.71.0"
 FRP_TOKEN="tun100"
 FRP_PORT="443"
 ADMIN_PORT_S="7500"
@@ -55,6 +38,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()  { echo -e "${BLUE}[STEP]${NC}  $1"; }
 log_ok()    { echo -e "${CYAN}[OK]${NC}    $1"; }
 log_ir()    { echo -e "${MAGENTA}[IRAN]${NC}  $1"; }
+log_perf()  { echo -e "${CYAN}[PERF]${NC}  $1"; }
 
 download_frp_binary() {
     local bin_name="$1"
@@ -94,10 +78,34 @@ download_frp_binary() {
     log_info "${bin_name} installed at /usr/local/bin/${bin_name}"
 }
 
+# ---------------------------------------------------------------------------
+# TCP / kernel tuning
+#
+# PERF FIX: added BBR congestion control (falls back to cubic if the module
+# isn't available). BBR behaves far better than the default cubic algorithm
+# on high-latency / lossy paths -- exactly what long international hops out
+# of Iran usually look like -- and is the single biggest lever for raw
+# throughput under load. Also widened the local ephemeral port range and
+# lowered FIN timeout, because disabling tcpMux (see install_client) means
+# frpc now opens many more *real* short-lived TCP connections instead of
+# multiplexing everything over one, so ports need to recycle faster.
+# ---------------------------------------------------------------------------
 tune_tcp_for_frp() {
-    log_step "Applying TCP kernel tuning for tunnel stability..."
+    log_step "Applying TCP kernel tuning for tunnel stability/performance..."
 
-    cat > /etc/sysctl.d/99-frp-tuning.conf <<'EOF'
+    local cc_line="net.ipv4.tcp_congestion_control = cubic"
+    local qdisc_line="# net.core.default_qdisc = fq (bbr module unavailable, staying on cubic)"
+
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        cc_line="net.ipv4.tcp_congestion_control = bbr"
+        qdisc_line="net.core.default_qdisc = fq"
+        log_perf "BBR congestion control available, enabling it."
+    else
+        log_warn "BBR module not available on this kernel, staying on cubic."
+    fi
+
+    cat > /etc/sysctl.d/99-frp-tuning.conf <<EOF
 # FRP Long-Haul TCP Optimization
 net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 10
@@ -108,11 +116,15 @@ net.ipv4.tcp_max_syn_backlog = 65535
 net.netfilter.nf_conntrack_tcp_timeout_established = 600
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
 net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.ip_local_port_range = 1024 65535
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
+${cc_line}
+${qdisc_line}
 EOF
 
     sysctl --system >/dev/null 2>&1
@@ -141,13 +153,59 @@ open_firewall_port() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Watchdog
+#
+# BUG FIX (this was silently breaking recovery entirely): the watchdog body
+# used to be written with a quoted heredoc ('WATCHDOG_EOF'), which is correct
+# for protecting the script's own runtime $(...) / arithmetic expressions --
+# but it also meant ${FRP_PORT} was NEVER substituted. The deployed watchdog
+# had no FRP_PORT variable of its own, so every reference to it resolved to
+# an empty string at runtime. Concretely: `systemctl restart
+# frps@server-${FRP_PORT}.service` became `systemctl restart
+# frps@server-.service` -- a unit that doesn't exist -- so restarts silently
+# failed every single time. The port-listening check had the same problem
+# (`grep -q ":"` matches almost anything, so that check was a no-op too).
+# Net effect: if frps/frpc ever actually hung or crashed under load, the
+# watchdog could never bring it back.
+#
+# Fix: write the needed values into the top of the generated script with a
+# small *unquoted* heredoc first, then append the rest of the logic with the
+# quoted heredoc as before so its own runtime expansions stay protected.
+#
+# PERF FIX: the old watchdog restarted the service on the very first failed
+# admin-API probe. Under real (heavy) traffic, frpc/frps can take a moment
+# to answer the local dashboard API simply because the Go runtime is busy
+# servicing tunnel traffic -- that is not the same as being dead. Restarting
+# on every such blip drops all active connections and is a very plausible
+# explanation for "tunnel gets bad under heavy load": it was restarting
+# itself. Now: a real crash (process gone / port not listening) still
+# restarts immediately, but a slow/unresponsive admin API needs 3
+# consecutive failed checks (3 minutes) before it triggers a restart, and
+# restarts are rate-limited to at most once every 5 minutes. A file lock
+# also stops overlapping cron runs if a check itself gets stuck.
+# ---------------------------------------------------------------------------
 install_watchdog() {
-    log_step "Installing Watchdog for health monitoring..."
+    log_step "Installing watchdog for health monitoring..."
 
-    cat > /usr/local/bin/frp-watchdog.sh <<'WATCHDOG_EOF'
+    cat > /usr/local/bin/frp-watchdog.sh <<HEADER_EOF
 #!/bin/bash
+# --- values baked in at install time (see frp-setup.sh install_watchdog) ---
+FRP_PORT="${FRP_PORT}"
+ADMIN_PORT_S="${ADMIN_PORT_S}"
+ADMIN_PORT_C="${ADMIN_PORT_C}"
+FRP_TOKEN="${FRP_TOKEN}"
+HEADER_EOF
+
+    cat >> /usr/local/bin/frp-watchdog.sh <<'WATCHDOG_EOF'
 LOG_FILE="/var/log/frp-watchdog.log"
 MAX_LOG_SIZE=1048576
+STATE_DIR="/var/run/frp-watchdog"
+FAIL_THRESHOLD=3
+RESTART_COOLDOWN=300
+API_TIMEOUT=8
+
+mkdir -p "$STATE_DIR"
 
 log_msg() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -161,83 +219,137 @@ rotate_log() {
 }
 
 check_admin_api() {
-    local port="$1"
-    local user="$2"
-    local pass="$3"
-    curl -sf --max-time 5 -u "${user}:${pass}" "http://127.0.0.1:${port}/api/status" >/dev/null 2>&1
+    local port="$1" user="$2" pass="$3"
+    curl -sf --max-time "$API_TIMEOUT" -u "${user}:${pass}" "http://127.0.0.1:${port}/api/status" >/dev/null 2>&1
+}
+
+read_count() {
+    local f="${STATE_DIR}/$1.fails"
+    [ -f "$f" ] && cat "$f" || echo 0
+}
+
+write_count() {
+    echo "$2" > "${STATE_DIR}/$1.fails"
+}
+
+can_restart_now() {
+    local svc="$1"
+    local ts_file="${STATE_DIR}/${svc}.last_restart"
+    local now
+    now=$(date +%s)
+    if [ -f "$ts_file" ]; then
+        local last
+        last=$(cat "$ts_file")
+        if [ $(( now - last )) -lt "$RESTART_COOLDOWN" ]; then
+            return 1
+        fi
+    fi
+    echo "$now" > "$ts_file"
+    return 0
+}
+
+do_restart() {
+    local proc="$1" unit="$2" svc_key="$3"
+    if ! can_restart_now "$svc_key"; then
+        log_msg "WATCHDOG: ${proc} needs restart but cooldown is active, skipping to avoid a restart storm"
+        return
+    fi
+    log_msg "WATCHDOG: RESTARTING ${unit}.service..."
+    systemctl restart "${unit}.service" >/dev/null 2>&1
+    sleep 5
+    if pgrep -x "$proc" >/dev/null 2>&1; then
+        log_msg "WATCHDOG: ${proc} restarted OK"
+        write_count "$svc_key" 0
+    else
+        log_msg "WATCHDOG: CRITICAL - ${proc} restart FAILED"
+    fi
 }
 
 check_frps() {
-    local fail=0
+    local svc_key="frps"
+
     if ! pgrep -x "frps" >/dev/null 2>&1; then
         log_msg "WATCHDOG: frps process NOT RUNNING"
-        fail=1
+        do_restart "frps" "frps@server-${FRP_PORT}" "$svc_key"
+        return
     fi
-    if ! ss -tlnp 2>/dev/null | grep -q ":${FRP_PORT}"; then
-        if ! netstat -tlnp 2>/dev/null | grep -q ":${FRP_PORT}"; then
-            log_msg "WATCHDOG: frps NOT LISTENING on port ${FRP_PORT}"
-            fail=1
-        fi
+
+    local listening=1
+    if ss -tlnp 2>/dev/null | grep -q ":${FRP_PORT} "; then
+        listening=0
+    elif netstat -tlnp 2>/dev/null | grep -q ":${FRP_PORT} "; then
+        listening=0
     fi
-    if ! check_admin_api "7500" "admin" "tun100"; then
-        log_msg "WATCHDOG: frps admin API not responding"
+    if [ "$listening" -eq 1 ]; then
+        log_msg "WATCHDOG: frps NOT LISTENING on port ${FRP_PORT}"
+        do_restart "frps" "frps@server-${FRP_PORT}" "$svc_key"
+        return
     fi
-    if [ "$fail" -eq 1 ]; then
-        log_msg "WATCHDOG: RESTARTING frps@server-${FRP_PORT}..."
-        systemctl restart frps@server-${FRP_PORT}.service >/dev/null 2>&1
-        sleep 5
-        if pgrep -x "frps" >/dev/null 2>&1; then
-            log_msg "WATCHDOG: frps restarted OK"
-        else
-            log_msg "WATCHDOG: CRITICAL - frps restart FAILED"
+
+    if check_admin_api "$ADMIN_PORT_S" "admin" "$FRP_TOKEN"; then
+        write_count "$svc_key" 0
+    else
+        local n=$(( $(read_count "$svc_key") + 1 ))
+        write_count "$svc_key" "$n"
+        log_msg "WATCHDOG: frps admin API not responding (${n}/${FAIL_THRESHOLD})"
+        if [ "$n" -ge "$FAIL_THRESHOLD" ]; then
+            do_restart "frps" "frps@server-${FRP_PORT}" "$svc_key"
         fi
     fi
 }
 
 check_frpc() {
-    local fail=0
+    local svc_key="frpc"
+
     if ! pgrep -x "frpc" >/dev/null 2>&1; then
         log_msg "WATCHDOG: frpc process NOT RUNNING"
-        fail=1
+        do_restart "frpc" "frpc@client-${FRP_PORT}" "$svc_key"
+        return
     fi
-    if ! check_admin_api "7400" "admin" "tun100"; then
-        log_msg "WATCHDOG: frpc admin API not responding"
-        fail=1
-    else
+
+    if check_admin_api "$ADMIN_PORT_C" "admin" "$FRP_TOKEN"; then
         local status
-        status=$(curl -sf --max-time 5 -u "admin:tun100" "http://127.0.0.1:7400/api/status" 2>/dev/null)
+        status=$(curl -sf --max-time "$API_TIMEOUT" -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null)
         if [ -n "$status" ] && echo "$status" | grep -q '"online":false'; then
-            log_msg "WATCHDOG: frpc reports OFFLINE status"
-            fail=1
-        fi
-    fi
-    if [ "$fail" -eq 1 ]; then
-        log_msg "WATCHDOG: RESTARTING frpc@client-${FRP_PORT}..."
-        systemctl restart frpc@client-${FRP_PORT}.service >/dev/null 2>&1
-        sleep 10
-        if pgrep -x "frpc" >/dev/null 2>&1; then
-            log_msg "WATCHDOG: frpc restarted OK"
+            local n=$(( $(read_count "$svc_key") + 1 ))
+            write_count "$svc_key" "$n"
+            log_msg "WATCHDOG: frpc reports OFFLINE status (${n}/${FAIL_THRESHOLD})"
+            if [ "$n" -ge "$FAIL_THRESHOLD" ]; then
+                do_restart "frpc" "frpc@client-${FRP_PORT}" "$svc_key"
+            fi
         else
-            log_msg "WATCHDOG: CRITICAL - frpc restart FAILED"
+            write_count "$svc_key" 0
+        fi
+    else
+        local n=$(( $(read_count "$svc_key") + 1 ))
+        write_count "$svc_key" "$n"
+        log_msg "WATCHDOG: frpc admin API not responding (${n}/${FAIL_THRESHOLD})"
+        if [ "$n" -ge "$FAIL_THRESHOLD" ]; then
+            do_restart "frpc" "frpc@client-${FRP_PORT}" "$svc_key"
         fi
     fi
 }
 
 rotate_log
-case "$1" in
-    frps) check_frps ;;
-    frpc) check_frpc ;;
-    *)    log_msg "Usage: $0 {frps|frpc}" ;;
-esac
+mkdir -p "$STATE_DIR"
+(
+    flock -n 200 || { log_msg "WATCHDOG: previous check for '$1' still running, skipping this tick"; exit 0; }
+    case "$1" in
+        frps) check_frps ;;
+        frpc) check_frpc ;;
+        *)    log_msg "Usage: $0 {frps|frpc}" ;;
+    esac
+) 200>"${STATE_DIR}/$1.lock"
 WATCHDOG_EOF
 
     chmod 755 /usr/local/bin/frp-watchdog.sh
+    mkdir -p /var/run/frp-watchdog
 
     (crontab -l 2>/dev/null | grep -v 'frp-watchdog' ; \
      echo "* * * * * /usr/local/bin/frp-watchdog.sh frps >/dev/null 2>&1" ; \
      echo "* * * * * /usr/local/bin/frp-watchdog.sh frpc >/dev/null 2>&1") | crontab -
 
-    log_info "Watchdog installed. Health check runs every 60 seconds."
+    log_info "Watchdog installed (health check every 60s, 3 consecutive soft-failures before restart, 5 min restart cooldown)."
     log_info "Watchdog log: /var/log/frp-watchdog.log"
 }
 
@@ -245,8 +357,42 @@ remove_watchdog() {
     rm -f /usr/local/bin/frp-watchdog.sh
     (crontab -l 2>/dev/null | grep -v 'frp-watchdog') | crontab -
     rm -f /var/log/frp-watchdog.log /var/log/frp-watchdog.log.old
+    rm -rf /var/run/frp-watchdog
 }
 
+# Counts individual ports represented by a comma-separated list that may
+# include ranges (e.g. "8080,9000-9010"). Used to size the connection pool
+# safely -- see the note in install_client.
+count_ports() {
+    local ports="$1"
+    local IFS=','
+    local total=0
+    read -ra PORT_ARRAY <<< "$ports"
+    for entry in "${PORT_ARRAY[@]}"; do
+        entry=$(echo "$entry" | tr -d ' ')
+        [ -z "$entry" ] && continue
+        if [[ "$entry" == *"-"* ]]; then
+            local start=${entry%%-*}
+            local end=${entry##*-}
+            total=$(( total + (end - start + 1) ))
+        else
+            total=$(( total + 1 ))
+        fi
+    done
+    echo "$total"
+}
+
+# ---------------------------------------------------------------------------
+# PERF FIX: useEncryption/useCompression used to be set to true on every
+# single proxy. The server config already forces transport.tls.force = true,
+# which encrypts the *entire* frpc<->frps connection -- so useEncryption on
+# top of that was encrypting every byte twice for no security benefit, just
+# CPU cost. useCompression tries to gzip traffic that, in the vast majority
+# of real tunnels (HTTPS, video, already-compressed data), has almost no
+# redundancy left to squeeze out; it just burns CPU per connection and adds
+# latency, and that cost multiplies with every concurrent connection under
+# heavy load. Both are dropped from the generated proxy blocks.
+# ---------------------------------------------------------------------------
 generate_tcp_proxies() {
     local ports="$1"
     local config_file="$2"
@@ -268,8 +414,6 @@ type = "tcp"
 localIP = "127.0.0.1"
 localPort = ${p}
 remotePort = ${p}
-transport.useEncryption = true
-transport.useCompression = true
 
 PROXY
             done
@@ -281,8 +425,6 @@ type = "tcp"
 localIP = "127.0.0.1"
 localPort = ${entry}
 remotePort = ${entry}
-transport.useEncryption = true
-transport.useCompression = true
 
 PROXY
         fi
@@ -310,8 +452,6 @@ type = "udp"
 localIP = "127.0.0.1"
 localPort = ${p}
 remotePort = ${p}
-transport.useEncryption = true
-transport.useCompression = true
 
 PROXY
             done
@@ -323,8 +463,6 @@ type = "udp"
 localIP = "127.0.0.1"
 localPort = ${entry}
 remotePort = ${entry}
-transport.useEncryption = true
-transport.useCompression = true
 
 PROXY
         fi
@@ -348,7 +486,7 @@ show_menu() {
 
 install_server() {
     log_step "=== Installing FRP Server (frps) ==="
-    log_ir "Iran-optimized: Port 443, HTTP/2 ready, UDP disabled"
+    log_ir "Iran-optimized: Port 443, TLS-only, KCP/UDP disabled"
 
     download_frp_binary "frps"
     mkdir -p /root/frp/server /var/log
@@ -362,8 +500,11 @@ install_server() {
 
 bindAddr = "::"
 bindPort = ${FRP_PORT}
-# KCP/UDP disabled - blocked in Iran
-kcpBindPort = 0
+# NOTE: kcpBindPort is intentionally left unset (not "= 0"). Setting it to 0
+# does not disable KCP -- it tells Go to bind an OS-assigned random UDP
+# port, which silently opens an unintended UDP listener. Per frp's own
+# docs, the only way to disable KCP is to omit kcpBindPort entirely, which
+# is what we want anyway since UDP is heavily filtered in Iran.
 
 # Web Dashboard
 webServer.addr = "0.0.0.0"
@@ -378,12 +519,25 @@ log.maxDays = 30
 log.disablePrintColor = true
 
 # Transport - server side
-transport.heartbeatTimeout = 90
-transport.maxPoolCount = 65535
-transport.tcpMux = true
+# PERF FIX: tcpMux disabled. With tcpMux on, every proxied connection
+# between frpc and frps is multiplexed as a logical stream over a SINGLE
+# real TCP connection. Under real load (many concurrent connections, or a
+# lossy/high-latency path like international links out of Iran), that one
+# connection's congestion window becomes the hard ceiling on total
+# throughput -- frp's own issue tracker has reports of tcp_mux dropping
+# throughput from ~100Mbps to ~10-15Mbps on the exact same link. Disabling
+# it lets frpc open real parallel connections instead (sized by
+# transport.poolCount on the client), each with its own congestion window.
+transport.tcpMux = false
 transport.tcpKeepalive = 30
+# Upper bound on how many pooled connections a single proxy may request.
+# 65535 (the old default here) had no real justification; 100 per proxy is
+# already generous headroom over what the client will realistically ask for.
+transport.maxPoolCount = 100
 
-# TLS - force TLS connections
+# TLS - force TLS connections (this is the ONLY encryption layer needed;
+# per-proxy useEncryption is deliberately NOT set on the client side, see
+# generate_tcp_proxies/generate_udp_proxies)
 transport.tls.force = true
 
 # Authentication
@@ -432,6 +586,7 @@ EOF
         echo -e "${GREEN}╔══════════════════════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║  Server Status: RUNNING                              ║${NC}"
         echo -e "${GREEN}║  Bind Port:     ${FRP_PORT} (TCP Only)                      ║${NC}"
+        echo -e "${GREEN}║  tcpMux:       DISABLED (parallel real connections)  ║${NC}"
         echo -e "${GREEN}║  Dashboard:    http://YOUR_IP:${ADMIN_PORT_S}              ║${NC}"
         echo -e "${GREEN}║  Dashboard PW: ${FRP_TOKEN}                          ║${NC}"
         echo -e "${GREEN}║  Token:        ${FRP_TOKEN}                          ║${NC}"
@@ -464,6 +619,39 @@ install_client() {
     read -p "Also forward UDP ports? (y/n) [default: n]: " forward_udp
 
     echo ""
+    echo "Expected concurrent connection load (affects connection pool size):"
+    echo "  1) Light  - a few users / casual browsing"
+    echo "  2) Medium - typical single-user, multiple tabs/apps [default]"
+    echo "  3) Heavy  - many simultaneous connections / multiple users"
+    read -p "Select [1-3, default 2]: " load_choice
+    load_choice=${load_choice:-2}
+
+    local base_pool
+    case "$load_choice" in
+        1) base_pool=8 ;;
+        3) base_pool=40 ;;
+        *) base_pool=20 ;;
+    esac
+
+    # PERF FIX: transport.poolCount pre-establishes real connections per
+    # proxy so new traffic doesn't pay a fresh TCP+TLS handshake every time
+    # (this matters now that tcpMux is off). But poolCount applies PER
+    # proxy, and a port range can expand into many proxies -- multiplying
+    # blindly could open thousands of idle connections. Cap the total.
+    local n_ports
+    n_ports=$(count_ports "$ports")
+    [ "$n_ports" -lt 1 ] && n_ports=1
+
+    local pool_count=$base_pool
+    local total_pool=$(( n_ports * base_pool ))
+    local POOL_CAP=400
+    if [ "$total_pool" -gt "$POOL_CAP" ]; then
+        pool_count=$(( POOL_CAP / n_ports ))
+        [ "$pool_count" -lt 2 ] && pool_count=2
+        log_warn "Requested load profile would open ~${total_pool} pooled connections across ${n_ports} ports; capping pool to ${pool_count} per port (~${POOL_CAP} total) to avoid overloading the link."
+    fi
+
+    echo ""
     echo "Select connection protocol:"
     echo "  1) http2     - RECOMMENDED: Looks like HTTPS, hardest to block"
     echo "  2) websocket - Good, but easier to fingerprint than http2"
@@ -474,19 +662,16 @@ install_client() {
     proto_choice=${proto_choice:-1}
 
     local transport_protocol
-    local pool_count
     local kcp_config=""
     local iran_warn=""
 
     case "$proto_choice" in
         3)
             transport_protocol="tcp"
-            pool_count=10
             iran_warn="WARNING: Plain TCP is easily detected in Iran. Consider HTTP/2."
             ;;
         4)
             transport_protocol="kcp"
-            pool_count=1
             iran_warn="WARNING: KCP uses UDP which is heavily filtered in Iran."
             kcp_config='
 # KCP tuning for lossy links
@@ -500,16 +685,13 @@ transport.kcp.dscp = 46
             ;;
         5)
             transport_protocol="quic"
-            pool_count=1
             iran_warn="WARNING: QUIC uses UDP which is heavily filtered in Iran."
             ;;
         2)
             transport_protocol="websocket"
-            pool_count=10
             ;;
         *)
             transport_protocol="http2"
-            pool_count=10
             ;;
     esac
 
@@ -606,14 +788,24 @@ auth.token = "${FRP_TOKEN}"
 
 # Protocol
 transport.protocol = "${transport_protocol}"
+
+# PERF FIX: tcpMux disabled (must match the server). See the note in
+# install_server for why -- single-mux-connection throughput collapses
+# under heavy/lossy conditions. transport.poolCount below is what makes
+# this fast: it pre-opens real parallel connections per proxy instead of
+# funnelling everything through one.
+transport.tcpMux = false
 transport.poolCount = ${pool_count}
-transport.tcpMux = true
+transport.tcpKeepalive = 30
 transport.dialServerTimeout = 15
 transport.dialServerKeepalive = 30
 
-# Heartbeat - client side only
-transport.heartbeatInterval = 15
-transport.heartbeatTimeout = 90
+# Heartbeat (only meaningful with tcpMux disabled; with tcpMux on, frp
+# ignores these and relies on tcpMux's own keepalive instead). Timeout is
+# set generously to tolerate packet loss on a degraded international link
+# without triggering false disconnects.
+transport.heartbeatInterval = 20
+transport.heartbeatTimeout = 120
 
 # TLS Configuration
 ${tls_config}
@@ -686,6 +878,7 @@ EOF
         echo -e "${GREEN}║  Server:        ${server_addr}:${FRP_PORT}                  ║${NC}"
         echo -e "${GREEN}║  Protocol:     ${transport_protocol}                          ║${NC}"
         echo -e "${GREEN}║  ${sni_note}                    ║${NC}"
+        echo -e "${GREEN}║  tcpMux:       DISABLED (pool=${pool_count}/proxy, parallel conns) ║${NC}"
         echo -e "${GREEN}║  TCP Ports:    ${ports}                              ║${NC}"
         if [[ "$forward_udp" =~ ^[Yy]$ ]]; then
         echo -e "${GREEN}║  UDP Ports:    ${ports} (also forwarded)              ║${NC}"
@@ -694,6 +887,7 @@ EOF
         echo -e "${GREEN}║  Proxy:        ENABLED                               ║${NC}"
         fi
         echo -e "${GREEN}╚══════════════════════════════════════════════════════╝${NC}"
+        log_info "If it's still slow: rerun and pick the 'Heavy' load profile, or manually raise transport.poolCount in the .toml and restart the service."
     else
         log_warn "Connection not yet established. This may take a few seconds."
         echo -e "${YELLOW}Check status: journalctl -u frpc@client-${FRP_PORT} -f${NC}"
@@ -741,7 +935,7 @@ check_status() {
 
     echo ""
     echo "--- TCP Kernel Settings ---"
-    sysctl net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes 2>/dev/null || true
+    sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes 2>/dev/null || true
 }
 
 remove_frp() {
