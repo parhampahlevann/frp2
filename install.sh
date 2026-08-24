@@ -621,16 +621,16 @@ install_client() {
     echo ""
     echo "Expected concurrent connection load (affects connection pool size):"
     echo "  1) Light  - a few users / casual browsing"
-    echo "  2) Medium - typical single-user, multiple tabs/apps [default]"
-    echo "  3) Heavy  - many simultaneous connections / multiple users"
-    read -p "Select [1-3, default 2]: " load_choice
-    load_choice=${load_choice:-2}
+    echo "  2) Medium - typical single-user, multiple tabs/apps"
+    echo "  3) Heavy  - many simultaneous connections / multiple users [default]"
+    read -p "Select [1-3, default 3]: " load_choice
+    load_choice=${load_choice:-3}
 
     local base_pool
     case "$load_choice" in
         1) base_pool=8 ;;
-        3) base_pool=40 ;;
-        *) base_pool=20 ;;
+        2) base_pool=20 ;;
+        *) base_pool=40 ;;
     esac
 
     # PERF FIX: transport.poolCount pre-establishes real connections per
@@ -653,7 +653,7 @@ install_client() {
 
     echo ""
     echo "Select connection protocol:"
-    echo "  1) http2     - RECOMMENDED: Looks like HTTPS, hardest to block"
+    echo "  1) http2     - RECOMMENDED: Looks like HTTPS, hardest to block [default]"
     echo "  2) websocket - Good, but easier to fingerprint than http2"
     echo "  3) tcp       - Simplest, no obfuscation (NOT recommended for Iran)"
     echo "  4) kcp       - UDP-based, usually BLOCKED in Iran"
