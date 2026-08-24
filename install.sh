@@ -666,7 +666,8 @@ transport.kcp.parityshard = 3
     fi
 
     # -----------------------------------------------------------------------
-    # MINIMAL CLIENT CONFIG - only essentials to avoid parse errors
+    # FIX: Removed transport.tcpKeepalive from client config - it's a
+    # SERVER-ONLY field. Client equivalent is dialServerKeepalive (optional).
     # -----------------------------------------------------------------------
     cat > /root/frp/client/client-${FRP_PORT}.toml <<EOF
 serverAddr = "${server_addr}"
@@ -680,7 +681,7 @@ webServer.user = "admin"
 webServer.password = "${FRP_TOKEN}"
 
 log.to = "/var/log/frpc.log"
-log.level = "debug"
+log.level = "info"
 log.maxDays = 30
 log.disablePrintColor = true
 
@@ -690,7 +691,6 @@ auth.token = "${FRP_TOKEN}"
 transport.protocol = "${transport_protocol}"
 transport.tcpMux = false
 transport.poolCount = ${pool_count}
-transport.tcpKeepalive = 30
 
 ${tls_config}
 ${proxy_config}
@@ -712,9 +712,6 @@ EOF
     echo -e "${CYAN}========== END OF TEST ==========${NC}"
     echo ""
     read -p "If you see an error above, press Ctrl+C to fix it. Otherwise press Enter to continue..."
-
-    # Switch back to info level for normal operation
-    sed -i 's/^log.level = "debug"/log.level = "info"/' /root/frp/client/client-${FRP_PORT}.toml
 
     cat > /etc/systemd/system/frpc@.service <<'EOF'
 [Unit]
