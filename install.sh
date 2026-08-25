@@ -151,6 +151,46 @@ check_port_in_use() {
    return 1
 }
 
+# Frees a port before (re)starting a service.
+# If the port is held by a stale/orphaned copy of the SAME binary
+# (e.g. a leftover frps/frpc from a crashed or manually-killed previous
+# run), it is killed automatically so the fresh systemd unit can bind
+# cleanly. If it's held by something else entirely, we warn and ask
+# for confirmation instead of killing blindly.
+free_stale_port() {
+   local port="$1" proc_name="$2" label="$3"
+   local line pids pid pname stale="" other=""
+
+   line=$(ss -tlnp 2>/dev/null | grep ":${port} ")
+   [ -z "$line" ] && line=$(netstat -tlnp 2>/dev/null | grep ":${port} ")
+   [ -z "$line" ] && return 0
+
+   pids=$(echo "$line" | grep -oP '(?<=pid=)[0-9]+' | sort -u)
+   [ -z "$pids" ] && pids=$(echo "$line" | grep -oP '\d+(?=/)' | sort -u)
+   [ -z "$pids" ] && return 0
+
+   for pid in $pids; do
+       pname=$(ps -p "$pid" -o comm= 2>/dev/null)
+       if [ "$pname" = "$proc_name" ]; then
+           stale="${stale} ${pid}"
+       else
+           other="${other} ${pid}"
+       fi
+   done
+
+   if [ -n "$stale" ]; then
+       log_warn "${label}: found stale ${proc_name} process(es) [PID:${stale} ] still bound here — killing so the fresh service can start cleanly."
+       for pid in $stale; do kill -9 "$pid" 2>/dev/null || true; done
+       sleep 1
+   fi
+
+   if [ -n "$other" ]; then
+       log_error "${label}: in use by a DIFFERENT process (PID:${other} ), not ${proc_name}. This will block startup:"
+       ps -p $other -o pid,comm,args 2>/dev/null
+       read -p "Press Enter to continue anyway, or Ctrl+C to abort..."
+   fi
+}
+
 install_watchdog() {
    log_step "Installing watchdog for health monitoring..."
 
@@ -220,6 +260,7 @@ do_restart() {
        return
    fi
    log_msg "WATCHDOG: RESTARTING ${unit}.service..."
+   systemctl reset-failed "${unit}.service" >/dev/null 2>&1 || true
    systemctl restart "${unit}.service" >/dev/null 2>&1
    sleep 5
    if pgrep -x "$proc" >/dev/null 2>&1; then
@@ -433,11 +474,14 @@ install_server() {
    log_step "=== Installing FRP Server (frps) on IRAN ==="
    log_ir "Reverse tunnel: frpc (outside) -> frps (Iran)"
 
-   if check_port_in_use "$FRP_PORT"; then
-       log_error "Port ${FRP_PORT} is already in use!"
-       ss -tlnp | grep ":${FRP_PORT} " || netstat -tlnp | grep ":${FRP_PORT} "
-       read -p "Press Enter to continue anyway, or Ctrl+C to abort..."
-   fi
+   # Stop any previous instance of this unit and clear systemd's failure
+   # counter first, then free both ports we're about to bind (tunnel port
+   # AND the admin dashboard port — a stale process on either one is the
+   # most common cause of "address already in use" on reinstall).
+   systemctl stop frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
+   systemctl reset-failed frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
+   free_stale_port "$FRP_PORT" "frps" "Bind port ${FRP_PORT}"
+   free_stale_port "$ADMIN_PORT_S" "frps" "Admin dashboard port ${ADMIN_PORT_S}"
 
    download_frp_binary "frps"
    mkdir -p /root/frp/server /var/log
@@ -472,13 +516,24 @@ maxPortsPerClient = 0
 detailedErrorsToClient = false
 EOF
 
+   # DEBUG: Run frps directly for a few seconds BEFORE handing it to systemd,
+   # so config/bind errors (like the port-already-in-use case) show up here
+   # immediately instead of being buried in journalctl after a crash loop.
+   log_step "Testing frps config validity (5 seconds)..."
+   echo ""
+   echo -e "${CYAN}========== DIRECT FRPS TEST ==========${NC}"
+   timeout 5 /usr/local/bin/frps -c /root/frp/server/server-${FRP_PORT}.toml 2>&1 || true
+   echo -e "${CYAN}========== END OF TEST ==========${NC}"
+   echo ""
+   read -p "If you see an error above, press Ctrl+C to fix it. Otherwise press Enter to continue..."
+
    cat > /etc/systemd/system/frps@.service <<'EOF'
 [Unit]
 Description=FRP Server Service (%i)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -497,6 +552,7 @@ EOF
 
    systemctl daemon-reload
    systemctl enable frps@server-${FRP_PORT}.service
+   systemctl reset-failed frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
    systemctl restart frps@server-${FRP_PORT}.service
 
    tune_tcp_for_frp
@@ -525,6 +581,14 @@ EOF
 install_client() {
    log_step "=== Installing FRP Client (frpc) on OUTSIDE server ==="
    log_ir "Connecting to Iran server via WSS/TLS"
+
+   # Same cleanup as the server side: stop any previous unit, clear its
+   # failure counter, and kill any stale frpc still bound to the admin
+   # port (this is why 'status' can show OFFLINE/failed while the admin
+   # API still answers — an old process never got cleaned up).
+   systemctl stop frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
+   systemctl reset-failed frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
+   free_stale_port "$ADMIN_PORT_C" "frpc" "Admin dashboard port ${ADMIN_PORT_C}"
 
    download_frp_binary "frpc"
    mkdir -p /root/frp/client /var/log
@@ -735,7 +799,7 @@ Description=FRP Client Service (%i)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -754,6 +818,7 @@ EOF
 
    systemctl daemon-reload
    systemctl enable frpc@client-${FRP_PORT}.service
+   systemctl reset-failed frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
    systemctl restart frpc@client-${FRP_PORT}.service
 
    tune_tcp_for_frp
@@ -822,7 +887,11 @@ check_status() {
        has_service=true
        echo ""
        echo "--- FRP Server (frps) - IRAN ---"
-       systemctl status frps@server-${FRP_PORT}.service --no-pager 2>/dev/null || echo "Not installed"
+       # 'systemctl status' exits non-zero for stopped/failed units even
+       # though they ARE installed — the old '|| echo "Not installed"'
+       # here printed a misleading line right under a status block that
+       # had just shown the unit as failed. Just show the status as-is.
+       systemctl status frps@server-${FRP_PORT}.service --no-pager 2>&1 || true
 
        if [ -f /var/log/frp-watchdog.log ]; then
            echo ""
@@ -835,7 +904,7 @@ check_status() {
        has_service=true
        echo ""
        echo "--- FRP Client (frpc) - OUTSIDE ---"
-       systemctl status frpc@client-${FRP_PORT}.service --no-pager 2>/dev/null || echo "Not installed"
+       systemctl status frpc@client-${FRP_PORT}.service --no-pager 2>&1 || true
 
        echo ""
        echo "--- Connection Status ---"
@@ -871,6 +940,12 @@ remove_frp() {
    rm -f /etc/systemd/system/frps@.service /etc/systemd/system/frpc@.service
    rm -rf /root/frp
    rm -f /usr/local/bin/frps /usr/local/bin/frpc
+
+   # Fallback: guarantee no orphaned process is left holding a port for
+   # the next install (this is exactly what caused the original
+   # "address already in use" failures).
+   pkill -9 -x frps 2>/dev/null || true
+   pkill -9 -x frpc 2>/dev/null || true
 
    remove_watchdog
    remove_tcp_tuning
