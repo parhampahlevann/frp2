@@ -2,51 +2,19 @@
 set -o pipefail
 
 ###############################################################################
-#  FRP Iran-Optimized Tunnel  --  STABILITY FIXED EDITION  (frp v0.71.0)
-#
-#  WHY THE OLD SCRIPT KEPT DROPPING THE TUNNEL  (all fixed below):
-#
-#   1. KILLER BUG - conntrack:
-#      "net.netfilter.nf_conntrack_tcp_timeout_established = 600" told the
-#      kernel firewall to FORGET any TCP flow that stayed quiet for 10 min,
-#      while frpc's control socket used Go's default TCP keepalive of
-#      2 HOURS. So every idle period silently killed the tunnel and the
-#      client only noticed much later -> classic connect / drop / reconnect.
-#      -> raised to 2h AND real keepalives added on the frp layer.
-#
-#   2. transport.tcpMux = false on BOTH sides:
-#      every single proxied connection (plus every pooled socket) opened a
-#      brand-new TLS/WSS handshake through the filtering layer. Iranian DPI
-#      throttles/resets bursts of identical handshakes to one IP:port.
-#      -> multiplexing ON: one long-lived session + yamux keepalive.
-#
-#   3. No heartbeat / dial keepalive on the client (they were deliberately
-#      deleted). Dead-link detection therefore took minutes.
-#      -> heartbeatInterval/Timeout + dialServerKeepalive/Timeout added.
-#         (These ARE valid frpc v1 fields; only transport.tcpKeepalive is
-#          server-only, which is why the old config crashed.)
-#
-#   4. Connection pool up to 400 pre-opened sockets -> handshake storm.
-#      -> small pool when mux is on (mux streams are nearly free).
-#
-#   5. transport.kcp.* is NOT a valid key in frp v1 TOML. With strict config
-#      parsing frpc refused to start whenever KCP was chosen. -> removed,
-#      replaced with the valid transport.quic.* options for QUIC.
-#
-#   6. systemd StartLimitBurst=10 / StartLimitIntervalSec=300: after 10 flaps
-#      systemd GAVE UP permanently ("start request repeated too quickly").
-#      -> start limiting disabled, RestartSec lowered to 5s.
-#
-#   7. Watchdog restart storms: it was installed on BOTH machines (the Iran
-#      box kept trying to restart a non-existent frpc every minute), it
-#      restarted services on a single slow admin-API reply, and its frpc
-#      health check grepped '"online":false' - a string frpc's API never
-#      returns, so real outages were missed while false ones triggered.
-#      -> side-aware install, systemd timer instead of cron, startup grace
-#         period, longer cooldown, correct health signal.
-#
-#   8. Kernel: added tcp_mtu_probing (PMTU black holes stall tunnels dead),
-#      lower tcp_retries2 (fail fast + reconnect), bigger conntrack table.
+# FRP Iran-Optimized Tunnel -- TCP-ONLY STABLE EDITION (frp v0.71.0)
+# FIXES APPLIED:
+# 1. REMOVED: wss, websocket, kcp, quic — only TCP remains (avoids UDP blocks)
+# 2. FIXED: PMTU/MSS black holes causing "some websites don't load"
+#    - Added iptables TCPMSS clamping on the tunnel interface
+#    - tcp_mtu_probing=2 (aggressive, not just 1)
+#    - Disabled TCP slow-start-after-idle (prevents stalls)
+# 3. FIXED: TCP buffer bloat / window scaling issues
+#    - Proper rmem/wmem values for high-latency paths
+#    - tcp_adv_win_scale adjusted
+# 4. FIXED: Connection tracking timeout mismatch (idle tunnel drops)
+# 5. FIXED: systemd start-limit storms and watchdog false-positives
+# 6. FIXED: TLS handshake issues — optional real cert, no fake SNI
 ###############################################################################
 
 FRP_VERSION="0.71.0"
@@ -55,17 +23,16 @@ FRP_PORT="8443"
 ADMIN_PORT_S="7500"
 ADMIN_PORT_C="7400"
 
-# --- Stability knobs -------------------------------------------------------
-# TCP_MUX MUST BE IDENTICAL ON BOTH SERVERS, otherwise login fails.
-TCP_MUX="true"          # true = stable (recommended). false = max raw speed.
-MUX_KEEPALIVE="20"      # yamux keepalive, seconds
-HB_INTERVAL="15"        # client -> server ping
-HB_TIMEOUT_C="60"       # client reconnects after this silence
-HB_TIMEOUT_S="120"      # server evicts a silent client after this
+--- Stability knobs -------------------------------------------------------
+TCP_MUX="true"
+MUX_KEEPALIVE="20"
+HB_INTERVAL="15"
+HB_TIMEOUT_C="60"
+HB_TIMEOUT_S="120"
 DIAL_TIMEOUT="15"
-DIAL_KEEPALIVE="15"     # TCP keepalive on the control socket (Go default 7200!)
-USER_CONN_TIMEOUT="20"  # tolerance for high-latency links
-ADMIN_BIND_S="0.0.0.0"  # set to 127.0.0.1 for a safer dashboard
+DIAL_KEEPALIVE="15"
+USER_CONN_TIMEOUT="30"        # increased for high-latency Iran links
+ADMIN_BIND_S="0.0.0.0"
 
 WD_FAIL_THRESHOLD="5"
 WD_COOLDOWN="600"
@@ -88,21 +55,21 @@ require_root() {
 
 detect_arch() {
     case "$(uname -m)" in
-        x86_64)        echo "amd64" ;;
+        x86_64) echo "amd64" ;;
         aarch64|arm64) echo "arm64" ;;
-        armv7l)        echo "arm" ;;
-        i386|i686)     echo "386" ;;
-        *)             echo "unsupported" ;;
+        armv7l) echo "arm" ;;
+        i386|i686) echo "386" ;;
+        *) echo "unsupported" ;;
     esac
 }
 
-log_info()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step()  { echo -e "${BLUE}[STEP]${NC}  $1"; }
-log_ok()    { echo -e "${CYAN}[OK]${NC}    $1"; }
-log_ir()    { echo -e "${MAGENTA}[IRAN]${NC}  $1"; }
-log_perf()  { echo -e "${CYAN}[PERF]${NC}  $1"; }
+log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
+log_ok() { echo -e "${CYAN}[OK]${NC} $1"; }
+log_ir() { echo -e "${MAGENTA}[IRAN]${NC} $1"; }
+log_perf() { echo -e "${CYAN}[PERF]${NC} $1"; }
 
 download_frp_binary() {
     local bin_name="$1"
@@ -143,7 +110,7 @@ download_frp_binary() {
 }
 
 ###############################################################################
-# Kernel tuning
+# Kernel tuning -- TCP-ONLY + PMTU FIX EDITION
 ###############################################################################
 tune_tcp_for_frp() {
     log_step "Applying TCP kernel tuning for tunnel stability..."
@@ -160,48 +127,59 @@ tune_tcp_for_frp() {
         log_warn "BBR module not available on this kernel, staying on cubic."
     fi
 
-    # conntrack lines only if the module is actually present, otherwise
-    # sysctl --system throws errors on every boot.
     modprobe nf_conntrack >/dev/null 2>&1 || true
     local conntrack_block="# nf_conntrack module not loaded, skipping conntrack tuning"
     if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
-        conntrack_block="net.netfilter.nf_conntrack_max = 262144
+        conntrack_block="net.netfilter.nf_conntrack_max = 524288
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60"
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30"
     fi
 
     cat > /etc/sysctl.d/99-frp-tuning.conf <<EOF
-# FRP Long-Haul TCP Optimization (stability edition)
+# FRP TCP-Only Tunnel Optimization
+# PMTU / MSS black hole fix
+net.ipv4.tcp_mtu_probing = 2
+net.ipv4.tcp_base_mss = 1024
+net.ipv4.tcp_mtu_probe_floor = 576
 
-# --- keepalive: notice a dead peer in ~90s instead of ~2h ---
+# Fast dead peer detection
 net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
 
-# --- fail fast on a black-holed link so frpc can reconnect ---
+# Fail fast on black-holed links
 net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
 
-# --- PMTU black holes are a top cause of "tunnel hangs then dies" ---
-net.ipv4.tcp_mtu_probing = 1
+# Disable slow start after idle (critical for tunnel stability)
+net.ipv4.tcp_slow_start_after_idle = 0
 
-# --- backlogs ---
+# Backlogs
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 
-# --- connection tracking: 600s was killing idle tunnel flows ---
+# Connection tracking
 ${conntrack_block}
 
+# Port reuse / timeouts
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.ip_local_port_range = 1024 65535
 
-# --- buffers ---
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
+# Window scaling / buffers optimized for high-latency tunnel
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_adv_win_scale = -2
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_mem = 786432 1048576 26777216
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+
 ${cc_line}
 ${qdisc_line}
 EOF
@@ -210,9 +188,59 @@ EOF
     log_info "TCP kernel tuning applied."
 }
 
+# CRITICAL FIX: MSS Clamping for tunneled TCP
+# Without this, websites sending large packets will fail to load.
+apply_mss_clamping() {
+    log_step "Applying MSS clamping (fixes 'some websites don't load')..."
+
+    local iface
+    iface=$(ip route | grep default | awk '{print $5}' | head -n1)
+    if [ -z "$iface" ]; then
+        iface="eth0"
+    fi
+
+    # Using iptables-legacy or nftables backend — both work
+    if command -v iptables >/dev/null 2>&1; then
+        # Clamp MSS to 1300 to leave room for FRP/TLS overhead
+        iptables -t mangle -C POSTROUTING -o "$iface" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-to-mss 1300 >/dev/null 2>&1 || \
+        iptables -t mangle -I POSTROUTING -o "$iface" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-to-mss 1300 2>/dev/null || true
+        
+        # Also clamp on INPUT chain for inbound SYN
+        iptables -t mangle -C INPUT -i "$iface" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-to-mss 1300 >/dev/null 2>&1 || \
+        iptables -t mangle -I INPUT -i "$iface" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-to-mss 1300 2>/dev/null || true
+        
+        # Make rules persistent if iptables-persistent exists
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+        elif command -v iptables-save >/dev/null 2>&1 && [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+        log_ok "MSS clamped to 1300 on $iface (iptables)."
+    fi
+
+    if command -v nft >/dev/null 2>&1; then
+        # nftables version
+        if ! nft list table inet mangle >/dev/null 2>&1; then
+            nft add table inet mangle 2>/dev/null || true
+        fi
+        if ! nft list chain inet mangle postrouting >/dev/null 2>&1; then
+            nft add chain inet mangle postrouting { type filter hook postrouting priority mangle \; } 2>/dev/null || true
+        fi
+        nft add rule inet mangle postrouting oifname "$iface" tcp flags syn tcp option maxseg size set 1300 2>/dev/null || true
+        log_ok "MSS clamped to 1300 on $iface (nftables)."
+    fi
+}
+
 remove_tcp_tuning() {
     rm -f /etc/sysctl.d/99-frp-tuning.conf
     sysctl --system >/dev/null 2>&1
+    
+    # Remove MSS clamping
+    local iface
+    iface=$(ip route | grep default | awk '{print $5}' | head -n1)
+    [ -z "$iface" ] && iface="eth0"
+    iptables -t mangle -D POSTROUTING -o "$iface" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-to-mss 1300 2>/dev/null || true
+    iptables -t mangle -D INPUT -i "$iface" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-to-mss 1300 2>/dev/null || true
 }
 
 ###############################################################################
@@ -235,8 +263,6 @@ open_firewall_port() {
     fi
 }
 
-# Frees a port before (re)starting a service. A stale copy of the SAME binary
-# is killed automatically; anything else only produces a warning.
 free_stale_port() {
     local port="$1" proc_name="$2" label="$3"
     local line pids pid pname stale="" other=""
@@ -272,10 +298,10 @@ free_stale_port() {
 }
 
 ###############################################################################
-# Transport config blocks (the actual stability fix)
+# Transport config blocks (TCP-ONLY)
 ###############################################################################
 server_transport_block() {
-    cat <<EOF
+cat <<EOF
 transport.tcpMux = ${TCP_MUX}
 transport.tcpMuxKeepaliveInterval = ${MUX_KEEPALIVE}
 transport.tcpKeepalive = 30
@@ -286,7 +312,7 @@ EOF
 
 client_transport_block() {
     local pool="$1"
-    cat <<EOF
+cat <<EOF
 transport.tcpMux = ${TCP_MUX}
 transport.tcpMuxKeepaliveInterval = ${MUX_KEEPALIVE}
 transport.poolCount = ${pool}
@@ -297,14 +323,12 @@ transport.dialServerKeepalive = ${DIAL_KEEPALIVE}
 EOF
 }
 
-# Strips the transport keys we manage and re-inserts the tuned ones BEFORE
-# the first [[proxies]] table (TOML requires bare keys above any table).
 patch_transport_block() {
     local file="$1" side="$2" pool="${3:-5}"
     local tmp block
     tmp=$(mktemp)
 
-    grep -Ev '^[[:space:]]*(transport\.tcpMux|transport\.tcpMuxKeepaliveInterval|transport\.tcpKeepalive|transport\.maxPoolCount|transport\.poolCount|transport\.heartbeatInterval|transport\.heartbeatTimeout|transport\.dialServerTimeout|transport\.dialServerKeepalive|transport\.kcp\.[a-zA-Z]+|userConnTimeout)[[:space:]]*=' "$file" > "$tmp"
+    grep -Ev '^[[:space:]]*(transport\.tcpMux|transport\.tcpMuxKeepaliveInterval|transport\.tcpKeepalive|transport\.maxPoolCount|transport\.poolCount|transport\.heartbeatInterval|transport\.heartbeatTimeout|transport\.dialServerTimeout|transport\.dialServerKeepalive|transport\.kcp\.[a-zA-Z]+|transport\.quic\.[a-zA-Z]+|transport\.protocol|userConnTimeout)[[:space:]]*=' "$file" > "$tmp"
 
     if [ "$side" = "server" ]; then
         block="$(server_transport_block)
@@ -324,9 +348,8 @@ userConnTimeout = ${USER_CONN_TIMEOUT}"
 
 current_pool_count() {
     local file="$1" p
-    p=$(grep -oP '^\s*transport\.poolCount\s*=\s*\K[0-9]+' "$file" 2>/dev/null | head -n1)
+    p=$(grep -oP '^\stransport.poolCount\s=\s*\K[0-9]+' "$file" 2>/dev/null | head -n1)
     if [ "$TCP_MUX" = "true" ]; then
-        # a huge legacy pool makes no sense once mux is on
         if [ -z "$p" ] || [ "$p" -gt 10 ]; then p=5; fi
     else
         [ -z "$p" ] && p=20
@@ -338,12 +361,11 @@ current_pool_count() {
 # systemd units
 ###############################################################################
 write_server_unit() {
-    cat > /etc/systemd/system/frps@.service <<'EOF'
+cat > /etc/systemd/system/frps@.service <<'EOF'
 [Unit]
 Description=FRP Server Service (%i)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
-# No start limit: systemd must NEVER give up on a tunnel.
 StartLimitIntervalSec=0
 
 [Service]
@@ -362,7 +384,7 @@ EOF
 }
 
 write_client_unit() {
-    cat > /etc/systemd/system/frpc@.service <<'EOF'
+cat > /etc/systemd/system/frpc@.service <<'EOF'
 [Unit]
 Description=FRP Client Service (%i)
 After=network-online.target nss-lookup.target
@@ -385,13 +407,13 @@ EOF
 }
 
 ###############################################################################
-# Watchdog (side-aware, storm-proof, systemd timer instead of cron)
+# Watchdog
 ###############################################################################
 install_watchdog() {
-    local side="$1"   # frps | frpc
+    local side="$1"
     log_step "Installing watchdog for ${side}..."
 
-    cat > /usr/local/bin/frp-watchdog.sh <<HEADER_EOF
+cat > /usr/local/bin/frp-watchdog.sh <<HEADER_EOF
 #!/bin/bash
 FRP_PORT="${FRP_PORT}"
 ADMIN_PORT_S="${ADMIN_PORT_S}"
@@ -402,7 +424,7 @@ RESTART_COOLDOWN=${WD_COOLDOWN}
 START_GRACE=${WD_GRACE}
 HEADER_EOF
 
-    cat >> /usr/local/bin/frp-watchdog.sh <<'WATCHDOG_EOF'
+cat >> /usr/local/bin/frp-watchdog.sh <<'WATCHDOG_EOF'
 LOG_FILE="/var/log/frp-watchdog.log"
 MAX_LOG_SIZE=1048576
 STATE_DIR="/run/frp-watchdog"
@@ -423,12 +445,11 @@ check_admin_api() {
     curl -sf --max-time "$API_TIMEOUT" -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${1}/api/status" >/dev/null 2>&1
 }
 
-read_count()  { local f="${STATE_DIR}/$1.fails"; [ -f "$f" ] && cat "$f" || echo 0; }
+read_count() { local f="${STATE_DIR}/$1.fails"; [ -f "$f" ] && cat "$f" || echo 0; }
 write_count() { echo "$2" > "${STATE_DIR}/$1.fails"; }
 
 unit_exists() { systemctl cat "$1" >/dev/null 2>&1; }
 
-# Never judge a service that has just (re)started - it needs time to dial out.
 started_recently() {
     local ts now
     ts=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$1" 2>/dev/null)
@@ -451,7 +472,6 @@ can_restart_now() {
 do_restart() {
     local proc="$1" unit="$2" svc_key="$3"
     if ! unit_exists "${unit}.service"; then
-        # e.g. the frpc check running on an frps-only box - nothing to do.
         return
     fi
     if started_recently "${unit}.service"; then
@@ -459,7 +479,7 @@ do_restart() {
         return
     fi
     if ! can_restart_now "$svc_key"; then
-        log_msg "WATCHDOG: ${proc} needs a restart but cooldown is active, skipping (no restart storms)"
+        log_msg "WATCHDOG: ${proc} needs a restart but cooldown is active, skipping"
         return
     fi
     log_msg "WATCHDOG: RESTARTING ${unit}.service..."
@@ -504,8 +524,6 @@ check_frps() {
         return
     fi
 
-    # A slow dashboard is NOT a reason to drop every client - only a long
-    # streak of failures counts.
     if check_admin_api "$ADMIN_PORT_S"; then
         write_count "$key" 0
     else
@@ -532,9 +550,6 @@ check_frpc() {
         return
     fi
 
-    # frpc's /api/status returns the proxy list with "status":"running".
-    # (The old script looked for '"online":false', which frpc never emits,
-    #  so a truly dead tunnel was reported as healthy.)
     if echo "$status" | grep -q '"status":"running"'; then
         write_count "$key" 0
     else
@@ -545,19 +560,18 @@ check_frpc() {
 rotate_log
 mkdir -p "$STATE_DIR"
 (
-    flock -n 200 || { log_msg "WATCHDOG: previous '$1' check still running, skipping tick"; exit 0; }
-    case "$1" in
-        frps) check_frps ;;
-        frpc) check_frpc ;;
-        *)    log_msg "Usage: $0 {frps|frpc}" ;;
-    esac
+flock -n 200 || { log_msg "WATCHDOG: previous '$1' check still running, skipping tick"; exit 0; }
+case "$1" in
+    frps) check_frps ;;
+    frpc) check_frpc ;;
+    *) log_msg "Usage: $0 {frps|frpc}" ;;
+esac
 ) 200>"${STATE_DIR}/$1.lock"
 WATCHDOG_EOF
 
     chmod 755 /usr/local/bin/frp-watchdog.sh
     mkdir -p /run/frp-watchdog
 
-    # Legacy cleanup: the old version put BOTH sides in cron on every host.
     if command -v crontab >/dev/null 2>&1; then
         (crontab -l 2>/dev/null | grep -v 'frp-watchdog') | crontab - 2>/dev/null || true
     fi
@@ -586,7 +600,6 @@ WantedBy=timers.target
 EOF
 
     systemctl daemon-reload
-    # only the side that actually runs here
     systemctl disable --now frp-watchdog@frps.timer >/dev/null 2>&1 || true
     systemctl disable --now frp-watchdog@frpc.timer >/dev/null 2>&1 || true
     systemctl enable --now "frp-watchdog@${side}.timer" >/dev/null 2>&1
@@ -642,7 +655,6 @@ generate_proxies() {
             local end=${entry##*-}
             for ((p=start; p<=end; p++)); do
                 cat >> "$config_file" <<PROXY
-
 [[proxies]]
 name = "${kind}-${p}"
 type = "${kind}"
@@ -671,10 +683,11 @@ PROXY
 show_menu() {
     clear
     echo "================================================"
-    echo "  FRP Iran-Optimized Tunnel - STABILITY EDITION "
-    echo "            (frp v${FRP_VERSION})                    "
+    echo " FRP Iran-Optimized Tunnel -- TCP-ONLY EDITION "
+    echo " (frp v${FRP_VERSION}) "
     echo "================================================"
-    echo " Multiplexing: ${TCP_MUX}   |  Port: ${FRP_PORT}"
+    echo " Protocol: TCP ONLY | Multiplexing: ${TCP_MUX} "
+    echo " Port: ${FRP_PORT}"
     echo "------------------------------------------------"
     echo "1) Install FRP Server (frps) - IRAN"
     echo "2) Install FRP Client (frpc) - OUTSIDE"
@@ -692,7 +705,7 @@ show_menu() {
 ###############################################################################
 install_server() {
     log_step "=== Installing FRP Server (frps) on IRAN ==="
-    log_ir "Reverse tunnel: frpc (outside) -> frps (Iran)"
+    log_ir "Reverse tunnel: frpc (outside) -> frps (Iran) via TCP"
 
     systemctl stop frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
     systemctl reset-failed frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
@@ -705,9 +718,7 @@ install_server() {
     open_firewall_port "$FRP_PORT" "tcp"
     open_firewall_port "$ADMIN_PORT_S" "tcp"
 
-    # Optional real certificate - a self-signed cert behind a fake SNI is a
-    # strong DPI fingerprint and a common reason a session gets reset after
-    # a few minutes.
+    # Optional real certificate
     local cert_block=""
     read -p "Do you have a real TLS cert for this server? (y/n) [default: n]: " use_cert
     if [[ "$use_cert" =~ ^[Yy]$ ]]; then
@@ -764,6 +775,7 @@ EOF
     systemctl restart frps@server-${FRP_PORT}.service
 
     tune_tcp_for_frp
+    apply_mss_clamping
     install_watchdog "frps"
 
     sleep 3
@@ -792,7 +804,7 @@ EOF
 ###############################################################################
 install_client() {
     log_step "=== Installing FRP Client (frpc) on OUTSIDE server ==="
-    log_ir "Connecting to Iran server via WSS/TLS"
+    log_ir "Connecting to Iran server via TCP (TLS)"
 
     systemctl stop frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
     systemctl reset-failed frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
@@ -829,8 +841,6 @@ install_client() {
     read -p "Select [1-3, default 2]: " load_choice
     load_choice=${load_choice:-2}
 
-    # With multiplexing ON a huge pool is pointless AND harmful: each pooled
-    # socket is a separate TLS handshake through the filter.
     local base_pool pool_cap
     if [ "$TCP_MUX" = "true" ]; then
         case "$load_choice" in
@@ -861,55 +871,16 @@ install_client() {
     fi
 
     echo ""
-    echo "Select connection protocol:"
-    echo "  1) wss       - RECOMMENDED: WebSocket over TLS, looks like HTTPS"
-    echo "  2) websocket - WebSocket without TLS"
-    echo "  3) tcp       - Plain TLS (NOT recommended for Iran)"
-    echo "  4) kcp       - UDP-based, usually BLOCKED in Iran"
-    echo "  5) quic      - UDP-based, usually BLOCKED in Iran"
-    read -p "Select [1-5, default 1]: " proto_choice
-    proto_choice=${proto_choice:-1}
-
-    local transport_protocol extra_proto_config="" iran_warn=""
-
-    case "$proto_choice" in
-        3) transport_protocol="tcp"
-           iran_warn="Plain TCP is easily detectable in Iran." ;;
-        4) transport_protocol="kcp"
-           iran_warn="KCP uses UDP, heavily filtered in Iran."
-           # NOTE: transport.kcp.* keys do NOT exist in frp v1 config and
-           # made frpc refuse to start. frp tunes KCP internally.
-           ;;
-        5) transport_protocol="quic"
-           iran_warn="QUIC uses UDP, heavily filtered in Iran."
-           extra_proto_config='transport.quic.keepalivePeriod = 10
-transport.quic.maxIdleTimeout = 30
-transport.quic.maxIncomingStreams = 100000' ;;
-        2) transport_protocol="websocket" ;;
-        *) transport_protocol="wss" ;;
-    esac
-
-    [ -n "$iran_warn" ] && log_warn "$iran_warn"
-
-    echo ""
-    echo "TLS / Domain Fronting:"
-    echo "  1) Basic TLS (default)"
-    echo "  2) Domain Fronting - Fake SNI"
-    echo "  3) Real Domain - Your own domain"
-    read -p "Select [1-3, default 1]: " tls_choice
+    echo "TLS Configuration:"
+    echo "  1) Basic TLS with self-signed cert (default)"
+    echo "  2) Real domain - Your own domain with valid cert"
+    read -p "Select [1-2, default 1]: " tls_choice
     tls_choice=${tls_choice:-1}
 
     local tls_config="" sni_note=""
 
     case "$tls_choice" in
-        2) read -p "Enter fake SNI domain [default: www.microsoft.com]: " fake_sni
-           fake_sni=${fake_sni:-www.microsoft.com}
-           tls_config="transport.tls.serverName = \"${fake_sni}\""
-           sni_note="SNI: ${fake_sni} (domain fronting)"
-           log_ir "Domain fronting active: SNI will show ${fake_sni}"
-           log_warn "A fake SNI with a self-signed cert can be reset by DPI after a while."
-           log_warn "For a rock-solid link use a real domain + real cert on the Iran side." ;;
-        3) read -p "Enter your real domain: " real_domain
+        2) read -p "Enter your real domain: " real_domain
            while [ -z "$real_domain" ]; do
                log_warn "Domain cannot be empty!"
                read -p "Enter your real domain: " real_domain
@@ -940,6 +911,7 @@ transport.quic.maxIncomingStreams = 100000' ;;
         log_ir "Proxy chaining enabled."
     fi
 
+    # TCP-ONLY: transport.protocol defaults to tcp, no need to set
     cat > /root/frp/client/client-${FRP_PORT}.toml <<EOF
 serverAddr = "${server_addr}"
 serverPort = ${FRP_PORT}
@@ -959,11 +931,9 @@ log.disablePrintColor = true
 auth.method = "token"
 auth.token = "${FRP_TOKEN}"
 
-transport.protocol = "${transport_protocol}"
 $(client_transport_block "$pool_count")
 ${tls_config}
 ${proxy_config}
-${extra_proto_config}
 EOF
 
     generate_proxies "tcp" "$ports" "/root/frp/client/client-${FRP_PORT}.toml"
@@ -988,6 +958,7 @@ EOF
     systemctl restart frpc@client-${FRP_PORT}.service
 
     tune_tcp_for_frp
+    apply_mss_clamping
     install_watchdog "frpc"
 
     log_step "Waiting for connection..."
@@ -1012,7 +983,7 @@ EOF
         echo -e "${GREEN}+------------------------------------------------------+${NC}"
         echo -e "${GREEN}|  Client (OUTSIDE) Status: CONNECTED${NC}"
         echo -e "${GREEN}|  Iran Server:  ${server_addr}:${FRP_PORT}${NC}"
-        echo -e "${GREEN}|  Protocol:     ${transport_protocol}${NC}"
+        echo -e "${GREEN}|  Protocol:     TCP (TLS)${NC}"
         echo -e "${GREEN}|  ${sni_note}${NC}"
         echo -e "${GREEN}|  tcpMux:       ${TCP_MUX} (keepalive ${MUX_KEEPALIVE}s)${NC}"
         echo -e "${GREEN}|  Heartbeat:    every ${HB_INTERVAL}s, timeout ${HB_TIMEOUT_C}s${NC}"
@@ -1034,7 +1005,7 @@ EOF
 }
 
 ###############################################################################
-# Apply the stability fix to an already-deployed install
+# Apply stability fix to existing install
 ###############################################################################
 apply_stability_fix() {
     log_step "=== Applying stability fix to existing configuration ==="
@@ -1064,6 +1035,7 @@ apply_stability_fix() {
     fi
 
     tune_tcp_for_frp
+    apply_mss_clamping
     systemctl daemon-reload
 
     if [ -f "$srv" ]; then
@@ -1090,7 +1062,7 @@ apply_stability_fix() {
 ###############################################################################
 check_status() {
     echo "================================================"
-    echo "              FRP Health Status                 "
+    echo " FRP Health Status "
     echo "================================================"
 
     local has_service=false
@@ -1162,10 +1134,14 @@ check_status() {
     sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_keepalive_time \
            net.ipv4.tcp_mtu_probing 2>/dev/null || true
     sysctl net.netfilter.nf_conntrack_tcp_timeout_established 2>/dev/null || true
+    
+    echo ""
+    echo "--- MSS Clamping ---"
+    iptables -t mangle -L POSTROUTING -v -n 2>/dev/null | grep -i mss || echo "  (no MSS rules found)"
 }
 
 live_logs() {
-    echo "1) frps (Iran)   2) frpc (Outside)   3) watchdog"
+    echo "1) frps (Iran) 2) frpc (Outside) 3) watchdog"
     read -p "Select [1-3]: " l
     case "$l" in
         1) journalctl -u frps@server-${FRP_PORT} -f --no-pager ;;
