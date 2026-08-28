@@ -767,6 +767,10 @@ EOF
     write_server_unit
     systemctl daemon-reload
     systemctl enable frps@server-${FRP_PORT}.service >/dev/null 2>&1
+    # The direct test above can leave a real frps process running past its
+    # timeout, squatting on these ports and blocking the service below.
+    free_stale_port "$FRP_PORT" "frps" "Bind port ${FRP_PORT}"
+    free_stale_port "$ADMIN_PORT_S" "frps" "Admin dashboard port ${ADMIN_PORT_S}"
     systemctl reset-failed frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
     systemctl restart frps@server-${FRP_PORT}.service
 
@@ -968,6 +972,9 @@ EOF
     write_client_unit
     systemctl daemon-reload
     systemctl enable frpc@client-${FRP_PORT}.service >/dev/null 2>&1
+    # The direct test above can leave a real frpc process running past its
+    # timeout, squatting on the admin port and blocking the service below.
+    free_stale_port "$ADMIN_PORT_C" "frpc" "Admin dashboard port ${ADMIN_PORT_C}"
     systemctl reset-failed frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
     systemctl restart frpc@client-${FRP_PORT}.service
 
@@ -1053,6 +1060,12 @@ apply_stability_fix() {
     if [ -f "$srv" ]; then
         log_step "Validating new server config..."
         timeout 4 /usr/local/bin/frps -c "$srv" 2>&1 | head -n 20 || true
+        # The line above starts a REAL frps process. If it outlives the
+        # 4s timeout (observed in the wild), it squats on the admin port
+        # forever and the systemd-managed copy below can never bind it
+        # ("address already in use"), crash-looping indefinitely.
+        free_stale_port "$FRP_PORT" "frps" "Bind port ${FRP_PORT}"
+        free_stale_port "$ADMIN_PORT_S" "frps" "Admin dashboard port ${ADMIN_PORT_S}"
         systemctl reset-failed frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
         systemctl restart frps@server-${FRP_PORT}.service
         install_watchdog "frps"
@@ -1060,6 +1073,8 @@ apply_stability_fix() {
     if [ -f "$cli" ]; then
         log_step "Validating new client config..."
         timeout 4 /usr/local/bin/frpc -c "$cli" 2>&1 | head -n 20 || true
+        # Same leak risk as above, on the client's admin port.
+        free_stale_port "$ADMIN_PORT_C" "frpc" "Admin dashboard port ${ADMIN_PORT_C}"
         systemctl reset-failed frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
         systemctl restart frpc@client-${FRP_PORT}.service
         install_watchdog "frpc"
