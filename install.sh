@@ -998,5 +998,3 @@
           esac
       done
   }
-  
-  main "$@"
