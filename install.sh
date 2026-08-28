@@ -47,6 +47,31 @@ set -o pipefail
 #
 #   8. Kernel: added tcp_mtu_probing (PMTU black holes stall tunnels dead),
 #      lower tcp_retries2 (fail fast + reconnect), bigger conntrack table.
+#
+#   9. SILENT SINGLE-PORT FAILURE  (the "only Google is broken" bug):
+#      frps binds each remotePort independently. If something ELSE is
+#      already listening on a port you're about to tunnel (e.g. a local
+#      Xray/V2Ray instance sitting on the Iran box), frps fails to bind
+#      JUST that one proxy - the control connection stays perfectly
+#      healthy, so nothing looked wrong. Any traffic sent to that port
+#      then hits the OTHER process instead of the tunnel.
+#      The old watchdog made this invisible: check_frpc() only asked "is
+#      AT LEAST ONE proxy running?" - with 3 good ports and 1 broken one,
+#      that's still true, so it reported healthy forever.
+#      -> (a) install_server now offers a pre-flight scan of the exact
+#             remote ports you intend to tunnel, and flags/lets you kill
+#             whatever's already squatting on them, BEFORE frps starts.
+#         (b) install_client now checks that a backend is actually
+#             listening on 127.0.0.1:<port> locally, so a not-yet-started
+#             Xray/V2Ray backend gets caught too.
+#         (c) check_status (option 3) now shows a per-port, per-side
+#             breakdown ([OK]/[FAIL] with the frp status string) instead
+#             of one aggregate number.
+#         (d) the watchdog now requires ALL configured proxies to be
+#             "running", not just one. A partial failure gets logged as a
+#             CRITICAL, cooldown-limited alert (restarting frpc can't fix
+#             a port fight on the server side, so it deliberately does
+#             NOT restart-loop on this - it tells you to go look).
 ###############################################################################
 
 FRP_VERSION="0.71.0"
@@ -278,6 +303,111 @@ free_stale_port() {
     fi
 }
 
+# Expands "443,1080,2053-2055" into a flat, space-separated port list.
+expand_port_list() {
+    local ports="$1"
+    local IFS=','
+    local out=()
+    read -ra PORT_ARRAY <<< "$ports"
+    for entry in "${PORT_ARRAY[@]}"; do
+        entry=$(echo "$entry" | tr -d ' ')
+        [ -z "$entry" ] && continue
+        if [[ "$entry" == *"-"* ]]; then
+            local start=${entry%%-*}
+            local end=${entry##*-}
+            local p
+            for ((p=start; p<=end; p++)); do out+=("$p"); done
+        else
+            out+=("$entry")
+        fi
+    done
+    echo "${out[@]}"
+}
+
+# THE FIX for bug #9, server side: check every REMOTE port you're about to
+# tunnel for a pre-existing listener BEFORE frps ever tries to bind it.
+# frps failing to bind one proxy does not crash the control connection, so
+# without this check the conflict is invisible until someone notices one
+# specific site/port doesn't work.
+check_remote_ports_preflight() {
+    local ports="$1"
+    local port pids pid pname found_conflict=false
+
+    log_step "Pre-flight: checking ${ports} for processes already bound on THIS (Iran) server..."
+    for port in $(expand_port_list "$ports"); do
+        local line
+        line=$(ss -tlnp 2>/dev/null | grep ":${port} ")
+        [ -z "$line" ] && line=$(netstat -tlnp 2>/dev/null | grep ":${port} ")
+        if [ -z "$line" ]; then
+            log_ok "Port ${port}: free."
+            continue
+        fi
+
+        pids=$(echo "$line" | grep -oP '(?<=pid=)[0-9]+' | sort -u)
+        [ -z "$pids" ] && pids=$(echo "$line" | grep -oP '\d+(?=/)' | sort -u)
+        if [ -z "$pids" ]; then
+            log_warn "Port ${port}: something is already listening but its PID could not be determined."
+            found_conflict=true
+            continue
+        fi
+
+        for pid in $pids; do
+            pname=$(ps -p "$pid" -o comm= 2>/dev/null)
+            if [ "$pname" = "frps" ]; then
+                log_ok "Port ${port}: already bound by an existing frps (fine, will be reused)."
+                continue
+            fi
+            found_conflict=true
+            log_error "Port ${port}: ALREADY IN USE by '${pname}' (PID ${pid})."
+            log_error "  -> If frpc later asks for this exact remotePort, frps will fail to bind"
+            log_error "     it SILENTLY (control connection stays healthy) and every request to"
+            log_error "     it will keep hitting '${pname}' instead of going through the tunnel."
+            ps -p "$pid" -o pid,comm,args 2>/dev/null
+            read -p "  Kill '${pname}' (PID ${pid}) now so port ${port} is free for the tunnel? (y/n): " kp
+            if [[ "$kp" =~ ^[Yy]$ ]]; then
+                kill -9 "$pid" 2>/dev/null || true
+                sleep 1
+                log_ok "  Killed. Port ${port} should be free now."
+            else
+                log_warn "  Left running - port ${port} will NOT work through the tunnel until you free it."
+            fi
+        done
+    done
+
+    if [ "$found_conflict" = true ]; then
+        log_warn "One or more ports had conflicts - review the output above."
+    else
+        log_info "No port conflicts found - clear to tunnel these ports."
+    fi
+}
+
+# THE FIX for bug #9, client side (case #2 from the diagnosis): warn if the
+# local backend (Xray/V2Ray/whatever should be listening on 127.0.0.1) isn't
+# actually up yet for a port you're about to tunnel.
+check_local_backend_ports() {
+    local ports="$1" port
+    log_step "Checking that a local backend is actually listening on 127.0.0.1 for each port..."
+    for port in $(expand_port_list "$ports"); do
+        if timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
+            log_ok "127.0.0.1:${port} -> something is listening (good)."
+        else
+            log_warn "127.0.0.1:${port} -> NOTHING is listening here right now."
+            log_warn "  frpc will still register this proxy, but until a local service"
+            log_warn "  (Xray/V2Ray/etc.) actually binds 127.0.0.1:${port}, traffic to it will fail."
+        fi
+    done
+}
+
+# Best-effort JSON scrape (no jq dependency): pulls out "name"/"status" pairs
+# from an frp admin-API status blob. Relies on frp always emitting "name"
+# before "status" within each proxy object, which is how its structs marshal.
+# Prints one "name<TAB>status" pair per line.
+parse_proxy_statuses() {
+    grep -oP '"name"\s*:\s*"[^"]*"|"status"\s*:\s*"[^"]*"' <<< "$1" \
+        | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' \
+        | paste -d '\t' - -
+}
+
 ###############################################################################
 # Transport config blocks (the actual stability fix)
 ###############################################################################
@@ -430,6 +560,14 @@ check_admin_api() {
     curl -sf --max-time "$API_TIMEOUT" -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${1}/api/status" >/dev/null 2>&1
 }
 
+# Best-effort JSON scrape (no jq dependency): pulls "name"/"status" pairs out
+# of an frp admin-API status blob, one "name<TAB>status" pair per line.
+parse_proxy_statuses() {
+    grep -oP '"name"\s*:\s*"[^"]*"|"status"\s*:\s*"[^"]*"' <<< "$1" \
+        | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' \
+        | paste -d '\t' - -
+}
+
 read_count()  { local f="${STATE_DIR}/$1.fails"; [ -f "$f" ] && cat "$f" || echo 0; }
 write_count() { echo "$2" > "${STATE_DIR}/$1.fails"; }
 
@@ -539,13 +677,44 @@ check_frpc() {
         return
     fi
 
-    # frpc's /api/status returns the proxy list with "status":"running".
-    # (The old script looked for '"online":false', which frpc never emits,
-    #  so a truly dead tunnel was reported as healthy.)
-    if echo "$status" | grep -q '"status":"running"'; then
+    # THE FIX for bug #9: require ALL configured proxies to be "running",
+    # not just at least one. (The old check used grep -q '"status":"running"'
+    # which is true even if 3 out of 4 ports are broken - exactly how a
+    # single squatted port on the server side went unnoticed.)
+    local total=0 running=0 bad_names=""
+    while IFS=$'\t' read -r pname pstatus; do
+        [ -z "$pname" ] && continue
+        total=$((total+1))
+        if [ "$pstatus" = "running" ]; then
+            running=$((running+1))
+        else
+            bad_names="${bad_names}${pname}(${pstatus}) "
+        fi
+    done < <(parse_proxy_statuses "$status")
+
+    if [ "$total" -eq 0 ]; then
+        bump_fail "$key" "frpc status returned no proxies" "frpc" "$unit"
+    elif [ "$running" -eq 0 ]; then
+        # Full outage - a plain restart is worth trying.
+        bump_fail "$key" "frpc has NO running proxy (tunnel fully down)" "frpc" "$unit"
+    elif [ "$running" -lt "$total" ]; then
+        # Partial outage - e.g. one remote port squatted by another process
+        # on the Iran side. Restarting frpc will NOT fix this (the server
+        # keeps refusing the same port), so alert loudly on a cooldown
+        # instead of restart-looping forever.
         write_count "$key" 0
+        local dfile="${STATE_DIR}/${key}.degraded_last"
+        local now last=0
+        now=$(date +%s)
+        [ -f "$dfile" ] && last=$(cat "$dfile")
+        if [ $(( now - last )) -ge "$RESTART_COOLDOWN" ]; then
+            log_msg "WATCHDOG: CRITICAL - PARTIAL TUNNEL FAILURE: ${running}/${total} ports up. Broken: ${bad_names}"
+            log_msg "WATCHDOG: this is almost always another process already bound to that port on the Iran server (check with: ss -tlnp | grep ':<port> '). Restarting frpc will NOT fix it - go fix the port conflict."
+            echo "$now" > "$dfile"
+        fi
     else
-        bump_fail "$key" "frpc has NO running proxy (tunnel down)" "frpc" "$unit"
+        write_count "$key" 0
+        rm -f "${STATE_DIR}/${key}.degraded_last" 2>/dev/null
     fi
 }
 
@@ -729,6 +898,21 @@ transport.tls.keyFile = \"${key_file}\""
         fi
     fi
 
+    # --- Bug #9 pre-flight: catch a squatter BEFORE frps ever tries to
+    #     bind the same port, instead of finding out later that "only
+    #     Google" or "only this one port" silently doesn't work.
+    echo ""
+    log_step "Pre-flight port-conflict check (recommended)"
+    echo "Enter the REMOTE/public ports you plan to tunnel through this server"
+    echo "(the same ports you will type on the client side) - comma separated, ranges ok."
+    read -p "Ports to check [enter to skip, e.g. 443,1080,2053,23902]: " preflight_ports
+    if [ -n "$preflight_ports" ]; then
+        check_remote_ports_preflight "$preflight_ports"
+        echo "$preflight_ports" > "/root/frp/server/ports-${FRP_PORT}.list"
+    else
+        log_warn "Skipped. You can re-run this check any time from option 3 (Check Status) or option 4."
+    fi
+
     cat > /root/frp/server/server-${FRP_PORT}.toml <<EOF
 bindAddr = "0.0.0.0"
 bindPort = ${FRP_PORT}
@@ -788,6 +972,7 @@ EOF
         echo ""
         log_warn "Open port ${FRP_PORT} in your cloud firewall as well."
         log_warn "Test from outside: nc -vz IRAN_IP ${FRP_PORT}"
+        log_warn "After the client connects, run option 3 to confirm EVERY port is actually running."
     else
         log_error "Failed to start server!"
         journalctl -u frps@server-${FRP_PORT} --no-pager -n 30
@@ -825,6 +1010,10 @@ install_client() {
 
     read -p "Enter inbound ports to forward [default: 8080]: " ports
     ports=${ports:-8080}
+
+    # --- Bug #9 (case #2): make sure something is actually listening
+    #     locally before we wire the tunnel up to it.
+    check_local_backend_ports "$ports"
 
     read -p "Also forward UDP ports? (y/n) [default: n]: " forward_udp
 
@@ -1007,6 +1196,9 @@ EOF
         echo -e "${GREEN}+------------------------------------------------------+${NC}"
         echo ""
         log_warn "Make sure the IRAN side also runs this new script (tcpMux must match)."
+        log_warn "'CONNECTED' above only means at least one port works. Run option 3 now to"
+        log_warn "confirm ALL ${n_ports} port(s) are individually running - that's what catches"
+        log_warn "a single silently-broken port like the Google-only issue."
     else
         log_warn "Connection not established."
         log_warn "  1. Is tcpMux the same (${TCP_MUX}) on the Iran server?"
@@ -1031,6 +1223,18 @@ apply_stability_fix() {
         write_server_unit
         touched=true
         log_ok "Server config patched (backup kept)."
+
+        local ports_file="/root/frp/server/ports-${FRP_PORT}.list"
+        if [ -f "$ports_file" ]; then
+            check_remote_ports_preflight "$(cat "$ports_file")"
+        else
+            echo ""
+            read -p "Enter remote ports to run the pre-flight conflict check on [enter to skip]: " recheck_ports
+            if [ -n "$recheck_ports" ]; then
+                check_remote_ports_preflight "$recheck_ports"
+                echo "$recheck_ports" > "$ports_file"
+            fi
+        fi
     fi
 
     local cli="/root/frp/client/client-${FRP_PORT}.toml"
@@ -1067,11 +1271,39 @@ apply_stability_fix() {
 
     sleep 4
     log_info "Stability fix applied. IMPORTANT: run this on BOTH servers so tcpMux matches."
+    log_info "Then run option 3 (Check Status) to confirm every port is running, not just the control connection."
 }
 
 ###############################################################################
 # Status / logs
 ###############################################################################
+# Prints a per-port [OK]/[FAIL] breakdown from a status JSON blob obtained
+# from an frp admin API. This is what actually catches bug #9 - a single
+# broken port among several healthy ones.
+print_proxy_breakdown() {
+    local json="$1"
+    local bad=0 total=0
+    while IFS=$'\t' read -r pname pstatus; do
+        [ -z "$pname" ] && continue
+        total=$((total+1))
+        if [ "$pstatus" = "running" ]; then
+            echo -e "  ${GREEN}[OK]${NC}   ${pname}"
+        else
+            echo -e "  ${RED}[FAIL]${NC} ${pname} -> status: ${pstatus}"
+            bad=$((bad+1))
+        fi
+    done < <(parse_proxy_statuses "$json")
+
+    if [ "$total" -eq 0 ]; then
+        echo "  (no proxies reported)"
+    elif [ "$bad" -gt 0 ]; then
+        echo -e "  ${RED}${bad}/${total} port(s) are NOT actually tunneling.${NC}"
+        echo -e "  On the Iran server, check what's squatting on them: ${YELLOW}ss -tlnp | grep ':<port> '${NC}"
+    else
+        echo -e "  ${GREEN}All ${total} port(s) running.${NC}"
+    fi
+}
+
 check_status() {
     echo "================================================"
     echo "              FRP Health Status                 "
@@ -1089,11 +1321,49 @@ check_status() {
         curl -sf --max-time 5 -u "admin:${FRP_TOKEN}" \
             "http://127.0.0.1:${ADMIN_PORT_S}/api/serverinfo" 2>/dev/null \
             | grep -oP '"clientCounts":\s*\K[0-9]+' || echo "  (admin API not reachable)"
+
+        echo ""
+        echo "Per-port status as seen by the SERVER:"
+        local sproxy
+        sproxy=$(curl -sf --max-time 5 -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${ADMIN_PORT_S}/api/proxy/tcp" 2>/dev/null)
+        sproxy="${sproxy} $(curl -sf --max-time 5 -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${ADMIN_PORT_S}/api/proxy/udp" 2>/dev/null)"
+        if [ -n "${sproxy// /}" ]; then
+            print_proxy_breakdown "$sproxy"
+        else
+            echo "  (admin API not reachable)"
+        fi
+
         if [ -f /var/log/frps.log ]; then
             echo ""
             echo "Control-connection churn (last 200 log lines):"
             echo "  logins:   $(tail -n 200 /var/log/frps.log | grep -c 'client login info')"
             echo "  closed:   $(tail -n 200 /var/log/frps.log | grep -ci 'client close\|control connection closed')"
+            local bind_errs
+            bind_errs=$(tail -n 500 /var/log/frps.log | grep -ic 'address already in use')
+            [ "$bind_errs" -gt 0 ] && echo -e "  ${RED}bind conflicts (last 500 lines): ${bind_errs} - another process is squatting on a tunnel port${NC}"
+        fi
+
+        if [ -f "/root/frp/server/ports-${FRP_PORT}.list" ]; then
+            echo ""
+            echo "Re-running saved pre-flight port check ($(cat "/root/frp/server/ports-${FRP_PORT}.list")):"
+            check_remote_ports_preflight_readonly() {
+                local ports="$1" port line pid pname
+                for port in $(expand_port_list "$ports"); do
+                    line=$(ss -tlnp 2>/dev/null | grep ":${port} ")
+                    if [ -z "$line" ]; then
+                        echo -e "  ${YELLOW}Port ${port}: nothing listening yet (ok if frpc hasn't connected).${NC}"
+                        continue
+                    fi
+                    pid=$(echo "$line" | grep -oP '(?<=pid=)[0-9]+' | head -n1)
+                    pname=$(ps -p "$pid" -o comm= 2>/dev/null)
+                    if [ "$pname" = "frps" ]; then
+                        echo -e "  ${GREEN}Port ${port}: bound by frps (correct).${NC}"
+                    else
+                        echo -e "  ${RED}Port ${port}: bound by '${pname}' (PID ${pid}) - NOT frps!${NC}"
+                    fi
+                done
+            }
+            check_remote_ports_preflight_readonly "$(cat "/root/frp/server/ports-${FRP_PORT}.list")"
         fi
     fi
 
@@ -1109,15 +1379,8 @@ check_status() {
         status=$(curl -sf --max-time 5 -u "admin:${FRP_TOKEN}" \
                  "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null)
         if [ -n "$status" ]; then
-            local running total
-            running=$(echo "$status" | grep -o '"status":"running"' | wc -l)
-            total=$(echo "$status" | grep -o '"status":"' | wc -l)
-            if [ "$running" -gt 0 ]; then
-                echo -e "${GREEN}ONLINE - ${running}/${total} proxies running.${NC}"
-            else
-                echo -e "${RED}OFFLINE - 0/${total} proxies running.${NC}"
-                echo "$status" | head -c 400
-            fi
+            echo "Per-port status as seen by the CLIENT:"
+            print_proxy_breakdown "$status"
         else
             echo "Admin API not available."
         fi
