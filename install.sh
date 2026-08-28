@@ -64,7 +64,9 @@ HB_TIMEOUT_C="60"       # client reconnects after this silence
 HB_TIMEOUT_S="120"      # server evicts a silent client after this
 DIAL_TIMEOUT="15"
 DIAL_KEEPALIVE="15"     # TCP keepalive on the control socket (Go default 7200!)
-USER_CONN_TIMEOUT="20"  # tolerance for high-latency links
+USER_CONN_TIMEOUT="45"  # was 20s - too tight for the full multi-hop chain on
+                         # slow/heavy sites; this is the #1 suspect for
+                         # "some sites just don't come up" while others work
 ADMIN_BIND_S="0.0.0.0"  # set to 127.0.0.1 for a safer dashboard
 
 WD_FAIL_THRESHOLD="5"
@@ -182,7 +184,12 @@ net.ipv4.tcp_keepalive_probes = 6
 net.ipv4.tcp_retries2 = 8
 
 # --- PMTU black holes are a top cause of "tunnel hangs then dies" ---
-net.ipv4.tcp_mtu_probing = 1
+# mode 1 only starts probing AFTER a stall is detected (first big response
+# on a path can still hang for a bit). Mode 2 starts every connection from
+# a conservative base MSS and grows it - no detection delay, no reliance
+# on ICMP (which Iranian ISPs/DPI frequently drop).
+net.ipv4.tcp_mtu_probing = 2
+net.ipv4.tcp_base_mss = 1024
 
 # --- backlogs ---
 net.core.somaxconn = 65535
