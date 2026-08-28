@@ -867,36 +867,13 @@ install_client() {
         log_warn "Capping pool to ${pool_count} per port (~${pool_cap} total)."
     fi
 
-    echo ""
-    echo "Select connection protocol:"
-    echo "  1) wss       - RECOMMENDED: WebSocket over TLS, looks like HTTPS"
-    echo "  2) websocket - WebSocket without TLS"
-    echo "  3) tcp       - Plain TLS (NOT recommended for Iran)"
-    echo "  4) kcp       - UDP-based, usually BLOCKED in Iran"
-    echo "  5) quic      - UDP-based, usually BLOCKED in Iran"
-    read -p "Select [1-5, default 1]: " proto_choice
-    proto_choice=${proto_choice:-1}
-
-    local transport_protocol extra_proto_config="" iran_warn=""
-
-    case "$proto_choice" in
-        3) transport_protocol="tcp"
-           iran_warn="Plain TCP is easily detectable in Iran." ;;
-        4) transport_protocol="kcp"
-           iran_warn="KCP uses UDP, heavily filtered in Iran."
-           # NOTE: transport.kcp.* keys do NOT exist in frp v1 config and
-           # made frpc refuse to start. frp tunes KCP internally.
-           ;;
-        5) transport_protocol="quic"
-           iran_warn="QUIC uses UDP, heavily filtered in Iran."
-           extra_proto_config='transport.quic.keepalivePeriod = 10
-transport.quic.maxIdleTimeout = 30
-transport.quic.maxIncomingStreams = 100000' ;;
-        2) transport_protocol="websocket" ;;
-        *) transport_protocol="wss" ;;
-    esac
-
-    [ -n "$iran_warn" ] && log_warn "$iran_warn"
+    # Per your request: only tcp is offered now. wss/websocket/kcp/quic were
+    # removed. NOTE: switching this transport was already tested (wss) and
+    # did not fix the Google-only failure - that leg (frpc<->frps) tested
+    # healthy, so don't expect this choice alone to fix that issue. See the
+    # chat answer for where the actual problem most likely is.
+    local transport_protocol="tcp" extra_proto_config=""
+    log_warn "transport.protocol=tcp: no HTTP/WS framing, so a TLS ClientHello with no SNI set is an anomaly DPI can fingerprint. Strongly set a fake or real SNI in the TLS step below - don't leave it blank."
 
     echo ""
     echo "TLS / Domain Fronting:"
