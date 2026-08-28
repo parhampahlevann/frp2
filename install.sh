@@ -1,7 +1,4 @@
-op: write
-path: /tasklet/agent/home/frp/frp-tunnel.sh
-content: 
-  #!/bin/bash
+ #!/bin/bash
   # =============================================================================
   #  FRP Reverse Tunnel Manager  --  v3.0  (TCP-ONLY EDITION)
   # =============================================================================
@@ -1003,4 +1000,3 @@ content:
   }
   
   main "$@"
-  
