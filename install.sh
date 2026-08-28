@@ -1,949 +1,1218 @@
 #!/bin/bash
-# =============================================================================
-#  FRP Reverse Tunnel Manager  --  v3.0  (TCP-ONLY EDITION)
-# =============================================================================
-#  Topology:   Users --> [IRAN server : frps] ==TCP+TLS==> [FOREIGN server : frpc] --> local service
-#
-#  WHAT CHANGED IN v3.0
-#  --------------------
-#  1) FRP core pinned to v0.71.0 (latest stable). It contains the upstream fix
-#     for the leaked control session when frpc reconnects over a half-open
-#     tcpMux connection -- that bug was a direct cause of "drops every few
-#     minutes then comes back".
-#  2) TCP ONLY. The whole protocol menu (wss / websocket / kcp / quic) is gone,
-#     together with every non-TCP config branch. The client hard-codes
-#     transport.protocol = "tcp". Re-running the repair option also migrates an
-#     old wss/kcp/quic install to TCP.
-#  3) MTU / MSS black-hole fix -- this is the real cause of
-#     "tunnel is up, traffic flows, but SOME sites never load".
-#     frp is a TCP *relay*, not an IP encapsulator, so the stall does not come
-#     from packet-in-packet overhead; it comes from the path between the end
-#     user and the Iran server (mobile / PPPoE / stacked tunnels reduce MTU to
-#     ~1400) combined with ICMP "fragmentation needed" being filtered.
-#     Result: the handshake and small requests succeed, but the first full-size
-#     data segment is silently dropped -> heavy pages hang forever while light
-#     ones work. Fixed by clamping the advertised MSS on both boxes, made
-#     persistent through a systemd unit, plus kernel MTU probing as a backstop.
-#  4) Two more real "some sites don't load" causes are now detected and fixed:
-#     broken IPv6 on the exit node (AAAA sites like Google/Cloudflare die while
-#     IPv4-only sites work) and broken DNS on the exit node.
-#  5) Remaining TCP-layer issues fixed: conntrack liberal window checking
-#     (out-of-window drops on relayed flows = random frozen connections),
-#     tcp_no_metrics_save (a bad cwnd cached during a lossy minute poisoned
-#     every later connection), saner tcp_retries2, dependency pre-flight.
-#
-#  Menu: 1 = Iran server (frps)   2 = Foreign server (frpc)   3 = status
-#        4 = repair/migrate existing install   5 = MTU/MSS fix only
-#        6 = diagnose "some sites don't load"  7 = logs   8 = uninstall
-# =============================================================================
-
 set -o pipefail
 
-# ------------------------------- constants ----------------------------------
-FRP_VERSION="0.71.0"          # latest stable
-FRP_DIR="/usr/local/frp"
-CONF_DIR="/etc/frp"
-LOG_DIR="/var/log/frp"
-MSS_SCRIPT="/usr/local/bin/frp-mss-fix.sh"
-MSS_UNIT="/etc/systemd/system/frp-mss.service"
-SYSCTL_FILE="/etc/sysctl.d/99-frp-tunnel.conf"
-LIMITS_DROPIN="/etc/systemd/system.conf.d/99-frp-limits.conf"
+###############################################################################
+#  FRP Iran-Optimized Tunnel  --  STABILITY FIXED EDITION  (frp v0.71.0)
+#
+#  WHY THE OLD SCRIPT KEPT DROPPING THE TUNNEL  (all fixed below):
+#
+#   1. KILLER BUG - conntrack:
+#      "net.netfilter.nf_conntrack_tcp_timeout_established = 600" told the
+#      kernel firewall to FORGET any TCP flow that stayed quiet for 10 min,
+#      while frpc's control socket used Go's default TCP keepalive of
+#      2 HOURS. So every idle period silently killed the tunnel and the
+#      client only noticed much later -> classic connect / drop / reconnect.
+#      -> raised to 2h AND real keepalives added on the frp layer.
+#
+#   2. transport.tcpMux = false on BOTH sides:
+#      every single proxied connection (plus every pooled socket) opened a
+#      brand-new TLS/WSS handshake through the filtering layer. Iranian DPI
+#      throttles/resets bursts of identical handshakes to one IP:port.
+#      -> multiplexing ON: one long-lived session + yamux keepalive.
+#
+#   3. No heartbeat / dial keepalive on the client (they were deliberately
+#      deleted). Dead-link detection therefore took minutes.
+#      -> heartbeatInterval/Timeout + dialServerKeepalive/Timeout added.
+#         (These ARE valid frpc v1 fields; only transport.tcpKeepalive is
+#          server-only, which is why the old config crashed.)
+#
+#   4. Connection pool up to 400 pre-opened sockets -> handshake storm.
+#      -> small pool when mux is on (mux streams are nearly free).
+#
+#   5. transport.kcp.* is NOT a valid key in frp v1 TOML. With strict config
+#      parsing frpc refused to start whenever KCP was chosen. -> removed,
+#      replaced with the valid transport.quic.* options for QUIC.
+#
+#   6. systemd StartLimitBurst=10 / StartLimitIntervalSec=300: after 10 flaps
+#      systemd GAVE UP permanently ("start request repeated too quickly").
+#      -> start limiting disabled, RestartSec lowered to 5s.
+#
+#   7. Watchdog restart storms: it was installed on BOTH machines (the Iran
+#      box kept trying to restart a non-existent frpc every minute), it
+#      restarted services on a single slow admin-API reply, and its frpc
+#      health check grepped '"online":false' - a string frpc's API never
+#      returns, so real outages were missed while false ones triggered.
+#      -> side-aware install, systemd timer instead of cron, startup grace
+#         period, longer cooldown, correct health signal.
+#
+#   8. Kernel: added tcp_mtu_probing (PMTU black holes stall tunnels dead),
+#      lower tcp_retries2 (fail fast + reconnect), bigger conntrack table.
+###############################################################################
 
-DEF_TOKEN="tun100"
-DEF_PORT="8443"
-DEF_ADMIN_S="7500"
-DEF_ADMIN_C="7400"
-DEF_MSS="1360"                # -> IP MTU 1400, safe on Iranian mobile/PPPoE paths
+FRP_VERSION="0.71.0"
+FRP_TOKEN="tun100"
+FRP_PORT="8443"
+ADMIN_PORT_S="7500"
+ADMIN_PORT_C="7400"
 
-# transport tuning (identical semantics on both sides where required)
-TCP_MUX="true"                # MUST be identical on frps and frpc
-MUX_KEEPALIVE="20"
-HB_INTERVAL="15"              # client heartbeat
-HB_TIMEOUT_C="60"             # client gives up after 60s of silence
-HB_TIMEOUT_S="120"            # server must be more tolerant than the client
+# --- Stability knobs -------------------------------------------------------
+# TCP_MUX MUST BE IDENTICAL ON BOTH SERVERS, otherwise login fails.
+TCP_MUX="true"          # true = stable (recommended). false = max raw speed.
+MUX_KEEPALIVE="20"      # yamux keepalive, seconds
+HB_INTERVAL="15"        # client -> server ping
+HB_TIMEOUT_C="60"       # client reconnects after this silence
+HB_TIMEOUT_S="120"      # server evicts a silent client after this
 DIAL_TIMEOUT="15"
-DIAL_KEEPALIVE="15"
-USER_CONN_TIMEOUT="20"
+DIAL_KEEPALIVE="15"     # TCP keepalive on the control socket (Go default 7200!)
+USER_CONN_TIMEOUT="20"  # tolerance for high-latency links
+ADMIN_BIND_S="0.0.0.0"  # set to 127.0.0.1 for a safer dashboard
 
-RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YEL=$'\033[1;33m'
-BLU=$'\033[0;34m'; CYN=$'\033[0;36m'; BLD=$'\033[1m'; NC=$'\033[0m'
+WD_FAIL_THRESHOLD="5"
+WD_COOLDOWN="600"
+WD_GRACE="120"
 
-ok()   { echo "${GRN}[ OK ]${NC} $*"; }
-inf()  { echo "${BLU}[INFO]${NC} $*"; }
-warn() { echo "${YEL}[WARN]${NC} $*"; }
-err()  { echo "${RED}[FAIL]${NC} $*"; }
-hdr()  { echo; echo "${CYN}${BLD}==> $*${NC}"; }
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        err "Run this script as root:  sudo bash $0"
+        echo -e "${RED}[ERROR] This script must be run as root (sudo).${NC}"
         exit 1
     fi
 }
 
-pause() { echo; read -r -p "Press Enter to continue..." _; }
-
-# --------------------------- dependency pre-flight --------------------------
-ensure_deps() {
-    local missing=""
-    command -v curl    >/dev/null 2>&1 || missing="$missing curl"
-    command -v tar     >/dev/null 2>&1 || missing="$missing tar"
-    command -v ss      >/dev/null 2>&1 || missing="$missing iproute2"
-    command -v ping    >/dev/null 2>&1 || missing="$missing iputils-ping"
-    command -v iptables>/dev/null 2>&1 || missing="$missing iptables"
-    [ -z "$missing" ] && return 0
-
-    inf "Installing missing packages:$missing"
-    if command -v apt-get >/dev/null 2>&1; then
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1
-        # shellcheck disable=SC2086
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $missing >/dev/null 2>&1
-    elif command -v dnf >/dev/null 2>&1; then
-        # shellcheck disable=SC2086
-        dnf install -y -q $missing >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        # shellcheck disable=SC2086
-        yum install -y -q $missing >/dev/null 2>&1
-    fi
-    command -v curl >/dev/null 2>&1 || { err "curl is required and could not be installed."; exit 1; }
-}
-
-# ------------------------------ frp binary ----------------------------------
 detect_arch() {
     case "$(uname -m)" in
-        x86_64|amd64)   echo "amd64"  ;;
-        aarch64|arm64)  echo "arm64"  ;;
-        armv7l|armv7)   echo "arm"    ;;
-        i386|i686)      echo "386"    ;;
-        *) err "Unsupported CPU architecture: $(uname -m)"; exit 1 ;;
+        x86_64)        echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l)        echo "arm" ;;
+        i386|i686)     echo "386" ;;
+        *)             echo "unsupported" ;;
     esac
 }
 
-download_frp() {
-    local arch pkg url tmp
-    arch="$(detect_arch)"
-    pkg="frp_${FRP_VERSION}_linux_${arch}"
-    url="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${pkg}.tar.gz"
-    tmp="$(mktemp -d)"
+log_info()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step()  { echo -e "${BLUE}[STEP]${NC}  $1"; }
+log_ok()    { echo -e "${CYAN}[OK]${NC}    $1"; }
+log_ir()    { echo -e "${MAGENTA}[IRAN]${NC}  $1"; }
+log_perf()  { echo -e "${CYAN}[PERF]${NC}  $1"; }
 
-    hdr "Installing frp v${FRP_VERSION} (${arch})"
-
-    if [ -x "${FRP_DIR}/frps" ] && "${FRP_DIR}/frps" --version 2>/dev/null | grep -q "^${FRP_VERSION}$"; then
-        ok "frp v${FRP_VERSION} already installed, skipping download."
-        rm -rf "$tmp"; return 0
+download_frp_binary() {
+    local bin_name="$1"
+    local arch
+    arch=$(detect_arch)
+    if [ "$arch" = "unsupported" ]; then
+        log_error "Unsupported architecture: $(uname -m)"
+        exit 1
     fi
 
-    local mirrors=(
-        "$url"
-        "https://ghproxy.net/${url}"
-        "https://gh-proxy.com/${url}"
-    )
-    local got=1 m
-    for m in "${mirrors[@]}"; do
-        inf "Trying: ${m%%\?*}"
-        if curl -fL --connect-timeout 15 --max-time 300 --retry 2 -o "${tmp}/frp.tar.gz" "$m" 2>/dev/null; then
-            if tar -tzf "${tmp}/frp.tar.gz" >/dev/null 2>&1; then got=0; break; fi
-        fi
-        warn "Mirror failed, trying the next one."
-    done
-    if [ $got -ne 0 ]; then
-        err "Could not download frp. Check outbound connectivity / DNS on this box."
-        rm -rf "$tmp"; exit 1
+    local pkg="frp_${FRP_VERSION}_linux_${arch}"
+    local url="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${pkg}.tar.gz"
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    log_step "Downloading ${bin_name} (frp v${FRP_VERSION}, ${arch})..."
+    if ! curl -fL --retry 5 --retry-delay 3 --connect-timeout 15 -o "${tmp_dir}/frp.tar.gz" "$url"; then
+        log_error "Download failed: $url"
+        rm -rf "$tmp_dir"
+        exit 1
     fi
 
-    tar -xzf "${tmp}/frp.tar.gz" -C "$tmp" || { err "Archive extraction failed."; rm -rf "$tmp"; exit 1; }
-    mkdir -p "$FRP_DIR" "$CONF_DIR" "$LOG_DIR"
-    install -m 0755 "${tmp}/${pkg}/frps" "${FRP_DIR}/frps"
-    install -m 0755 "${tmp}/${pkg}/frpc" "${FRP_DIR}/frpc"
-    rm -rf "$tmp"
-    ok "frp v${FRP_VERSION} installed to ${FRP_DIR}"
+    if ! tar -xzf "${tmp_dir}/frp.tar.gz" -C "$tmp_dir"; then
+        log_error "Archive extraction failed."
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    if [ ! -f "${tmp_dir}/${pkg}/${bin_name}" ]; then
+        log_error "Binary ${bin_name} not found inside archive."
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    install -m 755 "${tmp_dir}/${pkg}/${bin_name}" "/usr/local/bin/${bin_name}"
+    rm -rf "$tmp_dir"
+    log_info "${bin_name} installed at /usr/local/bin/${bin_name}"
 }
 
-# ------------------------- kernel / TCP stack tuning ------------------------
-tune_tcp() {
-    hdr "Tuning the TCP stack"
+###############################################################################
+# Kernel tuning
+###############################################################################
+tune_tcp_for_frp() {
+    log_step "Applying TCP kernel tuning for tunnel stability..."
 
-    modprobe tcp_bbr 2>/dev/null
-    local cc="cubic"
-    grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && cc="bbr"
+    local cc_line="net.ipv4.tcp_congestion_control = cubic"
+    local qdisc_line="# net.core.default_qdisc = fq (bbr unavailable, staying on cubic)"
 
-    cat > "$SYSCTL_FILE" <<EOF
-# managed by frp-tunnel.sh -- do not edit by hand
-
-# --- queueing & congestion control ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = ${cc}
-
-# --- socket buffers (long fat pipe Iran <-> abroad) ---
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 1048576 33554432
-net.ipv4.tcp_wmem = 4096 1048576 33554432
-net.ipv4.tcp_mem = 786432 1048576 26777216
-
-# --- MTU black-hole handling (backstop for the MSS clamp below) ---
-# 1 = enable probing only after a suspected black hole is detected.
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_base_mss = 1024
-
-# --- keepalive: notice a dead peer in ~75s instead of ~2h ---
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 3
-
-# --- do not let one bad minute poison every later connection ---
-net.ipv4.tcp_no_metrics_save = 1
-
-# --- give up on a truly dead connection in ~100s instead of ~15min ---
-net.ipv4.tcp_retries2 = 10
-
-# --- connection handling ---
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 32768
-net.ipv4.tcp_max_syn_backlog = 32768
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = 262144
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.ip_local_port_range = 10240 65000
-
-# --- file descriptors ---
-fs.file-max = 2097152
-fs.nr_open = 2097152
-EOF
-
-    # conntrack lives in a module that may not be loaded yet
-    modprobe nf_conntrack 2>/dev/null
-    if [ -d /proc/sys/net/netfilter ]; then
-        cat >> "$SYSCTL_FILE" <<'EOF'
-
-# --- netfilter connection tracking ---
-# A relayed/idle tunnel connection must not be evicted after 5 days of default
-# timers while the table fills up; and be_liberal stops conntrack from dropping
-# out-of-window segments on relayed flows (a classic "random frozen tab" cause).
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
-net.netfilter.nf_conntrack_tcp_be_liberal = 1
-EOF
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        cc_line="net.ipv4.tcp_congestion_control = bbr"
+        qdisc_line="net.core.default_qdisc = fq"
+        log_perf "BBR congestion control available, enabling it."
+    else
+        log_warn "BBR module not available on this kernel, staying on cubic."
     fi
+
+    # conntrack lines only if the module is actually present, otherwise
+    # sysctl --system throws errors on every boot.
+    modprobe nf_conntrack >/dev/null 2>&1 || true
+    local conntrack_block="# nf_conntrack module not loaded, skipping conntrack tuning"
+    if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        conntrack_block="net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60"
+    fi
+
+    cat > /etc/sysctl.d/99-frp-tuning.conf <<EOF
+# FRP Long-Haul TCP Optimization (stability edition)
+
+# --- keepalive: notice a dead peer in ~90s instead of ~2h ---
+net.ipv4.tcp_keepalive_time = 30
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+
+# --- fail fast on a black-holed link so frpc can reconnect ---
+net.ipv4.tcp_retries2 = 8
+
+# --- PMTU black holes are a top cause of "tunnel hangs then dies" ---
+net.ipv4.tcp_mtu_probing = 1
+
+# --- backlogs ---
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# --- connection tracking: 600s was killing idle tunnel flows ---
+${conntrack_block}
+
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.ip_local_port_range = 1024 65535
+
+# --- buffers ---
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+${cc_line}
+${qdisc_line}
+EOF
 
     sysctl --system >/dev/null 2>&1
-    ok "Sysctl applied (congestion control: ${cc})"
+    log_info "TCP kernel tuning applied."
+}
 
-    # process-wide FD limits
-    mkdir -p "$(dirname "$LIMITS_DROPIN")"
-    printf '[Manager]\nDefaultLimitNOFILE=1048576\n' > "$LIMITS_DROPIN"
-    if ! grep -q "frp-tunnel" /etc/security/limits.conf 2>/dev/null; then
-        {
-            echo "# frp-tunnel"
-            echo "* soft nofile 1048576"
-            echo "* hard nofile 1048576"
-            echo "root soft nofile 1048576"
-            echo "root hard nofile 1048576"
-        } >> /etc/security/limits.conf
+remove_tcp_tuning() {
+    rm -f /etc/sysctl.d/99-frp-tuning.conf
+    sysctl --system >/dev/null 2>&1
+}
+
+###############################################################################
+# Firewall / ports
+###############################################################################
+open_firewall_port() {
+    local port="$1"
+    local proto="${2:-tcp}"
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
     fi
-    systemctl daemon-reexec >/dev/null 2>&1
-    ok "File-descriptor limits raised"
-}
-
-# =============================================================================
-#  MSS CLAMPING  --  the fix for "tunnel works but some sites never load"
-# =============================================================================
-write_mss_script() {
-    local mss="$1" mss6=$(( $1 - 20 ))
-
-    cat > "$MSS_SCRIPT" <<EOF
-#!/bin/bash
-# managed by frp-tunnel.sh -- MSS clamping / PMTU black-hole fix
-MSS4=${mss}
-MSS6=${mss6}
-EOF
-
-    cat >> "$MSS_SCRIPT" <<'EOF'
-
-rule_set() {           # $1=cmd  $2=chain  $3..=target args
-    local cmd="$1" chain="$2"; shift 2
-    "$cmd" -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN "$@" >/dev/null 2>&1 && return 0
-    "$cmd" -t mangle -A "$chain" -p tcp --tcp-flags SYN,RST SYN "$@" >/dev/null 2>&1
-}
-
-rule_del() {
-    local cmd="$1" chain="$2"; shift 2
-    while "$cmd" -t mangle -C "$chain" -p tcp --tcp-flags SYN,RST SYN "$@" >/dev/null 2>&1; do
-        "$cmd" -t mangle -D "$chain" -p tcp --tcp-flags SYN,RST SYN "$@" >/dev/null 2>&1 || break
-    done
-}
-
-apply() {
-    if command -v iptables >/dev/null 2>&1; then
-        rule_set iptables OUTPUT     ! -o lo -j TCPMSS --set-mss "$MSS4"
-        rule_set iptables PREROUTING ! -i lo -j TCPMSS --set-mss "$MSS4"
-        rule_set iptables POSTROUTING ! -o lo -j TCPMSS --set-mss "$MSS4"
-        rule_set iptables FORWARD    -j TCPMSS --clamp-mss-to-pmtu
-    fi
-    if command -v ip6tables >/dev/null 2>&1; then
-        rule_set ip6tables OUTPUT     ! -o lo -j TCPMSS --set-mss "$MSS6"
-        rule_set ip6tables PREROUTING ! -i lo -j TCPMSS --set-mss "$MSS6"
-        rule_set ip6tables POSTROUTING ! -o lo -j TCPMSS --set-mss "$MSS6"
-        rule_set ip6tables FORWARD    -j TCPMSS --clamp-mss-to-pmtu
-    fi
-    return 0
-}
-
-remove() {
-    if command -v iptables >/dev/null 2>&1; then
-        rule_del iptables OUTPUT      ! -o lo -j TCPMSS --set-mss "$MSS4"
-        rule_del iptables PREROUTING  ! -i lo -j TCPMSS --set-mss "$MSS4"
-        rule_del iptables POSTROUTING ! -o lo -j TCPMSS --set-mss "$MSS4"
-        rule_del iptables FORWARD     -j TCPMSS --clamp-mss-to-pmtu
-    fi
-    if command -v ip6tables >/dev/null 2>&1; then
-        rule_del ip6tables OUTPUT      ! -o lo -j TCPMSS --set-mss "$MSS6"
-        rule_del ip6tables PREROUTING  ! -i lo -j TCPMSS --set-mss "$MSS6"
-        rule_del ip6tables POSTROUTING ! -o lo -j TCPMSS --set-mss "$MSS6"
-        rule_del ip6tables FORWARD     -j TCPMSS --clamp-mss-to-pmtu
-    fi
-    return 0
-}
-
-show() {
-    echo "--- IPv4 mangle rules (MSS ${MSS4}) ---"
-    iptables -t mangle -S 2>/dev/null | grep -i tcpmss || echo "  (none)"
-    echo "--- IPv6 mangle rules (MSS ${MSS6}) ---"
-    ip6tables -t mangle -S 2>/dev/null | grep -i tcpmss || echo "  (none)"
-}
-
-case "$1" in
-    apply)  apply  ;;
-    remove) remove ;;
-    show)   show   ;;
-    *) echo "usage: $0 {apply|remove|show}"; exit 1 ;;
-esac
-EOF
-    chmod 0755 "$MSS_SCRIPT"
-}
-
-install_mss_fix() {
-    local mss="${1:-$DEF_MSS}"
-    hdr "Applying the MSS clamp (MSS ${mss} / IP MTU $(( mss + 40 )))"
-
-    modprobe xt_TCPMSS 2>/dev/null
-    write_mss_script "$mss"
-
-    cat > "$MSS_UNIT" <<EOF
-[Unit]
-Description=FRP MSS clamping (PMTU black-hole fix)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${MSS_SCRIPT} apply
-ExecStop=${MSS_SCRIPT} remove
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload >/dev/null 2>&1
-    systemctl enable --now frp-mss.service >/dev/null 2>&1
-
-    if iptables -t mangle -S 2>/dev/null | grep -qi tcpmss; then
-        ok "MSS clamp is active and will survive reboots."
-    else
-        warn "Could not verify the MSS rules. Is the xt_TCPMSS module available?"
-        warn "Kernel MTU probing (tcp_mtu_probing=1) still covers most cases."
-    fi
-}
-
-remove_mss_fix() {
-    systemctl disable --now frp-mss.service >/dev/null 2>&1
-    [ -x "$MSS_SCRIPT" ] && "$MSS_SCRIPT" remove >/dev/null 2>&1
-    rm -f "$MSS_UNIT" "$MSS_SCRIPT"
-    systemctl daemon-reload >/dev/null 2>&1
-    ok "MSS clamp removed."
-}
-
-probe_mss() {
-    local host="$1" payload mtu
-    command -v ping >/dev/null 2>&1 || { echo "$DEF_MSS"; return; }
-    for payload in 1472 1452 1432 1412 1392 1372 1352 1332 1312 1272 1232 1172; do
-        if ping -c 1 -W 2 -M do -s "$payload" "$host" >/dev/null 2>&1; then
-            mtu=$(( payload + 28 ))
-            echo $(( mtu - 60 ))
-            return
-        fi
-    done
-    echo "$DEF_MSS"
-}
-
-fix_broken_ipv6() {
-    hdr "Checking IPv6 health on this box"
-
-    if ! ip -6 addr show scope global 2>/dev/null | grep -q "inet6"; then
-        ok "No global IPv6 address -- nothing to do."
-        return 0
-    fi
-
-    if curl -6 -sf --max-time 6 -o /dev/null https://ipv6.google.com 2>/dev/null \
-    || curl -6 -sf --max-time 6 -o /dev/null "https://[2606:4700:4700::1111]/" 2>/dev/null; then
-        ok "IPv6 is present and actually works."
-        return 0
-    fi
-
-    warn "This box advertises IPv6 but IPv6 traffic does not work."
-    warn "That is a textbook cause of 'some sites never load': anything with an"
-    warn "AAAA record (Google, YouTube, Cloudflare-fronted sites) is tried over"
-    warn "IPv6 first and times out, while IPv4-only sites open instantly."
-    inf  "Fixing by preferring IPv4 in /etc/gai.conf."
-
-    touch /etc/gai.conf
-    if ! grep -qE '^\s*precedence\s+::ffff:0:0/96\s+100' /etc/gai.conf; then
-        printf '\n# frp-tunnel: broken IPv6 detected, prefer IPv4\nprecedence ::ffff:0:0/96  100\n' >> /etc/gai.conf
-    fi
-    ok "IPv4 is now preferred for name resolution."
-}
-
-check_dns() {
-    hdr "Checking DNS on this box"
-    local d bad=0
-    for d in google.com cloudflare.com github.com; do
-        if getent hosts "$d" >/dev/null 2>&1; then
-            ok "resolves: $d"
-        else
-            err "does NOT resolve: $d"
-            bad=1
-        fi
-    done
-    if [ $bad -ne 0 ]; then
-        warn "Broken DNS on the exit node makes 'some sites' fail while others work."
-        warn "Point /etc/resolv.conf (or systemd-resolved) at 1.1.1.1 and 8.8.8.8."
-    fi
-    return 0
-}
-
-open_port() {
-    local port="$1" proto="${2:-tcp}"
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${port}/${proto}" >/dev/null 2>&1 && inf "ufw: opened ${port}/${proto}"
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
-        inf "firewalld: opened ${port}/${proto}"
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
     fi
     if command -v iptables >/dev/null 2>&1; then
-        iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null
+        iptables -C INPUT -p "${proto}" --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -I INPUT -p "${proto}" --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
     fi
 }
 
+# Frees a port before (re)starting a service. A stale copy of the SAME binary
+# is killed automatically; anything else only produces a warning.
 free_stale_port() {
-    local port="$1" pids
-    pids="$(ss -lntpH "sport = :${port}" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)"
+    local port="$1" proc_name="$2" label="$3"
+    local line pids pid pname stale="" other=""
+
+    line=$(ss -tlnp 2>/dev/null | grep ":${port} ")
+    [ -z "$line" ] && line=$(netstat -tlnp 2>/dev/null | grep ":${port} ")
+    [ -z "$line" ] && return 0
+
+    pids=$(echo "$line" | grep -oP '(?<=pid=)[0-9]+' | sort -u)
+    [ -z "$pids" ] && pids=$(echo "$line" | grep -oP '\d+(?=/)' | sort -u)
     [ -z "$pids" ] && return 0
-    warn "Port ${port} is already in use by PID(s): ${pids}"
-    read -r -p "Kill them and continue? [y/N]: " a
-    if [[ "$a" =~ ^[Yy]$ ]]; then
-        # shellcheck disable=SC2086
-        kill -9 $pids 2>/dev/null
+
+    for pid in $pids; do
+        pname=$(ps -p "$pid" -o comm= 2>/dev/null)
+        if [ "$pname" = "$proc_name" ]; then
+            stale="${stale} ${pid}"
+        else
+            other="${other} ${pid}"
+        fi
+    done
+
+    if [ -n "$stale" ]; then
+        log_warn "${label}: stale ${proc_name} process(es) [PID:${stale} ] still bound - killing."
+        for pid in $stale; do kill -9 "$pid" 2>/dev/null || true; done
         sleep 1
-        ok "Port ${port} released."
-    else
-        err "Port ${port} is busy, aborting."
-        return 1
+    fi
+
+    if [ -n "$other" ]; then
+        log_error "${label}: in use by a DIFFERENT process (PID:${other} ). This will block startup:"
+        ps -p $other -o pid,comm,args 2>/dev/null
+        read -p "Press Enter to continue anyway, or Ctrl+C to abort..."
     fi
 }
 
+###############################################################################
+# Transport config blocks (the actual stability fix)
+###############################################################################
 server_transport_block() {
     cat <<EOF
-# ---- transport (server) ----------------------------------------------------
-# tcpMux MUST match the client exactly, otherwise every connection is refused
-# after the login succeeds -- that mismatch alone looks like "random drops".
 transport.tcpMux = ${TCP_MUX}
 transport.tcpMuxKeepaliveInterval = ${MUX_KEEPALIVE}
 transport.tcpKeepalive = 30
 transport.maxPoolCount = 100
-# Must be larger than the client's heartbeatInterval, with headroom for a lossy
-# link, or the server evicts a client that is perfectly alive.
 transport.heartbeatTimeout = ${HB_TIMEOUT_S}
-transport.tls.force = true
 EOF
 }
 
 client_transport_block() {
     local pool="$1"
     cat <<EOF
-# ---- transport (client) ----------------------------------------------------
-# TCP ONLY. kcp/quic/websocket/wss are intentionally not supported by this
-# script: over an Iran <-> abroad path they add jitter and reconnect storms
-# without buying anything that TCP+TLS does not already give us.
-transport.protocol = "tcp"
 transport.tcpMux = ${TCP_MUX}
 transport.tcpMuxKeepaliveInterval = ${MUX_KEEPALIVE}
-transport.dialServerTimeout = ${DIAL_TIMEOUT}
-transport.dialServerKeepalive = ${DIAL_KEEPALIVE}
+transport.poolCount = ${pool}
 transport.heartbeatInterval = ${HB_INTERVAL}
 transport.heartbeatTimeout = ${HB_TIMEOUT_C}
-transport.poolCount = ${pool}
-# TLS wraps the control and data streams; with the custom first byte disabled
-# the stream starts with a real ClientHello, which is what a DPI box expects.
-transport.tls.enable = true
-transport.tls.disableCustomTLSFirstByte = true
+transport.dialServerTimeout = ${DIAL_TIMEOUT}
+transport.dialServerKeepalive = ${DIAL_KEEPALIVE}
 EOF
 }
 
-strip_managed_keys() {
-    local file="$1"
-    sed -i -E '/^[[:space:]]*(transport\.protocol|transport\.tcpMux|transport\.tcpMuxKeepaliveInterval|transport\.tcpKeepalive|transport\.maxPoolCount|transport\.poolCount|transport\.heartbeatInterval|transport\.heartbeatTimeout|transport\.dialServerTimeout|transport\.dialServerKeepalive|transport\.tls\.enable|transport\.tls\.force|transport\.tls\.disableCustomTLSFirstByte|transport\.quic\.[A-Za-z]+|transport\.kcp\.[A-Za-z]+|kcpBindPort|quicBindPort)[[:space:]]*=/d' "$file"
-    sed -i -E '/^# ---- transport \((server|client)\) -+$/d' "$file"
+# Strips the transport keys we manage and re-inserts the tuned ones BEFORE
+# the first [[proxies]] table (TOML requires bare keys above any table).
+patch_transport_block() {
+    local file="$1" side="$2" pool="${3:-5}"
+    local tmp block
+    tmp=$(mktemp)
+
+    grep -Ev '^[[:space:]]*(transport\.tcpMux|transport\.tcpMuxKeepaliveInterval|transport\.tcpKeepalive|transport\.maxPoolCount|transport\.poolCount|transport\.heartbeatInterval|transport\.heartbeatTimeout|transport\.dialServerTimeout|transport\.dialServerKeepalive|transport\.kcp\.[a-zA-Z]+|userConnTimeout)[[:space:]]*=' "$file" > "$tmp"
+
+    if [ "$side" = "server" ]; then
+        block="$(server_transport_block)
+userConnTimeout = ${USER_CONN_TIMEOUT}"
+    else
+        block="$(client_transport_block "$pool")"
+    fi
+
+    awk -v block="$block" '
+        BEGIN { inserted = 0 }
+        /^\[\[proxies\]\]/ && !inserted { print block; print ""; inserted = 1 }
+        { print }
+        END { if (!inserted) { print ""; print block } }
+    ' "$tmp" > "$file"
+    rm -f "$tmp"
 }
 
 current_pool_count() {
-    local file="$1" v
-    v="$(grep -oE '^[[:space:]]*transport\.poolCount[[:space:]]*=[[:space:]]*[0-9]+' "$file" 2>/dev/null | grep -oE '[0-9]+$' | head -1)"
-    [ -z "$v" ] && v=5
-    echo "$v"
+    local file="$1" p
+    p=$(grep -oP '^\s*transport\.poolCount\s*=\s*\K[0-9]+' "$file" 2>/dev/null | head -n1)
+    if [ "$TCP_MUX" = "true" ]; then
+        # a huge legacy pool makes no sense once mux is on
+        if [ -z "$p" ] || [ "$p" -gt 10 ]; then p=5; fi
+    else
+        [ -z "$p" ] && p=20
+    fi
+    echo "$p"
 }
 
-write_unit() {
-    local role="$1"   # frps | frpc
-    cat > "/etc/systemd/system/${role}.service" <<EOF
+###############################################################################
+# systemd units
+###############################################################################
+write_server_unit() {
+    cat > /etc/systemd/system/frps@.service <<'EOF'
 [Unit]
-Description=frp ${role} (TCP-only tunnel)
+Description=FRP Server Service (%i)
 After=network-online.target nss-lookup.target
 Wants=network-online.target
+# No start limit: systemd must NEVER give up on a tunnel.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=root
+ExecStart=/usr/local/bin/frps -c /root/frp/server/%i.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
-RestartSec=5
-StartLimitIntervalSec=0
-StartLimitBurst=0
-ExecStart=${FRP_DIR}/${role} -c ${CONF_DIR}/${role}.toml
-ExecReload=/bin/kill -HUP \$MAINPID
+RestartSec=5s
 LimitNOFILE=1048576
-LimitNPROC=1048576
+LimitNPROC=65535
 TimeoutStopSec=20
-KillMode=mixed
-OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload >/dev/null 2>&1
-    systemctl enable "$role" >/dev/null 2>&1
+}
+
+write_client_unit() {
+    cat > /etc/systemd/system/frpc@.service <<'EOF'
+[Unit]
+Description=FRP Client Service (%i)
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frpc -c /root/frp/client/%i.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5s
+LimitNOFILE=1048576
+LimitNPROC=65535
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+###############################################################################
+# Watchdog (side-aware, storm-proof, systemd timer instead of cron)
+###############################################################################
+install_watchdog() {
+    local side="$1"   # frps | frpc
+    log_step "Installing watchdog for ${side}..."
+
+    cat > /usr/local/bin/frp-watchdog.sh <<HEADER_EOF
+#!/bin/bash
+FRP_PORT="${FRP_PORT}"
+ADMIN_PORT_S="${ADMIN_PORT_S}"
+ADMIN_PORT_C="${ADMIN_PORT_C}"
+FRP_TOKEN="${FRP_TOKEN}"
+FAIL_THRESHOLD=${WD_FAIL_THRESHOLD}
+RESTART_COOLDOWN=${WD_COOLDOWN}
+START_GRACE=${WD_GRACE}
+HEADER_EOF
+
+    cat >> /usr/local/bin/frp-watchdog.sh <<'WATCHDOG_EOF'
+LOG_FILE="/var/log/frp-watchdog.log"
+MAX_LOG_SIZE=1048576
+STATE_DIR="/run/frp-watchdog"
+API_TIMEOUT=8
+
+mkdir -p "$STATE_DIR"
+
+log_msg() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
+
+rotate_log() {
+    if [ -f "$LOG_FILE" ] && [ "$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)" -gt "$MAX_LOG_SIZE" ]; then
+        mv "$LOG_FILE" "${LOG_FILE}.old"
+        touch "$LOG_FILE"
+    fi
+}
+
+check_admin_api() {
+    curl -sf --max-time "$API_TIMEOUT" -u "admin:${FRP_TOKEN}" "http://127.0.0.1:${1}/api/status" >/dev/null 2>&1
+}
+
+read_count()  { local f="${STATE_DIR}/$1.fails"; [ -f "$f" ] && cat "$f" || echo 0; }
+write_count() { echo "$2" > "${STATE_DIR}/$1.fails"; }
+
+unit_exists() { systemctl cat "$1" >/dev/null 2>&1; }
+
+# Never judge a service that has just (re)started - it needs time to dial out.
+started_recently() {
+    local ts now
+    ts=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$1" 2>/dev/null)
+    [ -z "$ts" ] || [ "$ts" = "0" ] && return 1
+    now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+    [ $(( (now - ts) / 1000000 )) -lt "$START_GRACE" ]
+}
+
+can_restart_now() {
+    local ts_file="${STATE_DIR}/$1.last_restart" now last
+    now=$(date +%s)
+    if [ -f "$ts_file" ]; then
+        last=$(cat "$ts_file")
+        [ $(( now - last )) -lt "$RESTART_COOLDOWN" ] && return 1
+    fi
+    echo "$now" > "$ts_file"
+    return 0
+}
+
+do_restart() {
+    local proc="$1" unit="$2" svc_key="$3"
+    if ! unit_exists "${unit}.service"; then
+        # e.g. the frpc check running on an frps-only box - nothing to do.
+        return
+    fi
+    if started_recently "${unit}.service"; then
+        log_msg "WATCHDOG: ${proc} started less than ${START_GRACE}s ago, giving it time"
+        return
+    fi
+    if ! can_restart_now "$svc_key"; then
+        log_msg "WATCHDOG: ${proc} needs a restart but cooldown is active, skipping (no restart storms)"
+        return
+    fi
+    log_msg "WATCHDOG: RESTARTING ${unit}.service..."
+    systemctl reset-failed "${unit}.service" >/dev/null 2>&1 || true
+    systemctl restart "${unit}.service" >/dev/null 2>&1
+    sleep 5
+    if pgrep -x "$proc" >/dev/null 2>&1; then
+        log_msg "WATCHDOG: ${proc} restarted OK"
+        write_count "$svc_key" 0
+    else
+        log_msg "WATCHDOG: CRITICAL - ${proc} restart FAILED"
+    fi
+}
+
+bump_fail() {
+    local key="$1" msg="$2" proc="$3" unit="$4"
+    local n=$(( $(read_count "$key") + 1 ))
+    write_count "$key" "$n"
+    log_msg "WATCHDOG: ${msg} (${n}/${FAIL_THRESHOLD})"
+    [ "$n" -ge "$FAIL_THRESHOLD" ] && do_restart "$proc" "$unit" "$key"
+}
+
+check_frps() {
+    local key="frps" unit="frps@server-${FRP_PORT}"
+    unit_exists "${unit}.service" || return 0
+
+    if ! pgrep -x "frps" >/dev/null 2>&1; then
+        log_msg "WATCHDOG: frps process NOT RUNNING"
+        do_restart "frps" "$unit" "$key"
+        return
+    fi
+
+    local listening=1
+    if ss -tlnp 2>/dev/null | grep -q ":${FRP_PORT} "; then
+        listening=0
+    elif netstat -tlnp 2>/dev/null | grep -q ":${FRP_PORT} "; then
+        listening=0
+    fi
+    if [ "$listening" -eq 1 ]; then
+        log_msg "WATCHDOG: frps NOT LISTENING on port ${FRP_PORT}"
+        do_restart "frps" "$unit" "$key"
+        return
+    fi
+
+    # A slow dashboard is NOT a reason to drop every client - only a long
+    # streak of failures counts.
+    if check_admin_api "$ADMIN_PORT_S"; then
+        write_count "$key" 0
+    else
+        bump_fail "$key" "frps admin API not responding" "frps" "$unit"
+    fi
+}
+
+check_frpc() {
+    local key="frpc" unit="frpc@client-${FRP_PORT}"
+    unit_exists "${unit}.service" || return 0
+
+    if ! pgrep -x "frpc" >/dev/null 2>&1; then
+        log_msg "WATCHDOG: frpc process NOT RUNNING"
+        do_restart "frpc" "$unit" "$key"
+        return
+    fi
+
+    local status
+    status=$(curl -sf --max-time "$API_TIMEOUT" -u "admin:${FRP_TOKEN}" \
+             "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null)
+
+    if [ -z "$status" ]; then
+        bump_fail "$key" "frpc admin API not responding" "frpc" "$unit"
+        return
+    fi
+
+    # frpc's /api/status returns the proxy list with "status":"running".
+    # (The old script looked for '"online":false', which frpc never emits,
+    #  so a truly dead tunnel was reported as healthy.)
+    if echo "$status" | grep -q '"status":"running"'; then
+        write_count "$key" 0
+    else
+        bump_fail "$key" "frpc has NO running proxy (tunnel down)" "frpc" "$unit"
+    fi
+}
+
+rotate_log
+mkdir -p "$STATE_DIR"
+(
+    flock -n 200 || { log_msg "WATCHDOG: previous '$1' check still running, skipping tick"; exit 0; }
+    case "$1" in
+        frps) check_frps ;;
+        frpc) check_frpc ;;
+        *)    log_msg "Usage: $0 {frps|frpc}" ;;
+    esac
+) 200>"${STATE_DIR}/$1.lock"
+WATCHDOG_EOF
+
+    chmod 755 /usr/local/bin/frp-watchdog.sh
+    mkdir -p /run/frp-watchdog
+
+    # Legacy cleanup: the old version put BOTH sides in cron on every host.
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null | grep -v 'frp-watchdog') | crontab - 2>/dev/null || true
+    fi
+
+    cat > /etc/systemd/system/frp-watchdog@.service <<'EOF'
+[Unit]
+Description=FRP watchdog check (%i)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/frp-watchdog.sh %i
+EOF
+
+    cat > /etc/systemd/system/frp-watchdog@.timer <<'EOF'
+[Unit]
+Description=FRP watchdog timer (%i)
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=5s
+Unit=frp-watchdog@%i.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    # only the side that actually runs here
+    systemctl disable --now frp-watchdog@frps.timer >/dev/null 2>&1 || true
+    systemctl disable --now frp-watchdog@frpc.timer >/dev/null 2>&1 || true
+    systemctl enable --now "frp-watchdog@${side}.timer" >/dev/null 2>&1
+    log_info "Watchdog installed for ${side} (checks every 60s, ${WD_COOLDOWN}s restart cooldown)."
+}
+
+remove_watchdog() {
+    systemctl disable --now frp-watchdog@frps.timer >/dev/null 2>&1 || true
+    systemctl disable --now frp-watchdog@frpc.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/frp-watchdog@.service /etc/systemd/system/frp-watchdog@.timer
+    rm -f /usr/local/bin/frp-watchdog.sh
+    if command -v crontab >/dev/null 2>&1; then
+        (crontab -l 2>/dev/null | grep -v 'frp-watchdog') | crontab - 2>/dev/null || true
+    fi
+    rm -f /var/log/frp-watchdog.log /var/log/frp-watchdog.log.old
+    rm -rf /run/frp-watchdog /var/run/frp-watchdog
+    systemctl daemon-reload
+}
+
+###############################################################################
+# Proxy generation
+###############################################################################
+count_ports() {
+    local ports="$1"
+    local IFS=','
+    local total=0
+    read -ra PORT_ARRAY <<< "$ports"
+    for entry in "${PORT_ARRAY[@]}"; do
+        entry=$(echo "$entry" | tr -d ' ')
+        [ -z "$entry" ] && continue
+        if [[ "$entry" == *"-"* ]]; then
+            local start=${entry%%-*}
+            local end=${entry##*-}
+            total=$(( total + (end - start + 1) ))
+        else
+            total=$(( total + 1 ))
+        fi
+    done
+    echo "$total"
 }
 
 generate_proxies() {
-    local ports_csv="$1" file="$2" local_ip="$3"
-    local p n=0
-    IFS=',' read -r -a arr <<< "$ports_csv"
-    for p in "${arr[@]}"; do
-        p="$(echo "$p" | tr -d '[:space:]')"
-        [ -z "$p" ] && continue
-        cat >> "$file" <<EOF
+    local kind="$1" ports="$2" config_file="$3"
+    local IFS=','
+
+    read -ra PORT_ARRAY <<< "$ports"
+    for entry in "${PORT_ARRAY[@]}"; do
+        entry=$(echo "$entry" | tr -d ' ')
+        [ -z "$entry" ] && continue
+
+        if [[ "$entry" == *"-"* ]]; then
+            local start=${entry%%-*}
+            local end=${entry##*-}
+            for ((p=start; p<=end; p++)); do
+                cat >> "$config_file" <<PROXY
 
 [[proxies]]
-name = "tcp-${p}"
-type = "tcp"
-localIP = "${local_ip}"
+name = "${kind}-${p}"
+type = "${kind}"
+localIP = "127.0.0.1"
 localPort = ${p}
 remotePort = ${p}
-transport.useEncryption = false
-transport.useCompression = false
-EOF
-        n=$((n+1))
+PROXY
+            done
+        else
+            cat >> "$config_file" <<PROXY
+
+[[proxies]]
+name = "${kind}-${entry}"
+type = "${kind}"
+localIP = "127.0.0.1"
+localPort = ${entry}
+remotePort = ${entry}
+PROXY
+        fi
     done
-    echo "$n"
 }
 
+###############################################################################
+# Menu
+###############################################################################
+show_menu() {
+    clear
+    echo "================================================"
+    echo "  FRP Iran-Optimized Tunnel - STABILITY EDITION "
+    echo "            (frp v${FRP_VERSION})                    "
+    echo "================================================"
+    echo " Multiplexing: ${TCP_MUX}   |  Port: ${FRP_PORT}"
+    echo "------------------------------------------------"
+    echo "1) Install FRP Server (frps) - IRAN"
+    echo "2) Install FRP Client (frpc) - OUTSIDE"
+    echo "3) Check Status / Health"
+    echo "4) Apply stability fix to an EXISTING install"
+    echo "5) Live logs (flap diagnostics)"
+    echo "6) Remove FRP"
+    echo "7) Exit"
+    echo "================================================"
+    read -p "Choose an option [1-7]: " choice
+}
+
+###############################################################################
+# Server
+###############################################################################
 install_server() {
-    hdr "Iran server -- frps"
+    log_step "=== Installing FRP Server (frps) on IRAN ==="
+    log_ir "Reverse tunnel: frpc (outside) -> frps (Iran)"
 
-    local port token admin_port admin_user admin_pass mss ports
-    read -r -p "Tunnel port [${DEF_PORT}]: " port;  port="${port:-$DEF_PORT}"
-    read -r -p "Shared token [${DEF_TOKEN}]: " token; token="${token:-$DEF_TOKEN}"
-    read -r -p "Dashboard port [${DEF_ADMIN_S}]: " admin_port; admin_port="${admin_port:-$DEF_ADMIN_S}"
-    read -r -p "Dashboard user [admin]: " admin_user; admin_user="${admin_user:-admin}"
-    read -r -p "Dashboard password [${token}]: " admin_pass; admin_pass="${admin_pass:-$token}"
-    read -r -p "Ports to publish, comma separated (e.g. 443,8080,2053): " ports
-    read -r -p "Clamped MSS [${DEF_MSS}]: " mss; mss="${mss:-$DEF_MSS}"
+    systemctl stop frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
+    systemctl reset-failed frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
+    free_stale_port "$FRP_PORT" "frps" "Bind port ${FRP_PORT}"
+    free_stale_port "$ADMIN_PORT_S" "frps" "Admin dashboard port ${ADMIN_PORT_S}"
 
-    if [ -z "$ports" ]; then err "You must list at least one port."; return 1; fi
+    download_frp_binary "frps"
+    mkdir -p /root/frp/server /var/log
 
-    ensure_deps
-    download_frp
-    tune_tcp
-    free_stale_port "$port" || return 1
+    open_firewall_port "$FRP_PORT" "tcp"
+    open_firewall_port "$ADMIN_PORT_S" "tcp"
 
-    mkdir -p "$CONF_DIR" "$LOG_DIR"
-    cat > "${CONF_DIR}/frps.toml" <<EOF
-# frps.toml -- generated by frp-tunnel.sh v3.0 (frp ${FRP_VERSION}, TCP only)
+    # Optional real certificate - a self-signed cert behind a fake SNI is a
+    # strong DPI fingerprint and a common reason a session gets reset after
+    # a few minutes.
+    local cert_block=""
+    read -p "Do you have a real TLS cert for this server? (y/n) [default: n]: " use_cert
+    if [[ "$use_cert" =~ ^[Yy]$ ]]; then
+        read -p "  Full path to fullchain.pem: " cert_file
+        read -p "  Full path to privkey.pem:  " key_file
+        if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+            cert_block="transport.tls.certFile = \"${cert_file}\"
+transport.tls.keyFile = \"${key_file}\""
+            log_ok "Real certificate will be used."
+        else
+            log_warn "Cert or key not found - falling back to frp's self-signed cert."
+        fi
+    fi
 
+    cat > /root/frp/server/server-${FRP_PORT}.toml <<EOF
 bindAddr = "0.0.0.0"
-bindPort = ${port}
+bindPort = ${FRP_PORT}
+proxyBindAddr = "0.0.0.0"
+
+webServer.addr = "${ADMIN_BIND_S}"
+webServer.port = ${ADMIN_PORT_S}
+webServer.user = "admin"
+webServer.password = "${FRP_TOKEN}"
+
+log.to = "/var/log/frps.log"
+log.level = "info"
+log.maxDays = 30
+log.disablePrintColor = true
 
 auth.method = "token"
-auth.token = "${token}"
-
-webServer.addr = "0.0.0.0"
-webServer.port = ${admin_port}
-webServer.user = "${admin_user}"
-webServer.password = "${admin_pass}"
-
-log.to = "${LOG_DIR}/frps.log"
-log.level = "info"
-log.maxDays = 3
-
-userConnTimeout = ${USER_CONN_TIMEOUT}
-maxPortsPerClient = 0
-allowPorts = [{ start = 1, end = 65535 }]
+auth.token = "${FRP_TOKEN}"
 
 $(server_transport_block)
+transport.tls.force = true
+${cert_block}
+
+maxPortsPerClient = 0
+userConnTimeout = ${USER_CONN_TIMEOUT}
+detailedErrorsToClient = false
 EOF
 
-    write_unit frps
-    open_port "$port" tcp
-    open_port "$admin_port" tcp
-    local p
-    IFS=',' read -r -a arr <<< "$ports"
-    for p in "${arr[@]}"; do
-        p="$(echo "$p" | tr -d '[:space:]')"; [ -n "$p" ] && { open_port "$p" tcp; open_port "$p" udp; }
-    done
+    log_step "Testing frps config validity (5 seconds)..."
+    echo ""
+    echo -e "${CYAN}========== DIRECT FRPS TEST ==========${NC}"
+    timeout 5 /usr/local/bin/frps -c /root/frp/server/server-${FRP_PORT}.toml 2>&1 || true
+    echo -e "${CYAN}========== END OF TEST ==========${NC}"
+    echo ""
+    read -p "If you see an error above, press Ctrl+C to fix it. Otherwise press Enter to continue..."
 
-    install_mss_fix "$mss"
+    write_server_unit
+    systemctl daemon-reload
+    systemctl enable frps@server-${FRP_PORT}.service >/dev/null 2>&1
+    systemctl reset-failed frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
+    systemctl restart frps@server-${FRP_PORT}.service
 
-    systemctl restart frps
-    sleep 2
-    if systemctl is-active --quiet frps; then
-        ok "frps is running."
-        echo
-        echo "  ${BLD}Dashboard:${NC} http://$(curl -s --max-time 5 ifconfig.me 2>/dev/null):${admin_port}  (${admin_user} / ${admin_pass})"
-        echo "  ${BLD}Give the foreign server:${NC} port ${port}, token ${token}, ports ${ports}"
+    tune_tcp_for_frp
+    install_watchdog "frps"
+
+    sleep 3
+
+    if systemctl is-active --quiet frps@server-${FRP_PORT}.service; then
+        log_info "FRP Server installed and running!"
+        echo ""
+        echo -e "${GREEN}+------------------------------------------------------+${NC}"
+        echo -e "${GREEN}|  Server (IRAN) Status: RUNNING                       |${NC}"
+        echo -e "${GREEN}|  Bind Port:   ${FRP_PORT} (TCP)                              |${NC}"
+        echo -e "${GREEN}|  Dashboard:   http://IRAN_IP:${ADMIN_PORT_S}                    |${NC}"
+        echo -e "${GREEN}|  Token:       ${FRP_TOKEN}                              |${NC}"
+        echo -e "${GREEN}|  tcpMux:      ${TCP_MUX}  (must match the client!)         |${NC}"
+        echo -e "${GREEN}+------------------------------------------------------+${NC}"
+        echo ""
+        log_warn "Open port ${FRP_PORT} in your cloud firewall as well."
+        log_warn "Test from outside: nc -vz IRAN_IP ${FRP_PORT}"
     else
-        err "frps failed to start. Last log lines:"
-        journalctl -u frps -n 25 --no-pager
+        log_error "Failed to start server!"
+        journalctl -u frps@server-${FRP_PORT} --no-pager -n 30
     fi
 }
 
+###############################################################################
+# Client
+###############################################################################
 install_client() {
-    hdr "Foreign server -- frpc"
+    log_step "=== Installing FRP Client (frpc) on OUTSIDE server ==="
+    log_ir "Connecting to Iran server via WSS/TLS"
 
-    local sip port token ports local_ip admin_port pool sni mss ans
-    read -r -p "Iran server IP: " sip
-    [ -z "$sip" ] && { err "The Iran server IP is required."; return 1; }
-    read -r -p "Tunnel port [${DEF_PORT}]: " port; port="${port:-$DEF_PORT}"
-    read -r -p "Shared token [${DEF_TOKEN}]: " token; token="${token:-$DEF_TOKEN}"
-    read -r -p "Ports to forward, comma separated (same list as the Iran side): " ports
-    [ -z "$ports" ] && { err "You must list at least one port."; return 1; }
-    read -r -p "Local service IP [127.0.0.1]: " local_ip; local_ip="${local_ip:-127.0.0.1}"
-    read -r -p "Local admin port [${DEF_ADMIN_C}]: " admin_port; admin_port="${admin_port:-$DEF_ADMIN_C}"
+    systemctl stop frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
+    systemctl reset-failed frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
+    free_stale_port "$ADMIN_PORT_C" "frpc" "Admin dashboard port ${ADMIN_PORT_C}"
 
-    echo
-    echo "Connection pool: pre-opened work connections. Too many causes a"
-    echo "reconnect storm, too few adds a round trip to the first request."
-    read -r -p "Pool size [5]: " pool; pool="${pool:-5}"
-    [[ "$pool" =~ ^[0-9]+$ ]] || pool=5
-    [ "$pool" -gt 20 ] && pool=20
+    download_frp_binary "frpc"
+    mkdir -p /root/frp/client /var/log
 
-    echo
-    echo "TLS SNI (domain fronting). The tunnel is always TCP+TLS; this only"
-    echo "changes the server name shown in the ClientHello."
-    echo "  1) default (no custom SNI)"
-    echo "  2) www.speedtest.net"
-    echo "  3) www.cloudflare.com"
-    echo "  4) custom"
-    read -r -p "Choice [1]: " ans; ans="${ans:-1}"
-    case "$ans" in
-        2) sni="www.speedtest.net" ;;
-        3) sni="www.cloudflare.com" ;;
-        4) read -r -p "SNI hostname: " sni ;;
-        *) sni="" ;;
+    read -p "Enter Iran server address (IP or domain): " server_addr
+    while [ -z "$server_addr" ]; do
+        log_warn "Server address cannot be empty!"
+        read -p "Enter Iran server address: " server_addr
+    done
+
+    log_step "Testing reachability to ${server_addr}:${FRP_PORT}..."
+    if nc -z -w 5 "$server_addr" "$FRP_PORT" 2>/dev/null; then
+        log_ok "Port ${FRP_PORT} is reachable from this server!"
+    else
+        log_warn "Port ${FRP_PORT} seems UNREACHABLE from here."
+        log_warn "If this is a timeout, your Iran IP may be blocked by this datacenter."
+        read -p "Press Enter to continue anyway, or Ctrl+C to abort..."
+    fi
+
+    read -p "Enter inbound ports to forward [default: 8080]: " ports
+    ports=${ports:-8080}
+
+    read -p "Also forward UDP ports? (y/n) [default: n]: " forward_udp
+
+    echo ""
+    echo "Connection load profile:"
+    echo "  1) Light  - few users"
+    echo "  2) Medium - typical single-user [default]"
+    echo "  3) Heavy  - many concurrent connections"
+    read -p "Select [1-3, default 2]: " load_choice
+    load_choice=${load_choice:-2}
+
+    # With multiplexing ON a huge pool is pointless AND harmful: each pooled
+    # socket is a separate TLS handshake through the filter.
+    local base_pool pool_cap
+    if [ "$TCP_MUX" = "true" ]; then
+        case "$load_choice" in
+            1) base_pool=2 ;;
+            3) base_pool=10 ;;
+            *) base_pool=5 ;;
+        esac
+        pool_cap=100
+    else
+        case "$load_choice" in
+            1) base_pool=8 ;;
+            3) base_pool=40 ;;
+            *) base_pool=20 ;;
+        esac
+        pool_cap=400
+    fi
+
+    local n_ports
+    n_ports=$(count_ports "$ports")
+    [ "$n_ports" -lt 1 ] && n_ports=1
+
+    local pool_count=$base_pool
+    local total_pool=$(( n_ports * base_pool ))
+    if [ "$total_pool" -gt "$pool_cap" ]; then
+        pool_count=$(( pool_cap / n_ports ))
+        [ "$pool_count" -lt 1 ] && pool_count=1
+        log_warn "Capping pool to ${pool_count} per port (~${pool_cap} total)."
+    fi
+
+    echo ""
+    echo "Select connection protocol:"
+    echo "  1) wss       - RECOMMENDED: WebSocket over TLS, looks like HTTPS"
+    echo "  2) websocket - WebSocket without TLS"
+    echo "  3) tcp       - Plain TLS (NOT recommended for Iran)"
+    echo "  4) kcp       - UDP-based, usually BLOCKED in Iran"
+    echo "  5) quic      - UDP-based, usually BLOCKED in Iran"
+    read -p "Select [1-5, default 1]: " proto_choice
+    proto_choice=${proto_choice:-1}
+
+    local transport_protocol extra_proto_config="" iran_warn=""
+
+    case "$proto_choice" in
+        3) transport_protocol="tcp"
+           iran_warn="Plain TCP is easily detectable in Iran." ;;
+        4) transport_protocol="kcp"
+           iran_warn="KCP uses UDP, heavily filtered in Iran."
+           # NOTE: transport.kcp.* keys do NOT exist in frp v1 config and
+           # made frpc refuse to start. frp tunes KCP internally.
+           ;;
+        5) transport_protocol="quic"
+           iran_warn="QUIC uses UDP, heavily filtered in Iran."
+           extra_proto_config='transport.quic.keepalivePeriod = 10
+transport.quic.maxIdleTimeout = 30
+transport.quic.maxIncomingStreams = 100000' ;;
+        2) transport_protocol="websocket" ;;
+        *) transport_protocol="wss" ;;
     esac
 
-    ensure_deps
-    download_frp
-    tune_tcp
+    [ -n "$iran_warn" ] && log_warn "$iran_warn"
 
-    echo
-    inf "Measuring the path MTU to ${sip} ..."
-    local suggested; suggested="$(probe_mss "$sip")"
-    inf "Suggested MSS: ${suggested}"
-    read -r -p "Clamped MSS [${suggested}]: " mss; mss="${mss:-$suggested}"
+    echo ""
+    echo "TLS / Domain Fronting:"
+    echo "  1) Basic TLS (default)"
+    echo "  2) Domain Fronting - Fake SNI"
+    echo "  3) Real Domain - Your own domain"
+    read -p "Select [1-3, default 1]: " tls_choice
+    tls_choice=${tls_choice:-1}
 
-    mkdir -p "$CONF_DIR" "$LOG_DIR"
-    {
-        cat <<EOF
-# frpc.toml -- generated by frp-tunnel.sh v3.0 (frp ${FRP_VERSION}, TCP only)
+    local tls_config="" sni_note=""
 
-serverAddr = "${sip}"
-serverPort = ${port}
+    case "$tls_choice" in
+        2) read -p "Enter fake SNI domain [default: www.microsoft.com]: " fake_sni
+           fake_sni=${fake_sni:-www.microsoft.com}
+           tls_config="transport.tls.serverName = \"${fake_sni}\""
+           sni_note="SNI: ${fake_sni} (domain fronting)"
+           log_ir "Domain fronting active: SNI will show ${fake_sni}"
+           log_warn "A fake SNI with a self-signed cert can be reset by DPI after a while."
+           log_warn "For a rock-solid link use a real domain + real cert on the Iran side." ;;
+        3) read -p "Enter your real domain: " real_domain
+           while [ -z "$real_domain" ]; do
+               log_warn "Domain cannot be empty!"
+               read -p "Enter your real domain: " real_domain
+           done
+           tls_config="transport.tls.serverName = \"${real_domain}\""
+           sni_note="SNI: ${real_domain} (real domain)" ;;
+        *) sni_note="SNI: ${server_addr} (basic TLS)" ;;
+    esac
 
-auth.method = "token"
-auth.token = "${token}"
+    echo ""
+    echo "Proxy Chaining (optional):"
+    read -p "Use an existing proxy (Shadowsocks/V2Ray/Xray)? (y/n) [default: n]: " use_proxy
 
-log.to = "${LOG_DIR}/frpc.log"
-log.level = "info"
-log.maxDays = 3
+    local proxy_config=""
+    if [[ "$use_proxy" =~ ^[Yy]$ ]]; then
+        echo "  1) SOCKS5 (e.g., 127.0.0.1:10808)"
+        echo "  2) HTTP proxy"
+        read -p "Select proxy type [1-2, default 1]: " proxy_type
+        proxy_type=${proxy_type:-1}
+        read -p "Enter proxy address [default: 127.0.0.1:10808]: " proxy_addr
+        proxy_addr=${proxy_addr:-127.0.0.1:10808}
 
-webServer.addr = "127.0.0.1"
-webServer.port = ${admin_port}
+        if [ "$proxy_type" = "2" ]; then
+            proxy_config="transport.proxyURL = \"http://${proxy_addr}\""
+        else
+            proxy_config="transport.proxyURL = \"socks5://${proxy_addr}\""
+        fi
+        log_ir "Proxy chaining enabled."
+    fi
+
+    cat > /root/frp/client/client-${FRP_PORT}.toml <<EOF
+serverAddr = "${server_addr}"
+serverPort = ${FRP_PORT}
 
 loginFailExit = false
 
-$(client_transport_block "$pool")
+webServer.addr = "127.0.0.1"
+webServer.port = ${ADMIN_PORT_C}
+webServer.user = "admin"
+webServer.password = "${FRP_TOKEN}"
+
+log.to = "/var/log/frpc.log"
+log.level = "info"
+log.maxDays = 30
+log.disablePrintColor = true
+
+auth.method = "token"
+auth.token = "${FRP_TOKEN}"
+
+transport.protocol = "${transport_protocol}"
+$(client_transport_block "$pool_count")
+${tls_config}
+${proxy_config}
+${extra_proto_config}
 EOF
-        [ -n "$sni" ] && echo "transport.tls.serverName = \"${sni}\""
-    } > "${CONF_DIR}/frpc.toml"
 
-    local n; n="$(generate_proxies "$ports" "${CONF_DIR}/frpc.toml" "$local_ip")"
+    generate_proxies "tcp" "$ports" "/root/frp/client/client-${FRP_PORT}.toml"
 
-    write_unit frpc
-    install_mss_fix "$mss"
-    fix_broken_ipv6
-    check_dns
-
-    systemctl restart frpc
-    sleep 3
-    if systemctl is-active --quiet frpc; then
-        ok "frpc is running with ${n} forwarded port(s)."
-        if grep -qiE "login to server success" "${LOG_DIR}/frpc.log" 2>/dev/null; then
-            ok "Logged in to ${sip}:${port} successfully."
-        else
-            warn "No successful login in the log yet. Watch it with menu option 7."
-        fi
-    else
-        err "frpc failed to start. Last log lines:"
-        journalctl -u frpc -n 25 --no-pager
+    if [[ "$forward_udp" =~ ^[Yy]$ ]]; then
+        log_warn "Adding UDP forwarding..."
+        generate_proxies "udp" "$ports" "/root/frp/client/client-${FRP_PORT}.toml"
     fi
 
-    echo
-    echo "${YEL}Note on DNS:${NC} frp forwards only the ports you listed. If the service"
-    echo "behind this tunnel needs UDP DNS, make sure UDP/53 is handled by that"
-    echo "service itself (Xray/sing-box do their own resolution) -- otherwise a"
-    echo "filtered local resolver will still poison some domains."
-}
+    log_step "Testing frpc config validity (10 seconds)..."
+    echo ""
+    echo -e "${CYAN}========== DIRECT FRPC TEST ==========${NC}"
+    timeout 10 /usr/local/bin/frpc -c /root/frp/client/client-${FRP_PORT}.toml 2>&1 || true
+    echo -e "${CYAN}========== END OF TEST ==========${NC}"
+    echo ""
+    read -p "If you see an error above, press Ctrl+C to fix it. Otherwise press Enter to continue..."
 
-repair_install() {
-    hdr "Repairing and migrating the existing install to TCP-only"
+    write_client_unit
+    systemctl daemon-reload
+    systemctl enable frpc@client-${FRP_PORT}.service >/dev/null 2>&1
+    systemctl reset-failed frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
+    systemctl restart frpc@client-${FRP_PORT}.service
 
-    local touched=0
-    ensure_deps
-    tune_tcp
+    tune_tcp_for_frp
+    install_watchdog "frpc"
 
-    if [ -f "${CONF_DIR}/frps.toml" ]; then
-        cp "${CONF_DIR}/frps.toml" "${CONF_DIR}/frps.toml.bak.$(date +%s)"
-        strip_managed_keys "${CONF_DIR}/frps.toml"
-        grep -qE '^[[:space:]]*userConnTimeout' "${CONF_DIR}/frps.toml" || \
-            echo "userConnTimeout = ${USER_CONN_TIMEOUT}" >> "${CONF_DIR}/frps.toml"
-        server_transport_block >> "${CONF_DIR}/frps.toml"
-        write_unit frps
-        systemctl restart frps
+    log_step "Waiting for connection..."
+    sleep 5
+
+    local connected=false status
+    for i in {1..10}; do
+        if pgrep -x "frpc" >/dev/null 2>&1; then
+            status=$(curl -sf --max-time 3 -u "admin:${FRP_TOKEN}" \
+                     "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null)
+            if [ -n "$status" ] && echo "$status" | grep -q '"status":"running"'; then
+                connected=true
+                break
+            fi
+        fi
         sleep 2
-        systemctl is-active --quiet frps && ok "frps repaired and restarted." || err "frps still failing -- see option 7."
-        touched=1
+    done
+
+    echo ""
+    if [ "$connected" = true ]; then
+        log_info "FRP Client installed and connected to Iran!"
+        echo -e "${GREEN}+------------------------------------------------------+${NC}"
+        echo -e "${GREEN}|  Client (OUTSIDE) Status: CONNECTED${NC}"
+        echo -e "${GREEN}|  Iran Server:  ${server_addr}:${FRP_PORT}${NC}"
+        echo -e "${GREEN}|  Protocol:     ${transport_protocol}${NC}"
+        echo -e "${GREEN}|  ${sni_note}${NC}"
+        echo -e "${GREEN}|  tcpMux:       ${TCP_MUX} (keepalive ${MUX_KEEPALIVE}s)${NC}"
+        echo -e "${GREEN}|  Heartbeat:    every ${HB_INTERVAL}s, timeout ${HB_TIMEOUT_C}s${NC}"
+        echo -e "${GREEN}|  Pool:         ${pool_count} per port${NC}"
+        echo -e "${GREEN}|  TCP Ports:    ${ports}${NC}"
+        [[ "$forward_udp" =~ ^[Yy]$ ]] && echo -e "${GREEN}|  UDP Ports:    ${ports}${NC}"
+        [ -n "$proxy_config" ] && echo -e "${GREEN}|  Proxy:        ENABLED${NC}"
+        echo -e "${GREEN}+------------------------------------------------------+${NC}"
+        echo ""
+        log_warn "Make sure the IRAN side also runs this new script (tcpMux must match)."
+    else
+        log_warn "Connection not established."
+        log_warn "  1. Is tcpMux the same (${TCP_MUX}) on the Iran server?"
+        log_warn "  2. Iran IP blocked from this datacenter?"
+        log_warn "  3. Iran cloud firewall blocking port ${FRP_PORT}?"
+        echo -e "${YELLOW}journalctl -u frpc@client-${FRP_PORT} -f${NC}"
+        echo -e "${YELLOW}cat /root/frp/client/client-${FRP_PORT}.toml${NC}"
     fi
-
-    if [ -f "${CONF_DIR}/frpc.toml" ]; then
-        cp "${CONF_DIR}/frpc.toml" "${CONF_DIR}/frpc.toml.bak.$(date +%s)"
-        local pool; pool="$(current_pool_count "${CONF_DIR}/frpc.toml")"
-        strip_managed_keys "${CONF_DIR}/frpc.toml"
-        grep -qE '^[[:space:]]*loginFailExit' "${CONF_DIR}/frpc.toml" || \
-            echo "loginFailExit = false" >> "${CONF_DIR}/frpc.toml"
-        local tmp; tmp="$(mktemp)"
-        awk -v RS='' 'NR==1' /dev/null >/dev/null 2>&1
-        sed -n '1,/^\[\[proxies\]\]/p' "${CONF_DIR}/frpc.toml" | sed '$d' > "$tmp"
-        client_transport_block "$pool" >> "$tmp"
-        sed -n '/^\[\[proxies\]\]/,$p' "${CONF_DIR}/frpc.toml" >> "$tmp"
-        if ! grep -q '\[\[proxies\]\]' "$tmp"; then
-            cat "${CONF_DIR}/frpc.toml" > "$tmp"
-            client_transport_block "$pool" >> "$tmp"
-        fi
-        mv "$tmp" "${CONF_DIR}/frpc.toml"
-        write_unit frpc
-        systemctl restart frpc
-        sleep 2
-        systemctl is-active --quiet frpc && ok "frpc repaired, migrated to TCP and restarted." || err "frpc still failing -- see option 7."
-        fix_broken_ipv6
-        touched=1
-    fi
-
-    if [ $touched -eq 0 ]; then
-        err "No frps.toml or frpc.toml found under ${CONF_DIR}."
-        return 1
-    fi
-
-    local mss="$DEF_MSS"
-    [ -x "$MSS_SCRIPT" ] && mss="$(grep -oE '^MSS4=[0-9]+' "$MSS_SCRIPT" | cut -d= -f2)"
-    install_mss_fix "${mss:-$DEF_MSS}"
-
-    echo
-    warn "Reminder: tcpMux must be identical on BOTH servers. Run this repair on"
-    warn "the other box too, otherwise every connection dies right after login."
 }
 
-diagnose() {
-    hdr "Diagnosing 'some sites do not load'"
+###############################################################################
+# Apply the stability fix to an already-deployed install
+###############################################################################
+apply_stability_fix() {
+    log_step "=== Applying stability fix to existing configuration ==="
+    local touched=false
 
-    echo "${BLD}1) MSS clamp${NC}"
-    if [ -x "$MSS_SCRIPT" ]; then
-        "$MSS_SCRIPT" show
-    else
-        err "  Not installed. This is the #1 cause -- run menu option 5."
+    local srv="/root/frp/server/server-${FRP_PORT}.toml"
+    if [ -f "$srv" ]; then
+        cp "$srv" "${srv}.bak.$(date +%s)"
+        patch_transport_block "$srv" "server"
+        write_server_unit
+        touched=true
+        log_ok "Server config patched (backup kept)."
     fi
 
-    echo
-    echo "${BLD}2) Kernel MTU / TCP settings${NC}"
-    local k
-    for k in net.ipv4.tcp_mtu_probing net.ipv4.tcp_congestion_control \
-             net.ipv4.tcp_no_metrics_save net.ipv4.tcp_retries2; do
-        printf '   %-40s %s\n' "$k" "$(sysctl -n "$k" 2>/dev/null || echo '?')"
-    done
-    if [ -f /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal ]; then
-        printf '   %-40s %s\n' "nf_conntrack_tcp_be_liberal" "$(cat /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal)"
-        printf '   %-40s %s / %s\n' "conntrack usage" \
-            "$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)" \
-            "$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+    local cli="/root/frp/client/client-${FRP_PORT}.toml"
+    if [ -f "$cli" ]; then
+        cp "$cli" "${cli}.bak.$(date +%s)"
+        patch_transport_block "$cli" "client" "$(current_pool_count "$cli")"
+        write_client_unit
+        touched=true
+        log_ok "Client config patched (backup kept)."
     fi
 
-    echo
-    echo "${BLD}3) Path MTU${NC}"
-    local peer=""
-    [ -f "${CONF_DIR}/frpc.toml" ] && peer="$(grep -oE '^serverAddr[[:space:]]*=[[:space:]]*"[^"]+"' "${CONF_DIR}/frpc.toml" | cut -d'"' -f2)"
-    if [ -n "$peer" ]; then
-        inf "   Probing towards ${peer} ..."
-        echo "   Recommended MSS for this path: $(probe_mss "$peer")"
-    else
-        echo "   (run this on the foreign server to probe the tunnel path)"
+    if [ "$touched" = false ]; then
+        log_warn "No existing FRP config found at /root/frp. Use option 1 or 2 first."
+        return
     fi
 
-    echo
-    echo "${BLD}4) IPv6 sanity${NC}"
-    fix_broken_ipv6
+    tune_tcp_for_frp
+    systemctl daemon-reload
 
-    echo
-    echo "${BLD}5) DNS${NC}"
-    check_dns
+    if [ -f "$srv" ]; then
+        log_step "Validating new server config..."
+        timeout 4 /usr/local/bin/frps -c "$srv" 2>&1 | head -n 20 || true
+        systemctl reset-failed frps@server-${FRP_PORT}.service >/dev/null 2>&1 || true
+        systemctl restart frps@server-${FRP_PORT}.service
+        install_watchdog "frps"
+    fi
+    if [ -f "$cli" ]; then
+        log_step "Validating new client config..."
+        timeout 4 /usr/local/bin/frpc -c "$cli" 2>&1 | head -n 20 || true
+        systemctl reset-failed frpc@client-${FRP_PORT}.service >/dev/null 2>&1 || true
+        systemctl restart frpc@client-${FRP_PORT}.service
+        install_watchdog "frpc"
+    fi
 
-    echo
-    echo "${BLD}6) Reachability of a few heavy sites from this box${NC}"
-    local site
-    for site in https://www.google.com https://www.cloudflare.com https://www.youtube.com https://github.com; do
-        if curl -sf --max-time 8 -o /dev/null -w '' "$site" 2>/dev/null; then
-            ok "  $site"
+    sleep 4
+    log_info "Stability fix applied. IMPORTANT: run this on BOTH servers so tcpMux matches."
+}
+
+###############################################################################
+# Status / logs
+###############################################################################
+check_status() {
+    echo "================================================"
+    echo "              FRP Health Status                 "
+    echo "================================================"
+
+    local has_service=false
+
+    if systemctl cat frps@server-${FRP_PORT}.service >/dev/null 2>&1; then
+        has_service=true
+        echo ""
+        echo "--- FRP Server (frps) - IRAN ---"
+        systemctl status frps@server-${FRP_PORT}.service --no-pager 2>&1 | head -n 12 || true
+        echo ""
+        echo "Clients currently connected:"
+        curl -sf --max-time 5 -u "admin:${FRP_TOKEN}" \
+            "http://127.0.0.1:${ADMIN_PORT_S}/api/serverinfo" 2>/dev/null \
+            | grep -oP '"clientCounts":\s*\K[0-9]+' || echo "  (admin API not reachable)"
+        if [ -f /var/log/frps.log ]; then
+            echo ""
+            echo "Control-connection churn (last 200 log lines):"
+            echo "  logins:   $(tail -n 200 /var/log/frps.log | grep -c 'client login info')"
+            echo "  closed:   $(tail -n 200 /var/log/frps.log | grep -ci 'client close\|control connection closed')"
+        fi
+    fi
+
+    if systemctl cat frpc@client-${FRP_PORT}.service >/dev/null 2>&1; then
+        has_service=true
+        echo ""
+        echo "--- FRP Client (frpc) - OUTSIDE ---"
+        systemctl status frpc@client-${FRP_PORT}.service --no-pager 2>&1 | head -n 12 || true
+
+        echo ""
+        echo "--- Connection Status ---"
+        local status
+        status=$(curl -sf --max-time 5 -u "admin:${FRP_TOKEN}" \
+                 "http://127.0.0.1:${ADMIN_PORT_C}/api/status" 2>/dev/null)
+        if [ -n "$status" ]; then
+            local running total
+            running=$(echo "$status" | grep -o '"status":"running"' | wc -l)
+            total=$(echo "$status" | grep -o '"status":"' | wc -l)
+            if [ "$running" -gt 0 ]; then
+                echo -e "${GREEN}ONLINE - ${running}/${total} proxies running.${NC}"
+            else
+                echo -e "${RED}OFFLINE - 0/${total} proxies running.${NC}"
+                echo "$status" | head -c 400
+            fi
         else
-            err "  $site  (timeout or reset)"
+            echo "Admin API not available."
         fi
-    done
 
-    echo
-    echo "${BLD}7) Services${NC}"
-    for k in frps frpc; do
-        if systemctl list-unit-files 2>/dev/null | grep -q "^${k}.service"; then
-            printf '   %-6s %s (restarts: %s)\n' "$k" \
-                "$(systemctl is-active "$k" 2>/dev/null)" \
-                "$(systemctl show -p NRestarts --value "$k" 2>/dev/null)"
+        if [ -f /var/log/frpc.log ]; then
+            echo ""
+            echo "Reconnect churn (last 300 log lines):"
+            echo "  login success: $(tail -n 300 /var/log/frpc.log | grep -c 'login to server success')"
+            echo "  reconnects:    $(tail -n 300 /var/log/frpc.log | grep -ci 'try to reconnect')"
+            echo ""
+            echo "Last errors:"
+            tail -n 300 /var/log/frpc.log | grep -iE '\[E\]|error|timeout|reset' | tail -n 6
         fi
-    done
+    fi
 
+    [ "$has_service" = false ] && log_warn "No FRP service found on this machine."
+
+    if [ -f /var/log/frp-watchdog.log ]; then
+        echo ""
+        echo "--- Recent Watchdog Logs ---"
+        tail -n 6 /var/log/frp-watchdog.log 2>/dev/null
+    fi
+
+    echo ""
+    echo "--- Kernel Settings ---"
+    sysctl net.ipv4.tcp_congestion_control net.ipv4.tcp_keepalive_time \
+           net.ipv4.tcp_mtu_probing 2>/dev/null || true
+    sysctl net.netfilter.nf_conntrack_tcp_timeout_established 2>/dev/null || true
+}
+
+live_logs() {
+    echo "1) frps (Iran)   2) frpc (Outside)   3) watchdog"
+    read -p "Select [1-3]: " l
+    case "$l" in
+        1) journalctl -u frps@server-${FRP_PORT} -f --no-pager ;;
+        2) journalctl -u frpc@client-${FRP_PORT} -f --no-pager ;;
+        3) tail -f /var/log/frp-watchdog.log ;;
+        *) log_warn "Invalid choice." ;;
+    esac
+}
+
+###############################################################################
+# Removal
+###############################################################################
+remove_frp() {
+    log_step "=== Removing FRP ==="
+
+    systemctl stop frps@server-${FRP_PORT}.service frpc@client-${FRP_PORT}.service 2>/dev/null || true
+    systemctl disable frps@server-${FRP_PORT}.service frpc@client-${FRP_PORT}.service 2>/dev/null || true
+
+    rm -f /etc/systemd/system/frps@.service /etc/systemd/system/frpc@.service
+    rm -rf /root/frp
+    rm -f /usr/local/bin/frps /usr/local/bin/frpc
+
+    pkill -9 -x frps 2>/dev/null || true
+    pkill -9 -x frpc 2>/dev/null || true
+
+    remove_watchdog
+    remove_tcp_tuning
+
+    systemctl daemon-reload
+    log_info "FRP removed completely."
+}
+
+###############################################################################
+require_root
+
+while true; do
+    show_menu
+    case $choice in
+        1) install_server ;;
+        2) install_client ;;
+        3) check_status ;;
+        4) apply_stability_fix ;;
+        5) live_logs ;;
+        6) remove_frp ;;
+        7) echo "Goodbye!"; exit 0 ;;
+        *) log_warn "Invalid option. Please try again." ;;
+    esac
     echo
-    inf "If MSS is clamped, IPv6 and DNS are healthy, and heavy sites still hang"
-    inf "only through the tunnel, forward the exact port the panel listens on and"
-    inf "confirm tcpMux is set the same on both servers."
-}
-
-show_status() {
-    hdr "Status"
-    local role
-    for role in frps frpc; do
-        systemctl list-unit-files 2>/dev/null | grep -q "^${role}.service" || continue
-        echo
-        echo "${BLD}${role}${NC}: $(systemctl is-active "$role" 2>/dev/null) / $(systemctl is-enabled "$role" 2>/dev/null)"
-        echo "  version : $("${FRP_DIR}/${role}" --version 2>/dev/null)"
-        echo "  uptime  : $(systemctl show -p ActiveEnterTimestamp --value "$role" 2>/dev/null)"
-        echo "  restarts: $(systemctl show -p NRestarts --value "$role" 2>/dev/null)"
-        if [ -f "${CONF_DIR}/${role}.toml" ]; then
-            echo "  protocol: $(grep -oE '^transport\.protocol[[:space:]]*=[[:space:]]*"[a-z]+"' "${CONF_DIR}/${role}.toml" | cut -d'"' -f2 || echo tcp)"
-            echo "  tcpMux  : $(grep -oE '^transport\.tcpMux[[:space:]]*=[[:space:]]*(true|false)' "${CONF_DIR}/${role}.toml" | awk '{print $3}')"
-        fi
-    done
-    echo
-    echo "${BLD}Listening ports${NC}"
-    ss -lntp 2>/dev/null | grep -E 'frps|frpc' || echo "  (none)"
-    echo
-    echo "${BLD}MSS clamp${NC}"
-    [ -x "$MSS_SCRIPT" ] && "$MSS_SCRIPT" show || echo "  not installed"
-}
-
-show_logs() {
-    local role=""
-    systemctl is-active --quiet frps && role="frps"
-    systemctl is-active --quiet frpc && role="frpc"
-    [ -z "$role" ] && { err "Neither frps nor frpc is running."; return 1; }
-    inf "Live log for ${role} -- press Ctrl+C to exit."
-    journalctl -u "$role" -n 60 -f --no-pager
-}
-
-uninstall() {
-    read -r -p "Remove frp completely? [y/N]: " a
-    [[ "$a" =~ ^[Yy]$ ]] || return 0
-    systemctl disable --now frps frpc >/dev/null 2>&1
-    rm -f /etc/systemd/system/frps.service /etc/systemd/system/frpc.service
-    remove_mss_fix
-    rm -rf "$FRP_DIR" "$CONF_DIR" "$LOG_DIR" "$SYSCTL_FILE" "$LIMITS_DROPIN"
-    systemctl daemon-reload >/dev/null 2>&1
-    sysctl --system >/dev/null 2>&1
-    ok "frp removed."
-}
-
-menu() {
-    clear
-    echo "${CYN}${BLD}"
-    echo "  ============================================================"
-    echo "        FRP Reverse Tunnel Manager  --  v3.0  (TCP only)"
-    echo "        frp core: v${FRP_VERSION} (stable)"
-    echo "  ============================================================"
-    echo "${NC}"
-    echo "   1) Install on the ${BLD}IRAN${NC} server        (frps)"
-    echo "   2) Install on the ${BLD}FOREIGN${NC} server     (frpc)"
-    echo "   3) Status"
-    echo "   4) Repair / migrate an existing install to TCP-only"
-    echo "   5) Apply the MTU/MSS fix only"
-    echo "   6) Diagnose \"some sites don't load\""
-    echo "   7) Live logs"
-    echo "   8) Uninstall"
-    echo "   0) Exit"
-    echo
-}
-
-main() {
-    require_root
-    while true; do
-        menu
-        read -r -p "Choice: " c
-        case "$c" in
-            1) install_server; pause ;;
-            2) install_client; pause ;;
-            3) show_status;    pause ;;
-            4) repair_install; pause ;;
-            5) read -r -p "MSS [${DEF_MSS}]: " m; install_mss_fix "${m:-$DEF_MSS}"; pause ;;
-            6) diagnose;       pause ;;
-            7) show_logs;      pause ;;
-            8) uninstall;      pause ;;
-            0) echo "Bye."; exit 0 ;;
-            *) err "Invalid choice."; sleep 1 ;;
-        esac
-    done
-}
-
-main "$@"
+    read -p "Press Enter to continue..."
+done
