@@ -830,7 +830,12 @@ install_client() {
     read -p "Enter inbound ports to forward [default: 8080]: " ports
     ports=${ports:-8080}
 
-    read -p "Also forward UDP ports? (y/n) [default: n]: " forward_udp
+    # QUIC/HTTP3 (used heavily by Google and other major services) needs
+    # UDP. Without it, those specific destinations fail outright while
+    # ordinary TCP/HTTPS traffic works fine - a confirmed real-world failure
+    # mode, so this now defaults to yes.
+    read -p "Also forward UDP ports? (y/n) [default: y - needed for QUIC/HTTP3]: " forward_udp
+    forward_udp=${forward_udp:-y}
 
     echo ""
     echo "Connection load profile:"
