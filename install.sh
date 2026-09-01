@@ -1086,21 +1086,28 @@ offer_exit_node_fixes() {
     echo ""
 
     if [ -n "$GOOGLE_V6_BROKEN" ]; then
+        log_warn "Most Iran exit-node proxy software (Xray/V2Ray/sing-box/Hysteria/etc.) is written in Go and IGNORES /etc/gai.conf."
+        log_warn "If that describes what's listening behind this tunnel, option 1 alone will NOT fix Google/YouTube-style failures - only option 2 will."
         read -r -p \
-            "IPv6 is broken. Fix? (1=prefer IPv4, 2=disable IPv6, n=skip) [1]: " v6fix
-        v6fix="${v6fix:-1}"
+            "IPv6 is broken. Fix? (1=prefer IPv4 only, 2=disable IPv6 system-wide [recommended], n=skip) [2]: " v6fix
+        v6fix="${v6fix:-2}"
 
         case "$v6fix" in
-            1) prefer_ipv4_resolution ;;
+            1)
+                prefer_ipv4_resolution
+                log_warn "If Google/YouTube/other dual-stack sites still fail, re-run this check and choose option 2, or set the outbound domain strategy to IPv4-only inside your proxy app's own config."
+                ;;
             2)
                 prefer_ipv4_resolution
                 hard_disable_ipv6
+                log_warn "IPv6 is now off system-wide. If you manage this box over its IPv6 address (SSH, etc.), reconnect using its IPv4 address."
                 ;;
             *) log_warn "IPv6 fix skipped." ;;
         esac
     fi
 
     if ! quic_block_active; then
+        log_warn "Google properties aggressively prefer QUIC (UDP/443). If this exit node's outbound UDP is silently dropped upstream (no ICMP unreachable), browsers can hang or fail to load Google/YouTube while plain-TCP sites work fine."
         read -r -p \
             "Reject outbound UDP/443 to force TCP fallback? (y/n) [y]: " qb
         qb="${qb:-y}"
