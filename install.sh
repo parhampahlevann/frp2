@@ -175,14 +175,14 @@ install_server() {
     sys_optimize
     install_frp_binaries frps
 
-    read -rp "FRP port [7000]: " P;      P=${P:-7000};      is_port "$P"  || { err "Invalid port"; return 1; }
+    read -rp "Tunnel port - must match on the client [8443]: " P; P=${P:-8443}; is_port "$P" || { err "Invalid port"; return 1; }
     read -rp "Dashboard port [7500]: " DP; DP=${DP:-7500};  is_port "$DP" || { err "Invalid port"; return 1; }
-    read -rp "Remote port range to allow for clients [1024-65535]: " RANGE
-    RANGE=${RANGE:-1024-65535}
-    RSTART=${RANGE%-*}; REND=${RANGE#*-}
-    is_port "$RSTART" && is_port "$REND" || { err "Invalid range"; return 1; }
+    # Forwarded-port selection happens on the client only; the server just needs a
+    # wide-enough allowed range so it never blocks whatever the client asks for.
+    RSTART=1024; REND=65535
 
-    TOKEN=$(openssl rand -hex 16)
+    read -rp "Token - must match on the client [123]: " TOKEN; TOKEN=${TOKEN:-123}
+    [ "$TOKEN" = "123" ] && warn "Using the default token (123) - fine for quick testing, but change it on both sides for anything internet-facing"
     DASH_USER="admin"
     DASH_PASS=$(openssl rand -hex 8)
     SRV_IP=$(curl -s4 --max-time 6 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
@@ -191,7 +191,6 @@ install_server() {
 bindAddr = "0.0.0.0"
 bindPort = ${P}
 kcpBindPort = ${P}
-quicBindPort = ${P}
 
 auth.method = "token"
 auth.token = "${TOKEN}"
@@ -251,7 +250,7 @@ EOF
 
     cat > "$CONFIG_DIR/server-info.txt" <<EOF
 Server IP   : ${SRV_IP}
-FRP Port    : ${P} (tcp/kcp/quic)
+FRP Port    : ${P} (tcp/kcp)
 Token       : ${TOKEN}
 Dashboard   : http://${SRV_IP}:${DP}  (${DASH_USER} / ${DASH_PASS})
 EOF
@@ -260,7 +259,7 @@ EOF
     if systemctl is-active --quiet frps; then
         echo -e "${GREEN}+---------------- FRP SERVER READY -----------------+${NC}"
         echo -e "${GREEN}| Server IP : ${SRV_IP}${NC}"
-        echo -e "${GREEN}| FRP Port  : ${P} (tcp/kcp/quic)${NC}"
+        echo -e "${GREEN}| FRP Port  : ${P} (tcp/kcp)${NC}"
         echo -e "${YELLOW}| TOKEN     : ${TOKEN}${NC}"
         echo -e "${GREEN}| Dashboard : http://${SRV_IP}:${DP}${NC}"
         echo -e "${GREEN}|             user=${DASH_USER}  pass=${DASH_PASS}${NC}"
@@ -335,19 +334,17 @@ install_client() {
 
     read -rp "FRP server IP (frps): " SERVER_IP
     [ -z "$SERVER_IP" ] && { err "IP is required"; return 1; }
-    read -rp "FRP port [7000]: " P; P=${P:-7000}; is_port "$P" || { err "Invalid port"; return 1; }
-    read -rp "Token: " TOKEN
-    [ -z "$TOKEN" ] && { err "Token is required"; return 1; }
+    read -rp "Tunnel port - must match the server [8443]: " P; P=${P:-8443}; is_port "$P" || { err "Invalid port"; return 1; }
+    read -rp "Token - must match the server [123]: " TOKEN; TOKEN=${TOKEN:-123}
 
     echo ""
     echo "Transport protocol used to reach the server:"
     echo "  1) tcp       - default, most stable"
     echo "  2) kcp       - better speed on lossy links (needs UDP open between the two servers)"
-    echo "  3) quic      - similar to kcp"
-    echo "  4) websocket - for getting through strict firewalls"
+    echo "  3) websocket - for getting through strict firewalls"
     read -rp "Choice [1]: " T
     case $T in
-        2) TP="kcp" ;; 3) TP="quic" ;; 4) TP="websocket" ;; *) TP="tcp" ;;
+        2) TP="kcp" ;; 3) TP="websocket" ;; *) TP="tcp" ;;
     esac
 
     # ---------- Port mappings ----------
