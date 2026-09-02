@@ -1,14 +1,16 @@
 #!/bin/bash
 #==============================================================
-#  FRP TUNNEL MANAGER v4.0 (Server + Client) — One Script
-#  For: x-ui (VLESS / Shadowsocks) | Transport: TCP
-#  Features: Smart Watchdog | Google/QUIC Fix | MTU Fix | Monitor
+#  FRP TUNNEL MANAGER v4.1 (Server + Client) - Single Script
+#  Generic TCP/UDP port forwarding over FRP
+#  Features: Smart Watchdog | Google/QUIC Fix | MTU Fix | Live Monitor
 #
-#  ⚠️ نکات مهم:
-#  - فرپ فقط TCP و UDP فوروارد میکند. ICMP (پینگ) از داخل تانل
-#    رد نمیشود. پینگ واچ‌داگ، پینگ مستقیم بین دو سرور برای سنجش
-#    سلامت لینک است (چون از ICMP استفاده میکنی، این کار میکند).
-#  - x-ui داخل این اسکریپت نصب نمیشود — خودت نصب کن.
+#  Notes:
+#  - FRP only forwards TCP and UDP. ICMP (ping) is never tunneled -
+#    the watchdog's ping is a direct ICMP check between the two
+#    servers themselves, used only to measure link health.
+#  - This script only builds the tunnel. It does not install any
+#    panel or application on either machine - point the forwarded
+#    ports at whatever local service you're already running there.
 #==============================================================
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -22,12 +24,12 @@ LOG_DIR="/var/log/frp"
 SCRIPTS_DIR="$INSTALL_DIR/scripts"
 
 #---------------- helpers ----------------
-msg()  { echo -e "${GREEN}[✓]${NC} $1"; }
+msg()  { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err()  { echo -e "${RED}[✗]${NC} $1"; }
+err()  { echo -e "${RED}[X]${NC} $1"; }
 
 check_root() {
-    [ "$EUID" -ne 0 ] && { err "با root اجرا کن → sudo bash $0"; exit 1; }
+    [ "$EUID" -ne 0 ] && { err "Run as root -> sudo bash $0"; exit 1; }
 }
 
 detect_arch() {
@@ -35,7 +37,7 @@ detect_arch() {
         x86_64)  echo "amd64" ;;
         aarch64) echo "arm64" ;;
         armv7l)  echo "arm" ;;
-        *) err "معماری پشتیبانی نمیشود: $(uname -m)"; exit 1 ;;
+        *) err "Unsupported architecture: $(uname -m)"; exit 1 ;;
     esac
 }
 
@@ -54,10 +56,10 @@ install_deps() {
     elif command -v yum >/dev/null 2>&1; then
         yum install -y -q wget curl tar openssl iptables iproute2 procps >/dev/null 2>&1
     fi
-    command -v wget >/dev/null 2>&1 || { err "نصب wget ناموفق بود"; exit 1; }
+    command -v wget >/dev/null 2>&1 || { err "Failed to install wget"; exit 1; }
 }
 
-# دانلود با میرور فال‌بک (برای سرورهایی که دسترسی مستقیم به گیت‌هاب ندارند)
+# Download with fallback mirrors (for servers without direct GitHub access)
 fetch_file() {
     local url="$1" out="$2"
     local mirrors=("" "https://ghfast.top/" "https://ghproxy.net/" "https://mirror.ghproxy.com/")
@@ -78,18 +80,18 @@ install_frp_binaries() {
 
     mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$LOG_DIR" "$SCRIPTS_DIR"
 
-    msg "دانلود FRP v${FRP_VERSION} (${arch})..."
-    fetch_file "$url" "/tmp/$file" || { err "دانلود ناموفق (گیت‌هاب + میرورها)"; exit 1; }
-    tar -xzf "/tmp/$file" -C /tmp || { err "اکسترکت ناموفق"; exit 1; }
+    msg "Downloading FRP v${FRP_VERSION} (${arch})..."
+    fetch_file "$url" "/tmp/$file" || { err "Download failed (GitHub + mirrors)"; exit 1; }
+    tar -xzf "/tmp/$file" -C /tmp || { err "Extraction failed"; exit 1; }
 
     [ "$need" != "frpc" ] && cp "/tmp/$ext/frps" "$BIN_DIR/" && chmod +x "$BIN_DIR/frps"
     [ "$need" != "frps" ] && cp "/tmp/$ext/frpc" "$BIN_DIR/" && chmod +x "$BIN_DIR/frpc"
     rm -rf "/tmp/$ext" "/tmp/$file"
-    msg "باینری FRP نصب شد → $BIN_DIR"
+    msg "FRP binaries installed -> $BIN_DIR"
 }
 
 sys_optimize() {
-    msg "بهینه‌سازی سیستم (BBR، بافرها، MTU probing)..."
+    msg "Optimizing system (BBR, buffers, MTU probing)..."
     modprobe tcp_bbr 2>/dev/null
     modprobe nf_conntrack 2>/dev/null
 
@@ -156,14 +158,15 @@ open_firewall() {
 }
 
 #==============================================================
-#  گزینه 1 — نصب FRP SERVER (frps)  ← روی سرور فرپ اجرا شود
+#  Option 1 - Install FRP SERVER (frps) - run on the externally
+#             exposed server (the one users connect to)
 #==============================================================
 install_server() {
     echo ""
-    msg "═══ نصب FRP SERVER (frps) ═══"
+    msg "=== Installing FRP SERVER (frps) ==="
 
     if [ -f /etc/systemd/system/frps.service ]; then
-        read -rp "frps قبلا نصب شده. نصب مجدد انجام شود؟ (y/N): " R
+        read -rp "frps is already installed. Reinstall? (y/N): " R
         [ "$R" = "y" ] || return 0
         systemctl stop frps 2>/dev/null
     fi
@@ -172,12 +175,12 @@ install_server() {
     sys_optimize
     install_frp_binaries frps
 
-    read -rp "پورت FRP [7000]: " P;      P=${P:-7000};      is_port "$P"  || { err "پورت نامعتبر"; return 1; }
-    read -rp "پورت Dashboard [7500]: " DP; DP=${DP:-7500};  is_port "$DP" || { err "پورت نامعتبر"; return 1; }
-    read -rp "بازه پورت‌های Remote برای کلاینت‌ها [1024-65535]: " RANGE
+    read -rp "FRP port [7000]: " P;      P=${P:-7000};      is_port "$P"  || { err "Invalid port"; return 1; }
+    read -rp "Dashboard port [7500]: " DP; DP=${DP:-7500};  is_port "$DP" || { err "Invalid port"; return 1; }
+    read -rp "Remote port range to allow for clients [1024-65535]: " RANGE
     RANGE=${RANGE:-1024-65535}
     RSTART=${RANGE%-*}; REND=${RANGE#*-}
-    is_port "$RSTART" && is_port "$REND" || { err "بازه نامعتبر"; return 1; }
+    is_port "$RSTART" && is_port "$REND" || { err "Invalid range"; return 1; }
 
     TOKEN=$(openssl rand -hex 16)
     DASH_USER="admin"
@@ -212,9 +215,9 @@ log.maxDays = 3
 udpPacketSize = 1500
 EOF
 
-    # ✅ اعتبارسنجی کانفیگ قبل از استارت
+    # Validate config before starting the service
     if ! "$BIN_DIR/frps" verify -c "$CONFIG_DIR/frps.toml" >/dev/null 2>&1; then
-        err "کانفیگ frps نامعتبر است!"; return 1
+        err "frps config is invalid!"; return 1
     fi
 
     cat > /etc/systemd/system/frps.service <<EOF
@@ -246,7 +249,6 @@ EOF
     systemctl restart frps
     sleep 3
 
-    mkdir -p "$CONFIG_DIR"
     cat > "$CONFIG_DIR/server-info.txt" <<EOF
 Server IP   : ${SRV_IP}
 FRP Port    : ${P} (tcp/kcp/quic)
@@ -256,22 +258,22 @@ EOF
 
     echo ""
     if systemctl is-active --quiet frps; then
-        echo -e "${GREEN}╔══════════════ FRP SERVER آماده است ══════════════╗${NC}"
-        echo -e "${GREEN}║ Server IP : ${SRV_IP}${NC}"
-        echo -e "${GREEN}║ FRP Port  : ${P} (tcp/kcp/quic)${NC}"
-        echo -e "${YELLOW}║ TOKEN     : ${TOKEN}${NC}"
-        echo -e "${GREEN}║ Dashboard : http://${SRV_IP}:${DP}${NC}"
-        echo -e "${GREEN}║             user=${DASH_USER}  pass=${DASH_PASS}${NC}"
-        echo -e "${GREEN}║ (اطلاعات در ${CONFIG_DIR}/server-info.txt ذخیره شد)${NC}"
-        echo -e "${GREEN}╚═══════════════════════════════════════════════════╝${NC}"
-        warn "قدم بعدی: روی سرور x-ui (کلاینت) → گزینه 2، بعد 4، بعد 5"
+        echo -e "${GREEN}+---------------- FRP SERVER READY -----------------+${NC}"
+        echo -e "${GREEN}| Server IP : ${SRV_IP}${NC}"
+        echo -e "${GREEN}| FRP Port  : ${P} (tcp/kcp/quic)${NC}"
+        echo -e "${YELLOW}| TOKEN     : ${TOKEN}${NC}"
+        echo -e "${GREEN}| Dashboard : http://${SRV_IP}:${DP}${NC}"
+        echo -e "${GREEN}|             user=${DASH_USER}  pass=${DASH_PASS}${NC}"
+        echo -e "${GREEN}| (saved to ${CONFIG_DIR}/server-info.txt)${NC}"
+        echo -e "${GREEN}+-----------------------------------------------------+${NC}"
+        warn "Next step: on the client machine -> option 2, then 4, then 5"
     else
-        err "frps استارت نشد:"; journalctl -u frps --no-pager -n 15
+        err "frps failed to start:"; journalctl -u frps --no-pager -n 15
     fi
 }
 
 #==============================================================
-#  پروکسی‌نویس‌ها (کلاینت)
+#  Client-side proxy writers
 #==============================================================
 write_tcp_proxy() {  # $1=name $2=lport $3=rport
 cat >> "$CONFIG_DIR/frpc.toml" <<EOF
@@ -314,14 +316,15 @@ proxy_count() {
 }
 
 #==============================================================
-#  گزینه 2 — نصب FRP CLIENT (frpc)  ← روی سرور x-ui اجرا شود
+#  Option 2 - Install FRP CLIENT (frpc) - run on the internal
+#             server that has the local service(s) to expose
 #==============================================================
 install_client() {
     echo ""
-    msg "═══ نصب FRP CLIENT (frpc) ═══"
+    msg "=== Installing FRP CLIENT (frpc) ==="
 
     if [ -f "$CONFIG_DIR/frpc.toml" ]; then
-        read -rp "frpc قبلا کانفیگ شده. از نو کانفیگ شود؟ (y/N): " R
+        read -rp "frpc is already configured. Reconfigure from scratch? (y/N): " R
         [ "$R" = "y" ] || return 0
         systemctl stop frpc 2>/dev/null
     fi
@@ -330,50 +333,52 @@ install_client() {
     sys_optimize
     install_frp_binaries frpc
 
-    read -rp "IP سرور فرپ (frps): " SERVER_IP
-    [ -z "$SERVER_IP" ] && { err "IP الزامی است"; return 1; }
-    read -rp "پورت FRP [7000]: " P; P=${P:-7000}; is_port "$P" || { err "پورت نامعتبر"; return 1; }
+    read -rp "FRP server IP (frps): " SERVER_IP
+    [ -z "$SERVER_IP" ] && { err "IP is required"; return 1; }
+    read -rp "FRP port [7000]: " P; P=${P:-7000}; is_port "$P" || { err "Invalid port"; return 1; }
     read -rp "Token: " TOKEN
-    [ -z "$TOKEN" ] && { err "Token الزامی است"; return 1; }
+    [ -z "$TOKEN" ] && { err "Token is required"; return 1; }
 
     echo ""
-    echo "پروتکل ارتباط فرپ با سرور:"
-    echo "  1) tcp       ← پیش‌فرض و پایدار (انتخاب اصلی تو)"
-    echo "  2) kcp       ← سرعت بهتر روی لینک پکت‌لاس (نیاز UDP باز بین دو سرور)"
-    echo "  3) quic      ← مشابه kcp"
-    echo "  4) websocket ← برای عبور از فایروال‌های سخت‌گیر"
-    read -rp "انتخاب [1]: " T
+    echo "Transport protocol used to reach the server:"
+    echo "  1) tcp       - default, most stable"
+    echo "  2) kcp       - better speed on lossy links (needs UDP open between the two servers)"
+    echo "  3) quic      - similar to kcp"
+    echo "  4) websocket - for getting through strict firewalls"
+    read -rp "Choice [1]: " T
     case $T in
         2) TP="kcp" ;; 3) TP="quic" ;; 4) TP="websocket" ;; *) TP="tcp" ;;
     esac
 
-    # ---------- پورت مپ‌ها (اینباندهای x-ui: VLESS / Shadowsocks) ----------
-    MAPPINGS=()
-    while true; do
-        echo ""
-        echo -e "${CYAN}── پورت مپ جدید (پورت اینباند پنل x-ui) ──${NC}"
-        read -rp "پورت لوکال روی همین سرور (اینباند پنل، مثلا 443 یا 8443): " LP
-        is_port "$LP" || { err "پورت نامعتبر"; continue; }
-        read -rp "پورت Remote روی سرور فرپ (کاربر به این وصل میشود): " RP
-        is_port "$RP" || { err "پورت نامعتبر"; continue; }
-        read -rp "پروتکل مپ: tcp/udp/both [both]: " PP; PP=${PP:-both}
-        case $PP in tcp|udp|both) ;; *) PP="both" ;; esac
+    # ---------- Port mappings ----------
+    echo ""
+    echo -e "${CYAN}-- Ports to forward --${NC}"
+    echo "Enter the ports you want forwarded, comma-separated."
+    echo "Each one is forwarded 1:1 (same port number on the server as locally), e.g: 443,8443,2096"
+    read -rp "Ports: " PORTS_RAW
+    read -rp "Protocol for these ports: tcp/udp/both [both]: " PP; PP=${PP:-both}
+    case $PP in tcp|udp|both) ;; *) PP="both" ;; esac
 
-        # هشدار اگر پورت لوکال هیچ سرویسی روش گوش نمیدهد
+    MAPPINGS=()
+    IFS=',' read -ra PORT_ARR <<< "$PORTS_RAW"
+    for raw in "${PORT_ARR[@]}"; do
+        port=$(echo "$raw" | tr -d '[:space:]')
+        [ -z "$port" ] && continue
+        if ! is_port "$port"; then
+            warn "Skipping invalid port: $port"
+            continue
+        fi
         if command -v ss >/dev/null 2>&1; then
-            if ! ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${LP}$"; then
-                warn "پورت ${LP} هنوز روی این سرور Listen نیست — اینباند x-ui را بساز"
+            if ! ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+                warn "Port ${port} is not listening locally yet - make sure your service is bound to it"
             fi
         fi
-
-        MAPPINGS+=("${LP}:${RP}:${PP}")
-        read -rp "پورت دیگری اضافه میکنی؟ (Y/n): " M
-        [ "$M" = "n" ] && break
+        MAPPINGS+=("${port}:${port}:${PP}")
     done
 
-    [ ${#MAPPINGS[@]} -eq 0 ] && { err "حداقل یک پورت مپ لازم است"; return 1; }
+    [ ${#MAPPINGS[@]} -eq 0 ] && { err "At least one valid port is required"; return 1; }
 
-    # ---------- کانفیگ اصلی ----------
+    # ---------- Main config ----------
     cat > "$CONFIG_DIR/frpc.toml" <<EOF
 serverAddr = "${SERVER_IP}"
 serverPort = ${P}
@@ -399,25 +404,25 @@ log.maxDays = 3
 udpPacketSize = 1500
 EOF
 
-    # ---------- پروکسی‌ها ----------
+    # ---------- Proxies ----------
     i=0
     for m in "${MAPPINGS[@]}"; do
         i=$((i+1))
         LP=${m%%:*}; rest=${m#*:}; RP=${rest%%:*}; PP=${rest#*:}
         case $PP in
-            tcp)  write_tcp_proxy "xui-tcp-$i" "$LP" "$RP" ;;
-            udp)  write_udp_proxy "xui-udp-$i" "$LP" "$RP" ;;
-            both) write_tcp_proxy "xui-tcp-$i" "$LP" "$RP"
-                  write_udp_proxy "xui-udp-$i" "$LP" "$RP" ;;
+            tcp)  write_tcp_proxy "fwd-tcp-$i" "$LP" "$RP" ;;
+            udp)  write_udp_proxy "fwd-udp-$i" "$LP" "$RP" ;;
+            both) write_tcp_proxy "fwd-tcp-$i" "$LP" "$RP"
+                  write_udp_proxy "fwd-udp-$i" "$LP" "$RP" ;;
         esac
     done
 
-    # ---------- اعتبارسنجی ----------
+    # ---------- Validate ----------
     if ! "$BIN_DIR/frpc" verify -c "$CONFIG_DIR/frpc.toml" >/dev/null 2>&1; then
-        err "کانفیگ frpc نامعتبر است! لاگ: $LOG_DIR/frpc.log"; return 1
+        err "frpc config is invalid! Log: $LOG_DIR/frpc.log"; return 1
     fi
 
-    # ---------- سرویس ----------
+    # ---------- Service ----------
     cat > /etc/systemd/system/frpc.service <<EOF
 [Unit]
 Description=FRP Client (frpc)
@@ -450,74 +455,95 @@ EOF
 
     echo ""
     if systemctl is-active --quiet frpc; then
-        msg "frpc در حال اجراست"
+        msg "frpc is running"
         if tail -20 "$LOG_DIR/frpc.log" 2>/dev/null | grep -q "login to server success"; then
-            msg "اتصال تانل به ${SERVER_IP}:${P} برقرار است ✅"
+            msg "Tunnel connected to ${SERVER_IP}:${P}"
         else
-            warn "اتصال هنوز برقرار نشده — IP/Token را چک کن، لاگ: منو → گزینه 9"
+            warn "Not connected yet - check IP/Token, see logs via menu -> option 9"
         fi
     else
-        err "frpc استارت نشد:"; journalctl -u frpc --no-pager -n 15
+        err "frpc failed to start:"; journalctl -u frpc --no-pager -n 15
         return 1
     fi
 
     echo ""
-    echo -e "${CYAN}پورت مپ‌ها:${NC}"
+    echo -e "${CYAN}Port mappings:${NC}"
     for m in "${MAPPINGS[@]}"; do
         LP=${m%%:*}; rest=${m#*:}; RP=${rest%%:*}; PP=${rest#*:}
-        echo -e "  local ${LP} → remote ${RP} (${PP})"
+        echo -e "  local ${LP} -> remote ${RP} (${PP})"
     done
-    warn "قدم بعدی: گزینه 4 (واچ‌داگ) و گزینه 5 (فیکس گوگل — روی همین سرور چون خروجی اینترنت اینجاست)"
+    warn "Next: option 4 (watchdog) and option 5 (Google/QUIC fix - run it here, since this machine has the internet egress)"
 }
 
 #==============================================================
-#  گزینه 3 — افزودن پورت مپ جدید بدون نصب مجدد
+#  Option 3 - Add a new port mapping without reinstalling
 #==============================================================
 add_mapping() {
-    [ -f "$CONFIG_DIR/frpc.toml" ] || { err "اول گزینه 2 (نصب کلاینت) را اجرا کن"; return 1; }
+    [ -f "$CONFIG_DIR/frpc.toml" ] || { err "Run option 2 (install client) first"; return 1; }
 
-    read -rp "پورت لوکال (اینباند x-ui): " LP
-    is_port "$LP" || { err "پورت نامعتبر"; return 1; }
-    read -rp "پورت Remote روی سرور فرپ: " RP
-    is_port "$RP" || { err "پورت نامعتبر"; return 1; }
-    read -rp "پروتکل مپ: tcp/udp/both [both]: " PP; PP=${PP:-both}
+    echo "Enter the ports you want to add, comma-separated (each forwarded 1:1), e.g: 2053,2083"
+    read -rp "Ports: " PORTS_RAW
+    read -rp "Protocol for these ports: tcp/udp/both [both]: " PP; PP=${PP:-both}
     case $PP in tcp|udp|both) ;; *) PP="both" ;; esac
 
-    if command -v ss >/dev/null 2>&1; then
-        if ! ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${LP}$"; then
-            warn "پورت ${LP} هنوز Listen نیست — اینباند را در x-ui بساز"
+    NEW_MAPPINGS=()
+    IFS=',' read -ra PORT_ARR <<< "$PORTS_RAW"
+    for raw in "${PORT_ARR[@]}"; do
+        port=$(echo "$raw" | tr -d '[:space:]')
+        [ -z "$port" ] && continue
+        if ! is_port "$port"; then
+            warn "Skipping invalid port: $port"
+            continue
         fi
-    fi
+        if command -v ss >/dev/null 2>&1; then
+            if ! ss -tlnH 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then
+                warn "Port ${port} is not listening locally yet"
+            fi
+        fi
+        NEW_MAPPINGS+=("${port}:${port}:${PP}")
+    done
+
+    [ ${#NEW_MAPPINGS[@]} -eq 0 ] && { err "No valid ports given"; return 1; }
+
+    # Back up so we can actually revert if the new config turns out invalid
+    cp "$CONFIG_DIR/frpc.toml" "$CONFIG_DIR/frpc.toml.bak"
 
     N=$(proxy_count)
-    case $PP in
-        tcp)  write_tcp_proxy "xui-tcp-$((N+1))" "$LP" "$RP" ;;
-        udp)  write_udp_proxy "xui-udp-$((N+1))" "$LP" "$RP" ;;
-        both) write_tcp_proxy "xui-tcp-$((N+1))" "$LP" "$RP"
-              write_udp_proxy "xui-udp-$((proxy_count+1))" "$LP" "$RP" ;;
-    esac
+    for m in "${NEW_MAPPINGS[@]}"; do
+        N=$((N+1))
+        LP=${m%%:*}; rest=${m#*:}; RP=${rest%%:*}; PP=${rest#*:}
+        case $PP in
+            tcp)  write_tcp_proxy "fwd-tcp-$N" "$LP" "$RP" ;;
+            udp)  write_udp_proxy "fwd-udp-$N" "$LP" "$RP" ;;
+            both) write_tcp_proxy "fwd-tcp-$N" "$LP" "$RP"
+                  write_udp_proxy "fwd-udp-$N" "$LP" "$RP" ;;
+        esac
+    done
 
     if ! "$BIN_DIR/frpc" verify -c "$CONFIG_DIR/frpc.toml" >/dev/null 2>&1; then
-        err "کانفیگ جدید نامعتبر! به نسخه قبل برنگشته — لاگ را ببین"; return 1
+        err "New config is invalid - reverted to the previous version. Check: $LOG_DIR/frpc.log"
+        mv "$CONFIG_DIR/frpc.toml.bak" "$CONFIG_DIR/frpc.toml"
+        return 1
     fi
+    rm -f "$CONFIG_DIR/frpc.toml.bak"
 
     systemctl restart frpc 2>/dev/null
-    msg "پورت مپ اضافه و frpc ری‌استارت شد (local ${LP} → remote ${RP})"
-    warn "اگر روی سرور فرپ فایروال (ufw/firewalld) فعاله، پورت ${RP} را آنجا هم باز کن"
+    msg "Port mapping(s) added and frpc restarted"
+    warn "If ufw/firewalld is active on the frps server, open the matching remote port(s) there too"
 }
 
 #==============================================================
-#  گزینه 4 — واچ‌داگ هوشمند
+#  Option 4 - Smart watchdog
 #==============================================================
 install_watchdog() {
-    [ -f "$CONFIG_DIR/frpc.toml" ] || { err "اول گزینه 2 (نصب کلاینت) را اجرا کن"; return 1; }
+    [ -f "$CONFIG_DIR/frpc.toml" ] || { err "Run option 2 (install client) first"; return 1; }
 
-    msg "نصب واچ‌داگ هوشمند..."
+    msg "Installing smart watchdog..."
 
     cat > "$SCRIPTS_DIR/frp-watchdog.sh" <<'WEOF'
 #!/bin/bash
-# ============ Smart FRP Watchdog v4.0 ============
-# هر 5 ثانیه چک | بعد از 2 خطا (10s) اقدام | کول‌داون ضدلوپ
+# ============ Smart FRP Watchdog v4.1 ============
+# Checks every 5s | acts after 2 consecutive failures (10s) | cooldown to avoid restart loops
 LOG_DIR="/var/log/frp"
 WATCHDOG_LOG="$LOG_DIR/watchdog.log"
 CONFIG="/etc/frp/frpc.toml"
@@ -535,7 +561,7 @@ cycle=0
 
 log(){ echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$WATCHDOG_LOG"; }
 
-# جلوگیری از بزرگ شدن لاگ (بیش از 1MB → خالی)
+# Prevent the log from growing unbounded (truncate above 1MB)
 if [ -f "$WATCHDOG_LOG" ]; then
     sz=$(stat -c%s "$WATCHDOG_LOG" 2>/dev/null || echo 0)
     [ "$sz" -gt 1048576 ] && : > "$WATCHDOG_LOG"
@@ -560,14 +586,14 @@ mem_kb(){ ps -C frpc -o rss= 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
 restart_frpc(){
     now=$(date +%s)
     if [ $((now - last_restart)) -lt $RESTART_COOLDOWN ]; then
-        log "COOLDOWN — ری‌استارت رد شد (جلوگیری از لوپ)"
+        log "COOLDOWN - restart skipped (avoiding restart loop)"
         return 1
     fi
-    log "ACTION: ری‌استارت frpc..."
+    log "ACTION: restarting frpc..."
     systemctl stop frpc 2>/dev/null
     pkill -9 -x frpc 2>/dev/null
     sleep 1
-    # پاکسازی سوکت‌های نیمه‌مُرده به سمت سرور
+    # Clean up half-dead sockets toward the server
     ss -K dst "$SERVER_ADDR" 2>/dev/null
     systemctl reset-failed frpc 2>/dev/null
     systemctl start frpc 2>/dev/null
@@ -575,39 +601,39 @@ restart_frpc(){
     last_restart=$(date +%s)
     total_restarts=$((total_restarts+1))
     if proc_ok; then
-        log "OK: frpc ری‌استارت شد (مجموع=$total_restarts)"
+        log "OK: frpc restarted (total=$total_restarts)"
         fail_count=0
     else
-        log "ERROR: ری‌استارت ناموفق!"
+        log "ERROR: restart failed!"
     fi
 }
 
 net_repair(){
-    log "ACTION: تعمیر شبکه (سوکت‌های مُرده / ARP / sysctl)"
+    log "ACTION: repairing network (dead sockets / ARP / sysctl)"
     ss -K dst "$SERVER_ADDR" 2>/dev/null
     ip neigh flush "$SERVER_ADDR" 2>/dev/null
     sysctl -p /etc/sysctl.d/99-frp-tuning.conf >/dev/null 2>&1
 }
 
 log "==================================================="
-log "START watchdog → server=$SERVER_ADDR:$SERVER_PORT interval=${CHECK_INTERVAL}s threshold=$FAIL_THRESHOLD"
+log "START watchdog -> server=$SERVER_ADDR:$SERVER_PORT interval=${CHECK_INTERVAL}s threshold=$FAIL_THRESHOLD"
 
 while true; do
     sleep "$CHECK_INTERVAL"
     cycle=$((cycle+1))
 
-    # --- 1) پروسه زنده است؟ ---
+    # --- 1) Is the process alive? ---
     if ! proc_ok; then
         fail_count=$((fail_count+1))
-        log "WARN: پروسه frpc مرده است ($fail_count/$FAIL_THRESHOLD)"
+        log "WARN: frpc process is dead ($fail_count/$FAIL_THRESHOLD)"
         [ $fail_count -ge $FAIL_THRESHOLD ] && restart_frpc
         continue
     fi
 
-    # --- 2) کانکشن TCP واقعی به سرور برقرار است؟ (سریع‌ترین تست) ---
+    # --- 2) Is there a real TCP connection to the server? (fastest check) ---
     if ! tcp_ok; then
         fail_count=$((fail_count+1))
-        log "WARN: سرور در دسترس نیست ($fail_count/$FAIL_THRESHOLD)"
+        log "WARN: server is unreachable ($fail_count/$FAIL_THRESHOLD)"
         if [ $fail_count -ge $FAIL_THRESHOLD ]; then
             net_repair
             sleep 2
@@ -617,26 +643,26 @@ while true; do
         continue
     fi
 
-    # --- 3) لاگ frpc سالم است؟ ---
+    # --- 3) Does the frpc log look healthy? ---
     if ! log_ok; then
         fail_count=$((fail_count+1))
-        log "WARN: لاگ frpc خطا نشان میدهد ($fail_count/$FAIL_THRESHOLD)"
+        log "WARN: frpc log shows an error ($fail_count/$FAIL_THRESHOLD)"
         [ $fail_count -ge $FAIL_THRESHOLD ] && restart_frpc
         continue
     fi
 
     if [ $fail_count -gt 0 ]; then
-        log "OK: اتصال برقرار شد ✔"
+        log "OK: connection recovered"
         fail_count=0
     fi
 
-    # --- 4) هر 60 ثانیه: پینگ ICMP مستقیم + حافظه ---
+    # --- 4) Every 60s: direct ICMP ping + memory check ---
     if [ $((cycle % 12)) -eq 0 ]; then
         lat=$(ping -c1 -W2 "$SERVER_ADDR" 2>/dev/null | grep -o 'time=[0-9.]*' | head -1 | cut -d= -f2 | cut -d. -f1)
-        [ -n "$lat" ] && log "INFO: پینگ مستقیم ${lat}ms"
+        [ -n "$lat" ] && log "INFO: direct ping ${lat}ms"
         m=$(mem_kb)
         if [ "$m" -gt 524288 ]; then
-            log "WARN: مصرف حافظه frpc بالا ($((m/1024))MB) → ری‌استارت"
+            log "WARN: frpc memory usage high ($((m/1024))MB) -> restarting"
             restart_frpc
         fi
     fi
@@ -666,30 +692,31 @@ EOF
     systemctl restart frp-watchdog
 
     if systemctl is-active --quiet frp-watchdog; then
-        msg "واچ‌داگ فعال شد (چک هر 5s — اقدام بعد از 10s — کول‌داون 30s)"
+        msg "Watchdog is active (checks every 5s - acts after 10s - 30s cooldown)"
     else
-        err "واچ‌داگ استارت نشد:"; journalctl -u frp-watchdog --no-pager -n 10
+        err "Watchdog failed to start:"; journalctl -u frp-watchdog --no-pager -n 10
     fi
 }
 
 #==============================================================
-#  گزینه 5 و 6 — فیکس گوگل + MTU
+#  Option 5 and 6 - Google/QUIC fix + MTU
 #==============================================================
 ensure_fix_rules() {
     cat > "$SCRIPTS_DIR/apply-fix-rules.sh" <<'FEOF'
 #!/bin/bash
-# بلاک QUIC/UDP-443 → کروم فوراً روی TCP فال‌بک میکند (فیکس سرچ گوگل)
+# Block QUIC/UDP-443 so Chrome falls back to TCP immediately (fixes Google search hangs)
 iptables  -C OUTPUT  -p udp --dport 443 -j REJECT 2>/dev/null || iptables  -I OUTPUT  1 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 ip6tables -C OUTPUT  -p udp --dport 443 -j REJECT 2>/dev/null || ip6tables -I OUTPUT  1 -p udp --dport 443 -j REJECT --reject-with icmp6-port-unreachable
 iptables  -C FORWARD -p udp --dport 443 -j REJECT 2>/dev/null || iptables  -I FORWARD 1 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 ip6tables -C FORWARD -p udp --dport 443 -j REJECT 2>/dev/null || ip6tables -I FORWARD 1 -p udp --dport 443 -j REJECT --reject-with icmp6-port-unreachable
 
-# MSS Clamp → فیکس صفحات نیمه‌لود / هنگ روی محتوای سنگین
+# MSS clamp - fixes half-loaded pages / hangs on heavy content
 iptables  -t mangle -C OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables  -t mangle -A OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 iptables  -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables  -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ip6tables -t mangle -C OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -t mangle -A OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+ip6tables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# اعمال MTU ذخیره‌شده از منوی بهینه‌ساز
+# Apply the saved MTU from the optimizer menu
 MTU_FILE=/etc/frp/mtu.conf
 if [ -f "$MTU_FILE" ]; then
     MTU=$(cat "$MTU_FILE")
@@ -706,7 +733,7 @@ FEOF
 
     cat > /etc/systemd/system/frp-fix-rules.service <<EOF
 [Unit]
-Description=FRP Fix Rules (QUIC/MSS/MTU) — persistent
+Description=FRP Fix Rules (QUIC/MSS/MTU) - persistent
 After=network-pre.target
 Wants=network-pre.target
 Before=network.target
@@ -725,48 +752,52 @@ EOF
 }
 
 google_fix() {
-    msg "اعمال فیکس گوگل (بلاک QUIC + MSS Clamp)..."
+    msg "Applying Google/QUIC fix (block QUIC + MSS clamp)..."
     install_deps
     ensure_fix_rules
     "$SCRIPTS_DIR/apply-fix-rules.sh"
-    msg "انجام شد — کروم دیگر منتظر QUIC نمیماند و سریع روی TCP سرچ میکند"
-    warn "این گزینه باید روی سروری اجرا شود که x-ui و خروجی اینترنت روی آن است (کلاینت فرپ)"
-    warn "اگر باز مشکل DNS داشتی: در x-ui خروجی، DNS را روی tcp://8.8.8.8 بگذار"
+    msg "Done - Chrome no longer waits for QUIC and falls back to TCP right away"
+    warn "Run this on the machine with the actual internet egress (the frpc/client machine)"
+    warn "If DNS is still an issue: in your outbound app settings, set DNS to tcp://8.8.8.8"
 }
 
 mtu_opt() {
-    read -rp "IP برای تست MTU (IP سرور فرپ): " TIP
-    [ -z "$TIP" ] && { err "IP الزامی است"; return 1; }
+    read -rp "IP to test MTU against (the frps server IP): " TIP
+    [ -z "$TIP" ] && { err "IP is required"; return 1; }
 
-    msg "تشخیص خودکار بهترین MTU (جستجوی باینری)..."
-    size=1472; optimal=1500
-    while [ "$size" -gt 500 ]; do
-        if ping -M do -s "$size" -c1 -W2 "$TIP" >/dev/null 2>&1; then
-            optimal=$((size+28)); break
+    msg "Auto-detecting the optimal MTU (binary search)..."
+    low=500; high=1500; optimal=1500
+    while [ $((high - low)) -gt 1 ]; do
+        mid=$(( (low + high) / 2 ))
+        payload=$((mid - 28))
+        if ping -M do -s "$payload" -c1 -W2 "$TIP" >/dev/null 2>&1; then
+            low=$mid
+        else
+            high=$mid
         fi
-        size=$((size-10))
     done
+    optimal=$low
 
     mkdir -p "$CONFIG_DIR"
     echo "$optimal" > "$CONFIG_DIR/mtu.conf"
     install_deps
     ensure_fix_rules
     "$SCRIPTS_DIR/apply-fix-rules.sh"
-    msg "بهترین MTU: $optimal → روی همه اینترفیس‌ها اعمال شد (دائمی — بعد از ریبوت هم خودکار اعمال میشود)"
+    msg "Best MTU: $optimal -> applied to all interfaces (persistent - re-applied automatically after reboot)"
 }
 
 #==============================================================
-#  گزینه 7 — وضعیت
+#  Option 7 - Status
 #==============================================================
 show_status() {
     echo ""
-    echo -e "${CYAN}══════════ وضعیت FRP ══════════${NC}"
+    echo -e "${CYAN}============ FRP STATUS ============${NC}"
     for svc in frps frpc frp-watchdog frp-fix-rules; do
         [ -f "/etc/systemd/system/$svc.service" ] || continue
         if systemctl is-active --quiet "$svc"; then
-            echo -e "  $svc : ${GREEN}● RUNNING${NC}"
+            echo -e "  $svc : ${GREEN}RUNNING${NC}"
         else
-            echo -e "  $svc : ${RED}● STOPPED${NC}"
+            echo -e "  $svc : ${RED}STOPPED${NC}"
         fi
     done
 
@@ -775,28 +806,38 @@ show_status() {
         SP=$(grep -oP 'serverPort\s*=\s*\K[0-9]+' "$CONFIG_DIR/frpc.toml" 2>/dev/null)
         if [ -n "$SA" ]; then
             if timeout 2 bash -c "exec 3<>/dev/tcp/$SA/$SP" 2>/dev/null; then
-                echo -e "  Server $SA:$SP : ${GREEN}● در دسترس${NC}"
+                echo -e "  Server $SA:$SP : ${GREEN}REACHABLE${NC}"
             else
-                echo -e "  Server $SA:$SP : ${RED}● قطع${NC}"
+                echo -e "  Server $SA:$SP : ${RED}UNREACHABLE${NC}"
             fi
             P=$(ping -c1 -W2 "$SA" 2>/dev/null | grep -o 'time=[0-9.]*' | head -1 | cut -d= -f2)
             [ -n "$P" ] && echo -e "  Latency: ${YELLOW}${P}ms${NC}"
             C=$(ss -tn 2>/dev/null | grep -c "$SA")
-            echo -e "  کانکشن‌های فعال: ${YELLOW}$C${NC}"
+            echo -e "  Active connections: ${YELLOW}$C${NC}"
         fi
+
+        echo ""
+        echo -e "${CYAN}-- Configured port mappings --${NC}"
+        awk '
+            /^\[\[proxies\]\]/ { name=""; type=""; lport=""; rport="" }
+            /^name *=/ { split($0,a,"="); gsub(/["\ ]/,"",a[2]); name=a[2] }
+            /^type *=/ { split($0,a,"="); gsub(/["\ ]/,"",a[2]); type=a[2] }
+            /^localPort *=/ { split($0,a,"="); gsub(/ /,"",a[2]); lport=a[2] }
+            /^remotePort *=/ { split($0,a,"="); gsub(/ /,"",a[2]); rport=a[2]; print "  " name " (" type "): local " lport " -> remote " rport }
+        ' "$CONFIG_DIR/frpc.toml" 2>/dev/null
     fi
 
     PID=$(pgrep -x frpc | head -1)
     [ -n "$PID" ] && echo -e "  frpc MEM: $(ps -p $PID -o rss= | awk '{printf "%.0f MB", $1/1024}')  CPU: $(ps -p $PID -o %cpu= | tr -d ' ')%"
 
     echo ""
-    echo -e "${CYAN}── آخرین رویدادهای واچ‌داگ ──${NC}"
-    tail -5 "$LOG_DIR/watchdog.log" 2>/dev/null || echo "  (رویدادی نیست)"
+    echo -e "${CYAN}-- Recent watchdog events --${NC}"
+    tail -5 "$LOG_DIR/watchdog.log" 2>/dev/null || echo "  (no events yet)"
     echo ""
 }
 
 #==============================================================
-#  گزینه 8 — مانیتور زنده
+#  Option 8 - Live monitor
 #==============================================================
 show_monitor() {
     SA=$(grep -oP 'serverAddr\s*=\s*"\K[^"]+' "$CONFIG_DIR/frpc.toml" 2>/dev/null)
@@ -804,14 +845,14 @@ show_monitor() {
     trap 'trap - INT; echo; return' INT
     while true; do
         clear
-        echo -e "${CYAN}════ FRP LIVE MONITOR — $(date '+%H:%M:%S') ════${NC}  (Ctrl+C = بازگشت)"
-        systemctl is-active --quiet frpc 2>/dev/null && echo -e " frpc      : ${GREEN}● RUNNING${NC}" || echo -e " frpc      : ${RED}● STOPPED${NC}"
-        systemctl is-active --quiet frp-watchdog 2>/dev/null && echo -e " watchdog  : ${GREEN}● RUNNING${NC}" || echo -e " watchdog  : ${RED}● STOPPED${NC}"
+        echo -e "${CYAN}==== FRP LIVE MONITOR - $(date '+%H:%M:%S') ====${NC}  (Ctrl+C = back to menu)"
+        systemctl is-active --quiet frpc 2>/dev/null && echo -e " frpc      : ${GREEN}RUNNING${NC}" || echo -e " frpc      : ${RED}STOPPED${NC}"
+        systemctl is-active --quiet frp-watchdog 2>/dev/null && echo -e " watchdog  : ${GREEN}RUNNING${NC}" || echo -e " watchdog  : ${RED}STOPPED${NC}"
         if [ -n "$SA" ]; then
             if timeout 2 bash -c "exec 3<>/dev/tcp/$SA/$SP" 2>/dev/null; then
-                echo -e " server    : ${GREEN}● CONNECTED${NC} ($SA:$SP)"
+                echo -e " server    : ${GREEN}CONNECTED${NC} ($SA:$SP)"
             else
-                echo -e " server    : ${RED}● DISCONNECTED${NC} ($SA:$SP)"
+                echo -e " server    : ${RED}DISCONNECTED${NC} ($SA:$SP)"
             fi
             P=$(ping -c1 -W2 "$SA" 2>/dev/null | grep -o 'time=[0-9.]*' | head -1 | cut -d= -f2)
             [ -n "$P" ] && echo -e " latency   : ${YELLOW}${P}ms${NC}"
@@ -819,18 +860,18 @@ show_monitor() {
         fi
         PID=$(pgrep -x frpc | head -1)
         [ -n "$PID" ] && echo -e " frpc mem  : $(ps -p $PID -o rss= | awk '{printf "%.0f MB", $1/1024}') | uptime: $(ps -p $PID -o etime= | tr -d ' ')"
-        echo "──────────────────────────────"
+        echo "--------------------------------"
         tail -3 "$LOG_DIR/watchdog.log" 2>/dev/null
         sleep 3
     done
 }
 
 #==============================================================
-#  گزینه 9 / 10 / 11 / 12
+#  Option 9 / 10 / 11 / 12
 #==============================================================
 view_logs() {
-    echo "  1) frpc log   2) frps log   3) watchdog log   4) journal frpc"
-    read -rp "انتخاب: " L
+    echo "  1) frpc log   2) frps log   3) watchdog log   4) frpc journal"
+    read -rp "Choice: " L
     case $L in
         1) tail -f "$LOG_DIR/frpc.log" 2>/dev/null ;;
         2) tail -f "$LOG_DIR/frps.log" 2>/dev/null ;;
@@ -842,63 +883,74 @@ view_logs() {
 restart_services() {
     for svc in frpc frps frp-watchdog frp-fix-rules; do
         if [ -f "/etc/systemd/system/$svc.service" ]; then
-            systemctl restart "$svc" 2>/dev/null && msg "$svc ری‌استارت شد"
+            systemctl restart "$svc" 2>/dev/null && msg "$svc restarted"
         fi
     done
     sleep 2
     show_status
 }
 
+# Full teardown: services + iptables/ip6tables rules + sysctl/limits tuning + all files
 uninstall() {
-    read -rp "مطمئنی همه‌چیز حذف شود؟ (yes/no): " C
+    read -rp "Remove everything - tunnel, iptables rules, and system tuning? (yes/no): " C
     [ "$C" = "yes" ] || return 0
+
+    msg "Stopping and removing services..."
     for svc in frp-watchdog frpc frps frp-fix-rules; do
         systemctl disable --now "$svc" >/dev/null 2>&1
         rm -f "/etc/systemd/system/$svc.service"
     done
-    # حذف رول‌های iptables
+
+    msg "Removing iptables/ip6tables rules..."
     iptables  -D OUTPUT  -p udp --dport 443 -j REJECT 2>/dev/null
     ip6tables -D OUTPUT  -p udp --dport 443 -j REJECT 2>/dev/null
     iptables  -D FORWARD -p udp --dport 443 -j REJECT 2>/dev/null
     ip6tables -D FORWARD -p udp --dport 443 -j REJECT 2>/dev/null
     iptables  -t mangle -D OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+    ip6tables -t mangle -D OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
     iptables  -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+    ip6tables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null
     pkill -9 -x frpc 2>/dev/null; pkill -9 -x frps 2>/dev/null
+
+    msg "Removing files and system tuning..."
     rm -rf "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR"
     rm -f /etc/sysctl.d/99-frp-tuning.conf /etc/security/limits.d/frp-limits.conf
-    msg "حذف کامل انجام شد."
+    sysctl --system >/dev/null 2>&1
+
+    msg "Complete removal finished - tunnel, iptables rules, and system tuning are all gone."
 }
 
 #==============================================================
-#  منوی اصلی
+#  Main menu
 #==============================================================
 show_menu() {
     clear
-    echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   FRP TUNNEL MANAGER v4.0 (x-ui / VLESS / SS)    ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  1) نصب FRP Server (frps)        ← سرور فرپ     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  2) نصب FRP Client (frpc)        ← سرور x-ui    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  3) افزودن پورت مپ جدید (کلاینت)                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  4) واچ‌داگ هوشمند                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  5) فیکس گوگل (QUIC block + MSS clamp)          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  6) بهینه‌ساز MTU                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  7) وضعیت (Status)                              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  8) مانیتور زنده                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  9) مشاهده لاگ‌ها                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  10) ری‌استارت سرویس‌ها                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  11) اعمال مجدد تیونینگ سیستم                    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  12) حذف کامل (Uninstall)                       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  0) خروج                                        ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}+====================================================+${NC}"
+    echo -e "${CYAN}|          FRP TUNNEL MANAGER v4.1 (TCP/UDP)         |${NC}"
+    echo -e "${CYAN}+====================================================+${NC}"
+    echo -e "${CYAN}|${NC}  1) Install FRP Server (frps)   - exposed server  ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  2) Install FRP Client (frpc)   - internal server ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  3) Add new port mapping (client)                 ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  4) Smart watchdog                                ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  5) Google/QUIC fix (block QUIC + MSS clamp)      ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  6) MTU optimizer                                 ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  7) Status                                        ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  8) Live monitor                                  ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  9) View logs                                     ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  10) Restart services                             ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  11) Re-apply system tuning                       ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  12) Uninstall everything                         ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  0) Exit                                          ${CYAN}|${NC}"
+    echo -e "${CYAN}+====================================================+${NC}"
 }
 
 check_root
 while true; do
     show_menu
-    read -rp "انتخاب: " CH
+    read -rp "Choice: " CH
     case $CH in
         1)  install_server ;;
         2)  install_client ;;
@@ -913,7 +965,7 @@ while true; do
         11) sys_optimize ;;
         12) uninstall ;;
         0)  exit 0 ;;
-        *)  warn "انتخاب نامعتبر" ;;
+        *)  warn "Invalid choice" ;;
     esac
-    read -rp $'\nبرای بازگشت به منو Enter بزن...'
+    read -rp $'\nPress Enter to return to the menu...'
 done
