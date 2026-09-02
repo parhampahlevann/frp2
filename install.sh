@@ -215,8 +215,11 @@ udpPacketSize = 1500
 EOF
 
     # Validate config before starting the service
-    if ! "$BIN_DIR/frps" verify -c "$CONFIG_DIR/frps.toml" >/dev/null 2>&1; then
-        err "frps config is invalid!"; return 1
+    VERIFY_OUT=$("$BIN_DIR/frps" verify -c "$CONFIG_DIR/frps.toml" 2>&1)
+    if [ $? -ne 0 ]; then
+        err "frps config is invalid:"
+        echo "$VERIFY_OUT"
+        return 1
     fi
 
     cat > /etc/systemd/system/frps.service <<EOF
@@ -285,7 +288,6 @@ localPort = $2
 remotePort = $3
 transport.useEncryption = false
 transport.useCompression = false
-healthCheck.enable = true
 healthCheck.type = "tcp"
 healthCheck.timeoutSeconds = 3
 healthCheck.maxFailed = 3
@@ -415,8 +417,11 @@ EOF
     done
 
     # ---------- Validate ----------
-    if ! "$BIN_DIR/frpc" verify -c "$CONFIG_DIR/frpc.toml" >/dev/null 2>&1; then
-        err "frpc config is invalid! Log: $LOG_DIR/frpc.log"; return 1
+    VERIFY_OUT=$("$BIN_DIR/frpc" verify -c "$CONFIG_DIR/frpc.toml" 2>&1)
+    if [ $? -ne 0 ]; then
+        err "frpc config is invalid:"
+        echo "$VERIFY_OUT"
+        return 1
     fi
 
     # ---------- Service ----------
@@ -517,8 +522,10 @@ add_mapping() {
         esac
     done
 
-    if ! "$BIN_DIR/frpc" verify -c "$CONFIG_DIR/frpc.toml" >/dev/null 2>&1; then
-        err "New config is invalid - reverted to the previous version. Check: $LOG_DIR/frpc.log"
+    VERIFY_OUT=$("$BIN_DIR/frpc" verify -c "$CONFIG_DIR/frpc.toml" 2>&1)
+    if [ $? -ne 0 ]; then
+        err "New config is invalid - reverted to the previous version:"
+        echo "$VERIFY_OUT"
         mv "$CONFIG_DIR/frpc.toml.bak" "$CONFIG_DIR/frpc.toml"
         return 1
     fi
