@@ -179,7 +179,7 @@ install_server() {
     read -rp "Dashboard port [7500]: " DP; DP=${DP:-7500};  is_port "$DP" || { err "Invalid port"; return 1; }
     # Forwarded-port selection happens on the client only; the server just needs a
     # wide-enough allowed range so it never blocks whatever the client asks for.
-    RSTART=1024; REND=65535
+    RSTART=1; REND=65535
 
     read -rp "Token - must match on the client [123]: " TOKEN; TOKEN=${TOKEN:-123}
     [ "$TOKEN" = "123" ] && warn "Using the default token (123) - fine for quick testing, but change it on both sides for anything internet-facing"
@@ -391,7 +391,7 @@ transport.tcpMuxKeepaliveInterval = 30
 transport.heartbeatInterval = 10
 transport.heartbeatTimeout = 30
 transport.poolCount = 10
-transport.tcpKeepalive = 30
+transport.dialServerKeepalive = 30
 transport.dialServerTimeout = 10
 
 loginFailExit = false
