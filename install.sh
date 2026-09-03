@@ -176,15 +176,12 @@ install_server() {
     install_frp_binaries frps
 
     read -rp "Tunnel port - must match on the client [8443]: " P; P=${P:-8443}; is_port "$P" || { err "Invalid port"; return 1; }
-    read -rp "Dashboard port [7500]: " DP; DP=${DP:-7500};  is_port "$DP" || { err "Invalid port"; return 1; }
     # Forwarded-port selection happens on the client only; the server just needs a
     # wide-enough allowed range so it never blocks whatever the client asks for.
     RSTART=1; REND=65535
 
     read -rp "Token - must match on the client [123]: " TOKEN; TOKEN=${TOKEN:-123}
     [ "$TOKEN" = "123" ] && warn "Using the default token (123) - fine for quick testing, but change it on both sides for anything internet-facing"
-    DASH_USER="admin"
-    DASH_PASS=$(openssl rand -hex 8)
     SRV_IP=$(curl -s4 --max-time 6 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 
     cat > "$CONFIG_DIR/frps.toml" <<EOF
@@ -194,11 +191,6 @@ kcpBindPort = ${P}
 
 auth.method = "token"
 auth.token = "${TOKEN}"
-
-webServer.addr = "0.0.0.0"
-webServer.port = ${DP}
-webServer.user = "${DASH_USER}"
-webServer.password = "${DASH_PASS}"
 
 allowPorts = [ { start = ${RSTART}, end = ${REND} } ]
 maxPortsPerClient = 0
@@ -244,7 +236,7 @@ Environment="GOMAXPROCS=$(nproc)"
 WantedBy=multi-user.target
 EOF
 
-    open_firewall "${P}/tcp ${P}/udp ${DP}/tcp ${RSTART}-${REND}/tcp ${RSTART}-${REND}/udp"
+    open_firewall "${P}/tcp ${P}/udp ${RSTART}-${REND}/tcp ${RSTART}-${REND}/udp"
 
     systemctl daemon-reload
     systemctl enable frps >/dev/null 2>&1
@@ -255,7 +247,6 @@ EOF
 Server IP   : ${SRV_IP}
 FRP Port    : ${P} (tcp/kcp)
 Token       : ${TOKEN}
-Dashboard   : http://${SRV_IP}:${DP}  (${DASH_USER} / ${DASH_PASS})
 EOF
 
     echo ""
@@ -264,11 +255,9 @@ EOF
         echo -e "${GREEN}| Server IP : ${SRV_IP}${NC}"
         echo -e "${GREEN}| FRP Port  : ${P} (tcp/kcp)${NC}"
         echo -e "${YELLOW}| TOKEN     : ${TOKEN}${NC}"
-        echo -e "${GREEN}| Dashboard : http://${SRV_IP}:${DP}${NC}"
-        echo -e "${GREEN}|             user=${DASH_USER}  pass=${DASH_PASS}${NC}"
         echo -e "${GREEN}| (saved to ${CONFIG_DIR}/server-info.txt)${NC}"
         echo -e "${GREEN}+-----------------------------------------------------+${NC}"
-        warn "Next step: on the client machine -> option 2, then 4, then 5"
+        warn "Next step: on the client machine -> option 2 (this also sets up the watchdog and the image/MTU fix automatically)"
     else
         err "frps failed to start:"; journalctl -u frps --no-pager -n 15
     fi
@@ -319,6 +308,8 @@ proxy_count() {
 #==============================================================
 #  Option 2 - Install FRP CLIENT (frpc) - run on the internal
 #             server that has the local service(s) to expose
+#             (also auto-installs the watchdog + the MSS/MTU
+#             fix that prevents pages/images from loading half-way)
 #==============================================================
 install_client() {
     echo ""
@@ -378,6 +369,9 @@ install_client() {
     [ ${#MAPPINGS[@]} -eq 0 ] && { err "At least one valid port is required"; return 1; }
 
     # ---------- Main config ----------
+    # Kept lean and low-latency on purpose: tcpMux reuses one connection for all
+    # proxies, poolCount keeps a few warm connections ready, and the heartbeat is
+    # short enough that a dead link is noticed in seconds, not minutes.
     cat > "$CONFIG_DIR/frpc.toml" <<EOF
 serverAddr = "${SERVER_IP}"
 serverPort = ${P}
@@ -387,12 +381,12 @@ auth.token = "${TOKEN}"
 
 transport.protocol = "${TP}"
 transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 30
-transport.heartbeatInterval = 10
-transport.heartbeatTimeout = 30
+transport.tcpMuxKeepaliveInterval = 20
+transport.heartbeatInterval = 8
+transport.heartbeatTimeout = 24
 transport.poolCount = 10
-transport.dialServerKeepalive = 30
-transport.dialServerTimeout = 10
+transport.dialServerKeepalive = 20
+transport.dialServerTimeout = 8
 
 loginFailExit = false
 
@@ -474,7 +468,22 @@ EOF
         LP=${m%%:*}; rest=${m#*:}; RP=${rest%%:*}; PP=${rest#*:}
         echo -e "  local ${LP} -> remote ${RP} (${PP})"
     done
-    warn "Next: option 4 (watchdog) and option 5 (Google/QUIC fix - run it here, since this machine has the internet egress)"
+
+    # ---------- Auto MSS/MTU fix (prevents pages/images loading half-way over the tunnel) ----------
+    echo ""
+    msg "Applying MSS clamp + QUIC fix so pages/images don't load half-way through the tunnel..."
+    ensure_fix_rules
+    "$SCRIPTS_DIR/apply-fix-rules.sh"
+    msg "Auto-detecting optimal MTU against ${SERVER_IP}..."
+    detect_and_apply_mtu "$SERVER_IP"
+
+    # ---------- Auto watchdog ----------
+    echo ""
+    msg "Installing the watchdog so the tunnel self-heals on any error..."
+    install_watchdog
+
+    echo ""
+    msg "Client setup complete: tunnel + image/MTU fix + watchdog are all active."
 }
 
 #==============================================================
@@ -538,6 +547,11 @@ add_mapping() {
 
 #==============================================================
 #  Option 4 - Smart watchdog
+#  Watches the frpc process, the TCP link to frps, and the frpc
+#  log for errors. On any failure it repairs the network (dead
+#  sockets / ARP / sysctl / MSS-MTU fix rules) and, if that alone
+#  doesn't restore the connection, restarts frpc - fully automatic,
+#  no manual action needed.
 #==============================================================
 install_watchdog() {
     [ -f "$CONFIG_DIR/frpc.toml" ] || { err "Run option 2 (install client) first"; return 1; }
@@ -546,20 +560,22 @@ install_watchdog() {
 
     cat > "$SCRIPTS_DIR/frp-watchdog.sh" <<'WEOF'
 #!/bin/bash
-# ============ Smart FRP Watchdog v4.1 ============
-# Checks every 5s | acts after 2 consecutive failures (10s) | cooldown to avoid restart loops
+# ============ Smart FRP Watchdog v4.2 ============
+# Checks every 3s | acts after 2 consecutive failures (6s) | cooldown to avoid restart loops
 LOG_DIR="/var/log/frp"
+SCRIPTS_DIR="/opt/frp/scripts"
 WATCHDOG_LOG="$LOG_DIR/watchdog.log"
 CONFIG="/etc/frp/frpc.toml"
 
 SERVER_ADDR=$(grep -oP '^\s*serverAddr\s*=\s*"\K[^"]+' "$CONFIG" 2>/dev/null)
 SERVER_PORT=$(grep -oP '^\s*serverPort\s*=\s*\K[0-9]+' "$CONFIG" 2>/dev/null)
 
-CHECK_INTERVAL=5
+CHECK_INTERVAL=3
 FAIL_THRESHOLD=2
-RESTART_COOLDOWN=30
+RESTART_COOLDOWN=20
 fail_count=0
 last_restart=0
+last_fixrules=0
 total_restarts=0
 cycle=0
 
@@ -587,6 +603,19 @@ log_ok(){
 
 mem_kb(){ ps -C frpc -o rss= 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
 
+# Re-applies the MSS clamp / QUIC-block / MTU rules - these are what stop
+# pages and images from loading half-way, and can silently drop after network
+# changes (interface reset, DHCP renew, VPN toggling, etc.)
+reapply_fix_rules(){
+    now=$(date +%s)
+    [ $((now - last_fixrules)) -lt 60 ] && return 0
+    if [ -x "$SCRIPTS_DIR/apply-fix-rules.sh" ]; then
+        "$SCRIPTS_DIR/apply-fix-rules.sh" >/dev/null 2>&1
+        last_fixrules=$now
+        log "INFO: re-applied MSS/QUIC/MTU fix rules"
+    fi
+}
+
 restart_frpc(){
     now=$(date +%s)
     if [ $((now - last_restart)) -lt $RESTART_COOLDOWN ]; then
@@ -613,14 +642,16 @@ restart_frpc(){
 }
 
 net_repair(){
-    log "ACTION: repairing network (dead sockets / ARP / sysctl)"
+    log "ACTION: repairing network (dead sockets / ARP / sysctl / fix-rules)"
     ss -K dst "$SERVER_ADDR" 2>/dev/null
     ip neigh flush "$SERVER_ADDR" 2>/dev/null
     sysctl -p /etc/sysctl.d/99-frp-tuning.conf >/dev/null 2>&1
+    reapply_fix_rules
 }
 
 log "==================================================="
 log "START watchdog -> server=$SERVER_ADDR:$SERVER_PORT interval=${CHECK_INTERVAL}s threshold=$FAIL_THRESHOLD"
+reapply_fix_rules
 
 while true; do
     sleep "$CHECK_INTERVAL"
@@ -651,7 +682,11 @@ while true; do
     if ! log_ok; then
         fail_count=$((fail_count+1))
         log "WARN: frpc log shows an error ($fail_count/$FAIL_THRESHOLD)"
-        [ $fail_count -ge $FAIL_THRESHOLD ] && restart_frpc
+        if [ $fail_count -ge $FAIL_THRESHOLD ]; then
+            net_repair
+            restart_frpc
+            fail_count=0
+        fi
         continue
     fi
 
@@ -660,14 +695,19 @@ while true; do
         fail_count=0
     fi
 
-    # --- 4) Every 60s: direct ICMP ping + memory check ---
-    if [ $((cycle % 12)) -eq 0 ]; then
+    # --- 4) Every ~60s: direct ICMP ping, memory check, and make sure the
+    #        fix-rules (MSS/QUIC/MTU) are still in place ---
+    if [ $((cycle % 20)) -eq 0 ]; then
         lat=$(ping -c1 -W2 "$SERVER_ADDR" 2>/dev/null | grep -o 'time=[0-9.]*' | head -1 | cut -d= -f2 | cut -d. -f1)
         [ -n "$lat" ] && log "INFO: direct ping ${lat}ms"
         m=$(mem_kb)
         if [ "$m" -gt 524288 ]; then
             log "WARN: frpc memory usage high ($((m/1024))MB) -> restarting"
             restart_frpc
+        fi
+        if ! iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            log "WARN: MSS-clamp rule missing -> re-applying fix rules"
+            reapply_fix_rules
         fi
     fi
 done
@@ -696,7 +736,7 @@ EOF
     systemctl restart frp-watchdog
 
     if systemctl is-active --quiet frp-watchdog; then
-        msg "Watchdog is active (checks every 5s - acts after 10s - 30s cooldown)"
+        msg "Watchdog is active (checks every 3s - acts after 6s - 20s cooldown, self-heals automatically)"
     else
         err "Watchdog failed to start:"; journalctl -u frp-watchdog --no-pager -n 10
     fi
@@ -704,6 +744,9 @@ EOF
 
 #==============================================================
 #  Option 5 and 6 - Google/QUIC fix + MTU
+#  (also applied automatically at the end of option 2, and kept
+#   in place by the watchdog - these menu items are for manually
+#   re-running them if you ever need to)
 #==============================================================
 ensure_fix_rules() {
     cat > "$SCRIPTS_DIR/apply-fix-rules.sh" <<'FEOF'
@@ -714,13 +757,15 @@ ip6tables -C OUTPUT  -p udp --dport 443 -j REJECT 2>/dev/null || ip6tables -I OU
 iptables  -C FORWARD -p udp --dport 443 -j REJECT 2>/dev/null || iptables  -I FORWARD 1 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
 ip6tables -C FORWARD -p udp --dport 443 -j REJECT 2>/dev/null || ip6tables -I FORWARD 1 -p udp --dport 443 -j REJECT --reject-with icmp6-port-unreachable
 
-# MSS clamp - fixes half-loaded pages / hangs on heavy content
+# MSS clamp - this is the main fix for pages/images loading half-way over the
+# tunnel: without it, packets larger than the tunnel's real MTU get silently
+# dropped instead of fragmented, so downloads stall partway through.
 iptables  -t mangle -C OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables  -t mangle -A OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 iptables  -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables  -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ip6tables -t mangle -C OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -t mangle -A OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ip6tables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# Apply the saved MTU from the optimizer menu
+# Apply the saved MTU from the optimizer menu (or auto-detected on install)
 MTU_FILE=/etc/frp/mtu.conf
 if [ -f "$MTU_FILE" ]; then
     MTU=$(cat "$MTU_FILE")
@@ -765,11 +810,12 @@ google_fix() {
     warn "If DNS is still an issue: in your outbound app settings, set DNS to tcp://8.8.8.8"
 }
 
-mtu_opt() {
-    read -rp "IP to test MTU against (the frps server IP): " TIP
+# Shared MTU auto-detect (binary search), used both by the manual menu option
+# and automatically at the end of client install.
+detect_and_apply_mtu() {
+    local TIP="$1"
     [ -z "$TIP" ] && { err "IP is required"; return 1; }
 
-    msg "Auto-detecting the optimal MTU (binary search)..."
     low=500; high=1500; optimal=1500
     while [ $((high - low)) -gt 1 ]; do
         mid=$(( (low + high) / 2 ))
@@ -784,10 +830,16 @@ mtu_opt() {
 
     mkdir -p "$CONFIG_DIR"
     echo "$optimal" > "$CONFIG_DIR/mtu.conf"
-    install_deps
     ensure_fix_rules
     "$SCRIPTS_DIR/apply-fix-rules.sh"
-    msg "Best MTU: $optimal -> applied to all interfaces (persistent - re-applied automatically after reboot)"
+    msg "Best MTU: $optimal -> applied to all interfaces (persistent - re-applied automatically after reboot and by the watchdog)"
+}
+
+mtu_opt() {
+    read -rp "IP to test MTU against (the frps server IP): " TIP
+    install_deps
+    msg "Auto-detecting the optimal MTU (binary search)..."
+    detect_and_apply_mtu "$TIP"
 }
 
 #==============================================================
@@ -933,12 +985,13 @@ uninstall() {
 show_menu() {
     clear
     echo -e "${CYAN}+====================================================+${NC}"
-    echo -e "${CYAN}|          FRP TUNNEL MANAGER v4.1 (TCP/UDP)         |${NC}"
+    echo -e "${CYAN}|          FRP TUNNEL MANAGER v4.2 (TCP/UDP)         |${NC}"
     echo -e "${CYAN}+====================================================+${NC}"
     echo -e "${CYAN}|${NC}  1) Install FRP Server (frps)   - exposed server  ${CYAN}|${NC}"
     echo -e "${CYAN}|${NC}  2) Install FRP Client (frpc)   - internal server ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}     (auto-installs watchdog + image/MTU fix)      ${CYAN}|${NC}"
     echo -e "${CYAN}|${NC}  3) Add new port mapping (client)                 ${CYAN}|${NC}"
-    echo -e "${CYAN}|${NC}  4) Smart watchdog                                ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC}  4) Reinstall/repair watchdog                     ${CYAN}|${NC}"
     echo -e "${CYAN}|${NC}  5) Google/QUIC fix (block QUIC + MSS clamp)      ${CYAN}|${NC}"
     echo -e "${CYAN}|${NC}  6) MTU optimizer                                 ${CYAN}|${NC}"
     echo -e "${CYAN}|${NC}  7) Status                                        ${CYAN}|${NC}"
