@@ -17,14 +17,16 @@
 #   - the old "kill -10 the process every 3 hours via cron" trick is removed
 #     entirely -> replaced with a real watchdog that only restarts the tunnel when
 #     it actually detects a problem.
-#   - downloaded binaries are no longer trusted blindly; the script verifies it
-#     actually received an ELF binary before installing it (a failed download that
-#     silently saved an HTML error page used to cause a very confusing crash loop).
+#   - downloaded binaries are no longer trusted blindly: they're pulled from the
+#     official fatedier/frp GitHub release (pinned to v0.58.1) and checked against
+#     the sha256 checksums fatedier publishes for that release before being
+#     installed - previously they came from a personal IP host / personal GitHub
+#     repo with no way to verify them at all.
 #   - added: status option, one-click full uninstall, automatic watchdog install.
 #   - added: kernel-level TCP tuning (BBR congestion control + fq qdisc + larger
-#     buffers) on both ends, applied during install and reverted on uninstall,
-#     to fix slow throughput on the long/lossy Iran<->abroad path while staying
-#     on plain TCP (no protocol switch).
+#     buffers + tcp_no_metrics_save) on both ends, applied during install and
+#     reverted on uninstall, to fix slow throughput on the long/lossy Iran<->abroad
+#     path while staying on plain TCP (no protocol switch).
 #
 # Left intentionally unchanged: the Go-template port-range mechanism
 # (parseNumberRangePair) and the fixed "server-3090" / "client-3090" instance
@@ -33,6 +35,12 @@
 set -uo pipefail
 
 BASE_DIR="/root/frp"
+
+# Pinned frp release - official GitHub build, checksums copied from fatedier's
+# own frp_sha256_checksums.txt for this release (verified before every install).
+FRP_VERSION="0.58.1"
+FRP_SHA256_LINUX_AMD64="5bd9f8860b580ed9c42eed1c99dfaa03b196d0f68007dca088f6c098d498430d"
+FRP_SHA256_LINUX_ARM64="25a77f4d7f4c5efeeaa89ed65b951a19014e79baac1efcbd57f0598b3ba95fd7"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,15 +63,68 @@ gen_secret() {
     fi
 }
 
-verify_binary() {
-    # Makes sure curl didn't just save an HTML error page or an empty file.
-    local path="$1"
-    if [[ ! -s "$path" ]]; then
+detect_frp_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "linux_amd64" ;;
+        aarch64|arm64) echo "linux_arm64" ;;
+        *) echo "" ;;
+    esac
+}
+
+download_frp() {
+    # Installs a checksum-verified official binary ($1 = "frps" or "frpc") to
+    # /usr/local/bin/$1. Refuses to install anything that doesn't match the
+    # official sha256 for the pinned version - no more trusting bytes blindly.
+    local bin_name="$1" arch expected_sha tarball url tmp_dir actual_sha extracted
+
+    arch=$(detect_frp_arch)
+    if [[ -z "$arch" ]]; then
+        echo "ERROR: unsupported CPU architecture ($(uname -m)). This script only"
+        echo "       ships checksums for linux_amd64 and linux_arm64."
         return 1
     fi
-    local magic
-    magic=$(head -c4 "$path" 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    [[ "$magic" == "7f454c46" ]]
+
+    case "$arch" in
+        linux_amd64) expected_sha="$FRP_SHA256_LINUX_AMD64" ;;
+        linux_arm64) expected_sha="$FRP_SHA256_LINUX_ARM64" ;;
+    esac
+
+    tarball="frp_${FRP_VERSION}_${arch}.tar.gz"
+    url="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${tarball}"
+    tmp_dir=$(mktemp -d)
+
+    echo "Downloading official frp v${FRP_VERSION} (${arch})..."
+    if ! curl -fL --retry 3 --retry-delay 2 -o "$tmp_dir/$tarball" "$url"; then
+        echo "ERROR: download failed."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    actual_sha=$(sha256sum "$tmp_dir/$tarball" | awk '{print $1}')
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        echo "ERROR: checksum mismatch for $tarball - refusing to install."
+        echo "  expected: $expected_sha"
+        echo "  got:      $actual_sha"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    if ! tar -xzf "$tmp_dir/$tarball" -C "$tmp_dir"; then
+        echo "ERROR: failed to extract $tarball"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    extracted="$tmp_dir/frp_${FRP_VERSION}_${arch}/${bin_name}"
+    if [[ ! -f "$extracted" ]]; then
+        echo "ERROR: $bin_name not found inside the release archive."
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    install -m 755 "$extracted" "/usr/local/bin/${bin_name}"
+    rm -rf "$tmp_dir"
+    echo "  OK: sha256 verified, installed /usr/local/bin/${bin_name} (v${FRP_VERSION})"
 }
 
 port_listening() {
@@ -118,6 +179,12 @@ net.ipv4.tcp_mtu_probing = 1
 
 # Don't reset the congestion window after brief idle periods (bursty VPN traffic)
 net.ipv4.tcp_slow_start_after_idle = 0
+
+# Don't let the kernel cache a bad RTT/cwnd estimate from one lossy connection
+# and apply it to future connections to the same peer (frps<->frpc reconnects
+# a lot - this "learned pessimism" would otherwise throttle every reconnect).
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_window_scaling = 1
 EOF
         if [[ ! -f /etc/modules-load.d/frp-bbr.conf ]]; then
             echo "tcp_bbr" > /etc/modules-load.d/frp-bbr.conf
@@ -281,18 +348,9 @@ install_server() {
 
     tune_tcp_stack
 
-    echo "Downloading frps..."
-    if ! curl -fL --retry 3 --retry-delay 2 -o /usr/local/bin/frps http://81.12.32.210/downloads/frps; then
-        echo "ERROR: download failed. Check your network / the download URL and try again."
+    if ! download_frp frps; then
         return 1
     fi
-    if ! verify_binary /usr/local/bin/frps; then
-        echo "ERROR: the downloaded file does not look like a valid binary (the server may"
-        echo "       have returned an error page instead of the frps executable). Aborting."
-        rm -f /usr/local/bin/frps
-        return 1
-    fi
-    chmod +x /usr/local/bin/frps
 
     local token admin_pass
     token=$(gen_secret)
@@ -388,17 +446,9 @@ install_client() {
 
     tune_tcp_stack
 
-    echo "Downloading frpc..."
-    if ! curl -fL --retry 3 --retry-delay 2 -o /usr/local/bin/frpc https://raw.githubusercontent.com/lostsoul6/frp-file/refs/heads/main/frpc; then
-        echo "ERROR: download failed."
+    if ! download_frp frpc; then
         return 1
     fi
-    if ! verify_binary /usr/local/bin/frpc; then
-        echo "ERROR: the downloaded file does not look like a valid binary. Aborting."
-        rm -f /usr/local/bin/frpc
-        return 1
-    fi
-    chmod +x /usr/local/bin/frpc
 
     local server_addr ports token
 
