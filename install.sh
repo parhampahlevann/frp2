@@ -1,18 +1,19 @@
 #!/bin/bash
 
-# FRP Reverse Tunnel Manager - Fixed & Ultra-Tuned Version
-# Compatible with Ubuntu/Debian/CentOS (amd64 / arm64)
+# FRP Reverse Tunnel Manager - Auto-Configured (Token=123)
+# Tuned for high speed, low latency, and stable connection
 
 set -uo pipefail
 
 BASE_DIR="/root/frp"
+DEFAULT_TOKEN="123"
 FRP_VERSION="0.58.1"
 FRP_SHA256_LINUX_AMD64="5bd9f8860b580ed9c42eed1c99dfaa03b196d0f68007dca088f6c098d498430d"
 FRP_SHA256_LINUX_ARM64="25a77f4d7f4c5efeeaa89ed65b951a19014e79baac1efcbd57f0598b3ba95fd7"
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo "ERROR: This script must be run as root (use sudo)." >&2
+        echo "ERROR: This script must be run as root." >&2
         exit 1
     fi
 }
@@ -31,16 +32,6 @@ install_deps() {
         elif command -v yum >/dev/null 2>&1; then
             yum install -y "${missing[@]}" >/dev/null 2>&1 || true
         fi
-    fi
-}
-
-gen_secret() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex 16
-    elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-        tr -d '-' < /proc/sys/kernel/random/uuid
-    else
-        date +%s%N | sha256sum | head -c32
     fi
 }
 
@@ -78,7 +69,7 @@ download_frp() {
 
     actual_sha=$(sha256sum "$tmp_dir/$tarball" | awk '{print $1}')
     if [[ "$actual_sha" != "$expected_sha" ]]; then
-        echo "ERROR: Checksum verification failed. Binary may be corrupted."
+        echo "ERROR: Checksum mismatch. Download corrupted."
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -86,7 +77,7 @@ download_frp() {
     tar -xzf "$tmp_dir/$tarball" -C "$tmp_dir"
     extracted="$tmp_dir/frp_${FRP_VERSION}_${arch}/${bin_name}"
     if [[ ! -f "$extracted" ]]; then
-        echo "ERROR: Target binary ${bin_name} not found in archive."
+        echo "ERROR: Binary not found in extracted archive."
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -134,7 +125,7 @@ remove_tcp_mss_clamping() {
 }
 
 tune_tcp_stack() {
-    echo "Applying Linux kernel TCP optimizations (BBR, Queue Disciplines & Buffer Sizes)..."
+    echo "Optimizing kernel network stack for high-throughput TCP..."
     modprobe tcp_bbr 2>/dev/null || true
 
     cat > /etc/sysctl.d/99-frp-tuning.conf <<'EOF'
@@ -275,10 +266,6 @@ install_server() {
     tune_tcp_stack
     download_frp frps || return 1
 
-    local token admin_pass
-    token=$(gen_secret)
-    admin_pass=$(gen_secret)
-
     cat > "$BASE_DIR/server/server-3090.toml" <<EOF
 bindAddr = "0.0.0.0"
 bindPort = 3090
@@ -291,12 +278,12 @@ transport.maxPoolCount = 100
 transport.tls.force = true
 
 auth.method = "token"
-auth.token = "$token"
+auth.token = "${DEFAULT_TOKEN}"
 
 webServer.addr = "127.0.0.1"
 webServer.port = 7500
 webServer.user = "admin"
-webServer.password = "$admin_pass"
+webServer.password = "admin123"
 
 log.level = "error"
 EOF
@@ -329,7 +316,7 @@ EOF
     cat > "$BASE_DIR/server/meta.env" <<EOF
 PORT=3090
 INSTANCE=server-3090
-TOKEN=$token
+TOKEN=${DEFAULT_TOKEN}
 EOF
     chmod 600 "$BASE_DIR/server/meta.env"
 
@@ -339,7 +326,7 @@ EOF
     sleep 2
 
     if ! systemctl is-active --quiet frps@server-3090.service; then
-        echo "ERROR: frps failed to start. Last logs:"
+        echo "ERROR: frps failed to start. Logs:"
         journalctl -u frps@server-3090.service -n 15 --no-pager
         return 1
     fi
@@ -351,9 +338,7 @@ EOF
     echo
     echo "=================================================="
     echo " FRP Server is RUNNING on port 3090"
-    echo " TOKEN (Save this for your Kharej Client):"
-    echo
-    echo "    $token"
+    echo " Default Token applied: ${DEFAULT_TOKEN}"
     echo "=================================================="
 }
 
@@ -365,31 +350,44 @@ install_client() {
     tune_tcp_stack
     download_frp frpc || return 1
 
-    local server_addr ports token
-    read -p "Enter Iran Server IP (IPv4 or IPv6): " server_addr
+    local server_addr ports
+    read -p "Enter Iran Server IP (e.g. 185.97.116.105): " server_addr
     while [[ -z "$server_addr" ]]; do
         read -p "Server IP cannot be empty: " server_addr
     done
 
-    read -p "Enter Server Token: " token
-    while [[ -z "$token" ]]; do
-        read -p "Token cannot be empty: " token
-    done
+    echo "Using default token: ${DEFAULT_TOKEN}"
 
-    read -p "Enter Inbound Forward Ports (e.g. 8080 or 6000-6005,8443) [default: 8080]: " ports
+    read -p "Enter ports to forward (comma-separated, e.g. 443,2053,23902,8080): " ports
     ports=${ports:-8080}
 
-    local admin_pass
-    admin_pass=$(gen_secret)
+    # Parse and validate ports natively to prevent TOML crashes
+    local IFS=','
+    read -ra port_list <<< "$ports"
+    local valid_ports=()
 
-    # Note: Using escaped \$_ and \$v so Bash does not evaluate Go template parameters!
+    for p in "${port_list[@]}"; do
+        p=$(echo "$p" | tr -d '[:space:]')
+        if [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
+            valid_ports+=("$p")
+        else
+            echo "WARNING: Ignoring invalid port '$p' (must be between 1 and 65535)."
+        fi
+    done
+
+    if [[ ${#valid_ports[@]} -eq 0 ]]; then
+        echo "ERROR: No valid ports entered. Setting default port 8080."
+        valid_ports=(8080)
+    fi
+
+    # Generate frpc.toml base config
     cat > "$BASE_DIR/client/client-3090.toml" <<EOF
 serverAddr = "$server_addr"
 serverPort = 3090
 loginFailExit = false
 
 auth.method = "token"
-auth.token = "$token"
+auth.token = "${DEFAULT_TOKEN}"
 
 transport.protocol = "tcp"
 transport.tcpMux = true
@@ -404,25 +402,25 @@ transport.tls.enable = true
 webServer.addr = "127.0.0.1"
 webServer.port = 7400
 webServer.user = "admin"
-webServer.password = "$admin_pass"
+webServer.password = "admin123"
 
 log.level = "error"
+EOF
 
-{{- range \$_, \$v := parseNumberRangePair "$ports" "$ports" }}
+    # Dynamically inject each proxy block
+    for p in "${valid_ports[@]}"; do
+        cat >> "$BASE_DIR/client/client-3090.toml" <<EOF
+
 [[proxies]]
-name = "tcp-{{ \$v.First }}"
+name = "tcp-${p}"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = {{ \$v.First }}
-remotePort = {{ \$v.Second }}
+localPort = ${p}
+remotePort = ${p}
 transport.useEncryption = true
 transport.useCompression = true
-healthCheck.type = "tcp"
-healthCheck.timeoutSeconds = 2
-healthCheck.maxFailed = 3
-healthCheck.intervalSeconds = 10
-{{- end }}
 EOF
+    done
     chmod 600 "$BASE_DIR/client/client-3090.toml"
 
     cat > /etc/systemd/system/frpc@.service <<'EOF'
@@ -449,12 +447,14 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    # meta.env is written BEFORE starting systemd so watchdog and status find it immediately
+    local clean_ports_str
+    clean_ports_str=$(IFS=,; echo "${valid_ports[*]}")
+
     cat > "$BASE_DIR/client/meta.env" <<EOF
 INSTANCE=client-3090
 SERVER_ADDR=$server_addr
 SERVER_PORT=3090
-PORTS="$ports"
+PORTS="$clean_ports_str"
 EOF
     chmod 600 "$BASE_DIR/client/meta.env"
 
@@ -464,7 +464,7 @@ EOF
     sleep 2
 
     if ! systemctl is-active --quiet frpc@client-3090.service; then
-        echo "ERROR: frpc failed to launch. Checking configuration and logs:"
+        echo "ERROR: frpc failed to launch. Checking syntax and logs:"
         /usr/local/bin/frpc verify -c "$BASE_DIR/client/client-3090.toml" || true
         journalctl -u frpc@client-3090.service -n 25 --no-pager
         return 1
@@ -475,9 +475,10 @@ EOF
 
     echo
     echo "=================================================="
-    echo " FRP Client is RUNNING and connected to Iran."
+    echo " FRP Client is ONLINE and connected to Iran."
     echo " Target Server: $server_addr:3090"
-    echo " Forwarded Port(s): $ports"
+    echo " Forwarded Port(s): $clean_ports_str"
+    echo " Default Token: ${DEFAULT_TOKEN}"
     echo "=================================================="
 }
 
