@@ -21,6 +21,10 @@
 #     actually received an ELF binary before installing it (a failed download that
 #     silently saved an HTML error page used to cause a very confusing crash loop).
 #   - added: status option, one-click full uninstall, automatic watchdog install.
+#   - added: kernel-level TCP tuning (BBR congestion control + fq qdisc + larger
+#     buffers) on both ends, applied during install and reverted on uninstall,
+#     to fix slow throughput on the long/lossy Iran<->abroad path while staying
+#     on plain TCP (no protocol switch).
 #
 # Left intentionally unchanged: the Go-template port-range mechanism
 # (parseNumberRangePair) and the fixed "server-3090" / "client-3090" instance
@@ -83,6 +87,56 @@ open_firewall_tcp_port() {
 press_enter() {
     echo
     read -p "Press Enter to continue..." _
+}
+
+tune_tcp_stack() {
+    # frp rides entirely on the OS TCP stack - it has no congestion control of
+    # its own - so the only real way to fix "TCP is slow" on a long/lossy link
+    # is to fix it at the kernel level. This is system-wide, not tunnel-only.
+    echo "Tuning the kernel TCP stack (BBR + larger buffers) for a long, lossy link..."
+
+    modprobe tcp_bbr 2>/dev/null
+
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        cat > /etc/sysctl.d/99-frp-tcp-tuning.conf <<'EOF'
+# TCP tuning for a tunnel over a long, sometimes lossy international link.
+# BBR estimates real bandwidth/RTT instead of slamming the brakes on every
+# packet loss the way the default Cubic algorithm does - it matters a lot when
+# loss comes from interference/DPI rather than a genuinely full pipe.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# Bigger buffers so a single TCP connection can fill a high-latency path
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.core.netdev_max_backlog = 5000
+
+# Avoid stalls caused by black-holed Path MTU Discovery
+net.ipv4.tcp_mtu_probing = 1
+
+# Don't reset the congestion window after brief idle periods (bursty VPN traffic)
+net.ipv4.tcp_slow_start_after_idle = 0
+EOF
+        if [[ ! -f /etc/modules-load.d/frp-bbr.conf ]]; then
+            echo "tcp_bbr" > /etc/modules-load.d/frp-bbr.conf
+        fi
+
+        sysctl --system >/dev/null 2>&1
+
+        if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
+            echo "  OK: BBR is active."
+        else
+            echo "  Warning: wrote BBR settings but they did not take effect. Some VPS"
+            echo "  hosts (e.g. OpenVZ containers) don't allow guests to change kernel"
+            echo "  sysctls - if that's the case here, this step is skipped harmlessly"
+            echo "  and TCP keeps using whatever the host already uses."
+        fi
+    else
+        echo "  Skipping: the tcp_bbr module isn't available on this kernel (need Linux"
+        echo "  4.9+). TCP will keep using the current congestion control algorithm."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -225,6 +279,8 @@ install_server() {
 
     mkdir -p "$BASE_DIR/server"
 
+    tune_tcp_stack
+
     echo "Downloading frps..."
     if ! curl -fL --retry 3 --retry-delay 2 -o /usr/local/bin/frps http://81.12.32.210/downloads/frps; then
         echo "ERROR: download failed. Check your network / the download URL and try again."
@@ -329,6 +385,8 @@ install_client() {
     echo "=== Installing FRP Client (frpc) on Kharej ==="
 
     mkdir -p "$BASE_DIR/client"
+
+    tune_tcp_stack
 
     echo "Downloading frpc..."
     if ! curl -fL --retry 3 --retry-delay 2 -o /usr/local/bin/frpc https://raw.githubusercontent.com/lostsoul6/frp-file/refs/heads/main/frpc; then
@@ -543,6 +601,12 @@ remove_frp() {
 
     rm -rf "$BASE_DIR"
     rm -f /usr/local/bin/frps /usr/local/bin/frpc
+
+    if [[ -f /etc/sysctl.d/99-frp-tcp-tuning.conf ]]; then
+        rm -f /etc/sysctl.d/99-frp-tcp-tuning.conf /etc/modules-load.d/frp-bbr.conf
+        sysctl --system >/dev/null 2>&1
+        echo "TCP tuning reverted."
+    fi
 
     # Clean up crontab entries left by older versions of this script.
     (crontab -l 2>/dev/null | grep -v 'pkill -10') | crontab - 2>/dev/null
