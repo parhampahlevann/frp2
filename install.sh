@@ -1,23 +1,21 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# FRP Reverse Tunnel Manager - TCP Low-Latency Edition
-# Iran (frps) <-> Kharej (frpc)
+# FRP TCP Multi-Path / Adaptive Tunnel Manager
 #
-# Goals:
-#   - FRP 0.71.0, verified against official release SHA256
-#   - TCP transport only, with TCP multiplexing enabled for normal web traffic
-#   - Correct heartbeat / keepalive configuration
-#   - No artificial bandwidth cap and no unnecessary compression
-#   - PMTU-aware TCP MSS handling (optional, reversible)
-#   - systemd supervision + active tunnel watchdog
-#   - configuration verification before every start
-#   - safe firewall rule tagging and clean uninstall
+# Iran (frps) <-> Foreign (frpc)
 #
-# NOTE:
-# No script can guarantee a fixed minimum latency, zero jitter, or unlimited
-# bandwidth. Those are constrained by the physical route, congestion, MTU,
-# kernel, VPS NIC, and provider shaping. This script removes avoidable
-# software-side bottlenecks without pretending to change the Internet path.
+# Modes:
+#   mux    : one TCP control connection with FRP TCP multiplexing
+#   multi  : tcpMux=false + N independent FRP work connections per proxy
+#            (implemented as N load-balanced proxy replicas)
+#
+# IMPORTANT:
+#   "multi" improves aggregate concurrency when the path has loss/BDP issues,
+#   but it cannot make a SINGLE TCP stream exceed TCP's own congestion window.
+#   For one HTTP/2/WebSocket/TCP flow, there is still one end-to-end stream.
+#
+# FRP pinned to 0.71.0. SHA256 values are for official Linux amd64/arm64
+# release archives used by the original script.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -25,196 +23,72 @@ IFS=$'\n\t'
 
 BASE_DIR="/root/frp"
 FRP_VERSION="0.71.0"
-
-# Official release archive SHA256 values for v0.71.0.
 FRP_SHA256_LINUX_AMD64="84f27e39f11169f7adcef8e8b70c9329de17747b1f14dad9fb95eef5682ea716"
 FRP_SHA256_LINUX_ARM64="f33c293c275d8fc68c654b6fba8f10b2551d6463d09a9fc9cffb7227eae82266"
 
-BIND_PORT=3090
-SERVER_INSTANCE="server-3090"
-CLIENT_INSTANCE="client-3090"
-WATCHDOG_INTERVAL=5
-WATCHDOG_FAILURES=2
+FRP_SERVER_PORT="${FRP_SERVER_PORT:-3090}"
+FRP_DASH_PORT="${FRP_DASH_PORT:-7500}"
+FRP_CLIENT_DASH_PORT="${FRP_CLIENT_DASH_PORT:-7400}"
 
-# 1 = install PMTU-aware TCPMSS rules. This is deliberately NOT a hard-coded
-# 1360 MSS. Hard clamping all traffic to 1360 can unnecessarily reduce
-# throughput on a clean 1500-byte path.
-ENABLE_MSS_CLAMP=1
+# Number of independent proxy replicas in multi mode.
+# 4 is a sane starting point; 2-8 is normally enough.
+MULTI_PATHS="${MULTI_PATHS:-4}"
 
-# ------------------------------------------------------------------------------
-# Generic helpers
-# ------------------------------------------------------------------------------
+# 0 = auto-detect PMTU, 1 = conservative 1360 clamp.
+USE_FIXED_MSS="${USE_FIXED_MSS:-0}"
+FIXED_MSS="${FIXED_MSS:-1360}"
+
+# Watchdog timings.
+WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-5}"
+WATCHDOG_FAILURES="${WATCHDOG_FAILURES:-2}"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 check_root() {
-    [[ $EUID -eq 0 ]] || die "Run this script as root."
+    [[ "${EUID}" -eq 0 ]] || die "Run this script as root."
 }
 
-command_exists() {
+need_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
 install_deps() {
     local need=()
-    command_exists curl || need+=(curl)
-    command_exists tar || need+=(tar)
-    command_exists ss || need+=(iproute2)
-    command_exists sha256sum || need+=(coreutils)
-    command_exists iptables || need+=(iptables)
+    need_cmd curl || need+=(curl)
+    need_cmd tar || need+=(tar)
+    need_cmd ss || need+=(iproute2)
+    need_cmd iptables || need+=(iptables)
 
-    if ((${#need[@]} == 0)); then
-        return 0
-    fi
-
-    log "Installing missing dependencies: ${need[*]}"
-    if command_exists apt-get; then
-        apt-get update -qq
-        apt-get install -y -qq "${need[@]}"
-    elif command_exists dnf; then
-        dnf install -y "${need[@]}"
-    elif command_exists yum; then
-        yum install -y "${need[@]}"
-    elif command_exists apk; then
-        apk add --no-cache "${need[@]}"
-    else
-        die "Could not determine a supported package manager."
+    if ((${#need[@]})); then
+        log "Installing: ${need[*]}"
+        if need_cmd apt-get; then
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need[@]}"
+        elif need_cmd dnf; then
+            dnf install -y "${need[@]}"
+        elif need_cmd yum; then
+            yum install -y "${need[@]}"
+        else
+            die "Cannot install dependencies automatically."
+        fi
     fi
 }
 
 gen_secret() {
-    local bytes="${1:-24}"
-    od -An -N "$bytes" -tx1 /dev/urandom | tr -d ' \n'
+    od -An -N"${1:-24}" -tx1 /dev/urandom | tr -d ' \n'
 }
-
-valid_port() {
-    local p="$1"
-    [[ "$p" =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535))
-}
-
-parse_ports_string() {
-    local input="$1" entry start end p
-    local -a entries result=()
-
-    IFS=', ' read -r -a entries <<< "$input"
-
-    for entry in "${entries[@]}"; do
-        entry="${entry//[[:space:]]/}"
-        [[ -z "$entry" ]] && continue
-
-        if [[ "$entry" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            start="${BASH_REMATCH[1]}"
-            end="${BASH_REMATCH[2]}"
-            if ((start >= 1 && end <= 65535 && start <= end)); then
-                for ((p=start; p<=end; p++)); do
-                    result+=("$p")
-                done
-            fi
-        elif valid_port "$entry"; then
-            result+=("$entry")
-        fi
-    done
-
-    if ((${#result[@]})); then
-        printf '%s\n' "${result[@]}" | awk '!seen[$0]++'
-    fi
-}
-
-wait_for_active() {
-    local unit="$1" tries="${2:-20}"
-    local i
-    for ((i=0; i<tries; i++)); do
-        if systemctl is-active --quiet "$unit"; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-tcp_listening() {
-    local port="$1"
-    ss -ltnH 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {found=1} END{exit !found}'
-}
-
-tcp_established_to() {
-    local host="$1" port="$2"
-    # Match destination host/port and ESTABLISHED state. ss may show an IP
-    # instead of the original hostname, so the caller should pass an IP.
-    ss -tnH state established 2>/dev/null |
-        awk -v h="$host" -v p=":$port" '
-            $4 ~ p"$" && $5 ~ ("^" h ":[0-9]+$") {found=1}
-            END {exit !found}
-        '
-}
-
-# ------------------------------------------------------------------------------
-# Firewall
-# ------------------------------------------------------------------------------
-
-FRP_CHAIN="FRP_TUNNEL"
-
-firewall_chain_exists() {
-    iptables -nL "$FRP_CHAIN" >/dev/null 2>&1
-}
-
-open_firewall() {
-    local port="$1"
-    command_exists iptables || return 0
-
-    iptables -N "$FRP_CHAIN" 2>/dev/null || true
-    if ! iptables -C INPUT -p tcp --dport "$port" -j "$FRP_CHAIN" 2>/dev/null; then
-        iptables -I INPUT -p tcp --dport "$port" -j "$FRP_CHAIN"
-    fi
-    if ! iptables -C "$FRP_CHAIN" -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
-        iptables -A "$FRP_CHAIN" -p tcp --dport "$port" -j ACCEPT
-    fi
-
-    # Also handle UFW when active. The iptables chain above remains the
-    # canonical rule used by this script.
-    if command_exists ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-        ufw allow "${port}/tcp" >/dev/null 2>&1 || true
-    fi
-}
-
-close_firewall() {
-    local port="$1"
-    command_exists iptables || return 0
-
-    if command_exists ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-        ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
-    fi
-
-    while iptables -C "$FRP_CHAIN" -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
-        iptables -D "$FRP_CHAIN" -p tcp --dport "$port" -j ACCEPT || break
-    done
-
-    while iptables -C INPUT -p tcp --dport "$port" -j "$FRP_CHAIN" 2>/dev/null; do
-        iptables -D INPUT -p tcp --dport "$port" -j "$FRP_CHAIN" || break
-    done
-
-    if firewall_chain_exists; then
-        # Delete only when empty.
-        iptables -F "$FRP_CHAIN" 2>/dev/null || true
-        iptables -X "$FRP_CHAIN" 2>/dev/null || true
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# Download / verify FRP
-# ------------------------------------------------------------------------------
 
 detect_arch() {
     case "$(uname -m)" in
-        x86_64|amd64) printf '%s\n' "linux_amd64" ;;
-        aarch64|arm64) printf '%s\n' "linux_arm64" ;;
+        x86_64|amd64) printf '%s\n' linux_amd64 ;;
+        aarch64|arm64) printf '%s\n' linux_arm64 ;;
         *) return 1 ;;
     esac
 }
 
 download_frp() {
-    local binary="$1" arch expected tarball url tmp actual extracted
+    local bin="$1" arch tarball url tmp expected actual extracted
     arch="$(detect_arch)" || die "Unsupported architecture: $(uname -m)"
 
     case "$arch" in
@@ -226,126 +100,158 @@ download_frp() {
     url="https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/${tarball}"
     tmp="$(mktemp -d)"
 
-    log "Downloading FRP ${FRP_VERSION} (${arch})..."
-    curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 \
-        -o "$tmp/$tarball" "$url"
-
-    actual="$(sha256sum "$tmp/$tarball" | awk '{print $1}')"
-    [[ "$actual" == "$expected" ]] || {
+    log "Downloading FRP ${FRP_VERSION} (${bin}, ${arch})..."
+    curl -fL --retry 5 --retry-delay 2 --connect-timeout 10 \
+        -o "${tmp}/${tarball}" "$url" || {
         rm -rf "$tmp"
-        die "FRP checksum mismatch. Expected $expected, got $actual"
+        die "FRP download failed."
     }
 
-    tar -xzf "$tmp/$tarball" -C "$tmp"
-    extracted="$tmp/frp_${FRP_VERSION}_${arch}/${binary}"
-    [[ -x "$extracted" || -f "$extracted" ]] ||
-        die "Verified archive does not contain $binary"
+    actual="$(sha256sum "${tmp}/${tarball}" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] || {
+        rm -rf "$tmp"
+        die "SHA256 mismatch for ${tarball}."
+    }
 
-    install -m 0755 "$extracted" "/usr/local/bin/$binary"
+    tar -xzf "${tmp}/${tarball}" -C "$tmp"
+    extracted="${tmp}/frp_${FRP_VERSION}_${arch}/${bin}"
+    [[ -x "$extracted" ]] || {
+        rm -rf "$tmp"
+        die "FRP binary missing from archive."
+    }
+
+    install -m 0755 "$extracted" "/usr/local/bin/${bin}"
     rm -rf "$tmp"
-
-    log "Installed verified /usr/local/bin/$binary"
 }
 
-# ------------------------------------------------------------------------------
-# Kernel tuning
-# ------------------------------------------------------------------------------
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && ((1 <= 10#$1 && 10#$1 <= 65535))
+}
 
-write_sysctl_tuning() {
+parse_ports() {
+    local input="$1" item a b p
+    declare -A seen=()
+    IFS=', ' read -r -a items <<< "$input"
+
+    for item in "${items[@]}"; do
+        item="${item//[[:space:]]/}"
+        [[ -z "$item" ]] && continue
+
+        if [[ "$item" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+            ((10#$a <= 10#$b)) || continue
+            ((10#$a >= 1 && 10#$b <= 65535)) || continue
+            for ((p=10#$a; p<=10#$b; p++)); do
+                seen["$p"]=1
+            done
+        elif valid_port "$item"; then
+            seen["$((10#$item))"]=1
+        fi
+    done
+
+    ((${#seen[@]})) || return 1
+    printf '%s\n' "${!seen[@]}" | sort -n
+}
+
+open_firewall() {
+    local port="$1" proto="$2"
+    if need_cmd ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+        ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+    if need_cmd iptables; then
+        iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null ||
+            iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
+}
+
+close_firewall() {
+    local port="$1" proto="$2"
+    if need_cmd ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
+        ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+    if need_cmd iptables; then
+        while iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; do
+            iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || break
+        done
+    fi
+}
+
+write_tcp_tuning() {
     cat > /etc/sysctl.d/99-frp-tcp-tuning.conf <<'EOF'
-# FRP TCP tuning. These values avoid common software-side stalls without
-# pretending to increase the physical capacity of the route.
-
+# FRP TCP tuning. Values are intentionally conservative and let autotuning
+# determine the actual socket buffer size.
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# Large enough for high-BDP international links; autotuning still controls
-# actual per-socket use.
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 131072 67108864
-net.ipv4.tcp_wmem = 4096 131072 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
 
-# Queue / burst tolerance.
-net.core.netdev_max_backlog = 16384
-
-# Reduce idle latency and avoid retaining old congestion state.
+net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_no_metrics_save = 1
-
-# Faster detection of dead peers. FRP itself also has application-level
-# heartbeat detection.
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 4
-
-# Reuse TIME_WAIT safely for outgoing connections.
-net.ipv4.tcp_tw_reuse = 1
-
-# Allow PMTU probing instead of imposing an arbitrary low MSS.
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_base_mss = 1024
-
-# Full ephemeral range for high concurrency.
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
 net.ipv4.ip_local_port_range = 1024 65535
 
-# Keep SYN/accept queues from becoming an avoidable bottleneck.
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.somaxconn = 8192
+# Avoid artificial application buffering.
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_autocorking = 0
+
+# Do not force TCP Fast Open: middleboxes can make it less reliable.
+net.ipv4.tcp_fastopen = 0
 EOF
 
-    mkdir -p /etc/modules-load.d
-    if ! grep -qx 'tcp_bbr' /etc/modules-load.d/frp-bbr.conf 2>/dev/null; then
-        printf '%s\n' tcp_bbr > /etc/modules-load.d/frp-bbr.conf
-    fi
-
     modprobe tcp_bbr 2>/dev/null || true
+    printf '%s\n' tcp_bbr > /etc/modules-load.d/frp-bbr.conf 2>/dev/null || true
     sysctl --system >/dev/null 2>&1 || true
 
-    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" != "bbr" ]]; then
-        log "WARNING: BBR is not available on this kernel; keeping the kernel's available congestion control."
+    if need_cmd iptables; then
+        # Remove our older fixed-MSS rule if present.
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss "$FIXED_MSS" 2>/dev/null || true
+
+        if [[ "$USE_FIXED_MSS" == "1" ]]; then
+            iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+                -j TCPMSS --set-mss "$FIXED_MSS" 2>/dev/null ||
+                iptables -t mangle -I POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+                    -j TCPMSS --set-mss "$FIXED_MSS" 2>/dev/null || true
+        else
+            # Let Linux calculate the proper MSS from PMTU instead of imposing
+            # a permanently low 1360-byte MSS.
+            iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+                -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null ||
+                iptables -t mangle -I POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+                    -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        fi
     fi
 }
 
-remove_sysctl_tuning() {
+remove_tcp_tuning() {
+    if need_cmd iptables; then
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --set-mss "$FIXED_MSS" 2>/dev/null || true
+    fi
     rm -f /etc/sysctl.d/99-frp-tcp-tuning.conf /etc/modules-load.d/frp-bbr.conf
     sysctl --system >/dev/null 2>&1 || true
 }
 
-# ------------------------------------------------------------------------------
-# PMTU-aware MSS
-# ------------------------------------------------------------------------------
-
-apply_mss_clamp() {
-    ((ENABLE_MSS_CLAMP == 1)) || return 0
-    command_exists iptables || return 0
-
-    # --clamp-mss-to-pmtu follows the route instead of forcing every path to
-    # MSS 1360. This is substantially safer for throughput.
-    iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-        -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-    iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-        -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-}
-
-remove_mss_clamp() {
-    command_exists iptables || return 0
-    while iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-        -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do
-        iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --clamp-mss-to-pmtu || break
+wait_active() {
+    local unit="$1" timeout="${2:-20}" i
+    for ((i=0; i<timeout; i++)); do
+        systemctl is-active --quiet "$unit" && return 0
+        sleep 1
     done
+    return 1
 }
 
-# ------------------------------------------------------------------------------
-# systemd units
-# ------------------------------------------------------------------------------
-
-write_systemd_units() {
+install_units() {
     cat > /etc/systemd/system/frps@.service <<'EOF'
 [Unit]
 Description=FRP Server (%i)
-Documentation=https://gofrp.org/
 After=network-online.target
 Wants=network-online.target
 
@@ -353,13 +259,11 @@ Wants=network-online.target
 Type=simple
 User=root
 ExecStart=/usr/local/bin/frps -c /root/frp/server/%i.toml
-ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
-RestartSec=2s
+RestartSec=2
 StartLimitIntervalSec=0
 LimitNOFILE=1048576
-LimitNPROC=65536
-TasksMax=infinity
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -368,7 +272,6 @@ EOF
     cat > /etc/systemd/system/frpc@.service <<'EOF'
 [Unit]
 Description=FRP Client (%i)
-Documentation=https://gofrp.org/
 After=network-online.target
 Wants=network-online.target
 
@@ -376,13 +279,11 @@ Wants=network-online.target
 Type=simple
 User=root
 ExecStart=/usr/local/bin/frpc -c /root/frp/client/%i.toml
-ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
-RestartSec=2s
+RestartSec=2
 StartLimitIntervalSec=0
 LimitNOFILE=1048576
-LimitNPROC=65536
-TasksMax=infinity
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -390,7 +291,7 @@ EOF
 
     cat > /etc/systemd/system/frp-watchdog@.service <<'EOF'
 [Unit]
-Description=FRP Active Tunnel Watchdog (%i)
+Description=FRP Adaptive Watchdog (%i)
 After=network-online.target
 Wants=network-online.target
 
@@ -398,7 +299,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/root/frp/watchdog.sh %i
 Restart=always
-RestartSec=2s
+RestartSec=1
 StartLimitIntervalSec=0
 NoNewPrivileges=true
 
@@ -409,276 +310,189 @@ EOF
     systemctl daemon-reload
 }
 
-# ------------------------------------------------------------------------------
-# Watchdog
-# ------------------------------------------------------------------------------
-
 write_watchdog() {
-    cat > "$BASE_DIR/watchdog.sh" <<'EOF'
-#!/bin/bash
+    cat > "$BASE_DIR/watchdog.sh" <<'WDEOF'
+#!/usr/bin/env bash
 set -Eeuo pipefail
+IFS=$'\n\t'
 
 ROLE="${1:-}"
-BASE_DIR="/root/frp"
-INTERVAL=5
-FAIL_THRESHOLD=2
-LOG="$BASE_DIR/watchdog.log"
+BASE="/root/frp"
+INTERVAL="${WATCHDOG_INTERVAL:-5}"
+MAX_FAIL="${WATCHDOG_FAILURES:-2}"
+LOG="$BASE/watchdog.log"
+
+mkdir -p "$BASE"
+touch "$LOG"
+chmod 600 "$LOG"
 
 log() {
-    mkdir -p "$BASE_DIR"
-    printf '%s [%s] %s\n' "$(date '+%F %T')" "$ROLE" "$*" >> "$LOG"
+    printf '[%s] [%s] %s\n' "$(date '+%F %T')" "$ROLE" "$*" >> "$LOG"
 }
 
-tcp_listening() {
-    ss -ltnH 2>/dev/null | awk -v p=":$1" '$4 ~ p"$" {ok=1} END{exit !ok}'
-}
-
-established_to_server() {
-    local host="$1" port="$2"
-    ss -tnH state established 2>/dev/null |
-        awk -v h="$host" -v p=":$port" '
-            $5 ~ ("^" h ":[0-9]+$") && $5 ~ p "$" {ok=1}
-            END{exit !ok}
-        '
-}
-
-restart_service() {
-    local svc="$1"
-    log "Restarting $svc"
-    systemctl restart "$svc" || true
-}
-
-case "$ROLE" in
-    server)
-        META="$BASE_DIR/server/meta.env"
-        SERVICE="frps@server-3090.service"
-        ;;
-    client)
-        META="$BASE_DIR/client/meta.env"
-        SERVICE="frpc@client-3090.service"
-        ;;
-    *)
-        exit 2
-        ;;
-esac
-
-[[ -f "$META" ]] || exit 0
+meta="$BASE/${ROLE}/meta.env"
+[[ -r "$meta" ]] || exit 0
 # shellcheck disable=SC1090
-source "$META"
+source "$meta"
 
-fails=0
+if [[ "$ROLE" == "server" ]]; then
+    UNIT="frps@${INSTANCE}.service"
+elif [[ "$ROLE" == "client" ]]; then
+    UNIT="frpc@${INSTANCE}.service"
+else
+    exit 1
+fi
+
+# Return the number of ESTABLISHED TCP sockets involving the FRP server port.
+server_connection_count() {
+    ss -Htn state established "( sport = :${SERVER_PORT} or dport = :${SERVER_PORT} )" 2>/dev/null |
+        wc -l | tr -d ' '
+}
+
+# Client-side check: a real ESTABLISHED socket to the configured server port.
+client_connection_ok() {
+    local server="$SERVER_ADDR"
+    ss -Htn state established 2>/dev/null |
+        awk -v host="$server" -v port=":${SERVER_PORT}" '
+        {
+            a=$4; b=$5;
+            if ((a ~ host && a ~ port) || (b ~ host && b ~ port)) found=1
+        }
+        END { exit(found ? 0 : 1) }'
+}
+
+# Validate configuration before restart; prevents a watchdog from entering a
+# restart loop caused by a broken generated TOML.
+verify_config() {
+    if [[ "$ROLE" == "server" ]]; then
+        /usr/local/bin/frps verify -c "$BASE/server/${INSTANCE}.toml" >/dev/null 2>&1
+    else
+        /usr/local/bin/frpc verify -c "$BASE/client/${INSTANCE}.toml" >/dev/null 2>&1
+    fi
+}
+
+fail=0
 
 while :; do
     healthy=1
     reason=""
 
-    if ! systemctl is-active --quiet "$SERVICE"; then
+    if ! systemctl is-active --quiet "$UNIT"; then
         healthy=0
-        reason="systemd service is not active"
+        reason="systemd unit inactive"
     elif [[ "$ROLE" == "server" ]]; then
-        if ! tcp_listening "$SERVER_PORT"; then
+        if ! ss -Hltn 2>/dev/null | awk -v p=":${PORT}" '$4 ~ p"$" {ok=1} END{exit(ok?0:1)}'; then
             healthy=0
-            reason="frps TCP port ${SERVER_PORT} is not listening"
+            reason="FRP TCP listen port is not listening"
         fi
     else
-        # A live frpc process alone is not sufficient. We require an actual
-        # established TCP control connection to the configured frps address.
-        if ! established_to_server "$SERVER_ADDR" "$SERVER_PORT"; then
+        if ! client_connection_ok; then
             healthy=0
-            reason="no established TCP control connection to ${SERVER_ADDR}:${SERVER_PORT}"
+            reason="no established FRP control connection to server"
         fi
     fi
 
     if ((healthy)); then
-        fails=0
+        fail=0
     else
-        ((fails+=1))
-        log "Unhealthy: $reason ($fails/$FAIL_THRESHOLD)"
-        if ((fails >= FAIL_THRESHOLD)); then
-            restart_service "$SERVICE"
-            fails=0
-            sleep 3
+        ((fail++))
+        log "health failure ${fail}/${MAX_FAIL}: ${reason}"
+
+        if ((fail >= MAX_FAIL)); then
+            if verify_config; then
+                log "restarting ${UNIT}"
+                systemctl restart "$UNIT" || true
+            else
+                log "configuration verification failed; refusing blind restart"
+            fi
+            fail=0
+            sleep 2
         fi
     fi
 
     sleep "$INTERVAL"
 done
-EOF
-    chmod 0755 "$BASE_DIR/watchdog.sh"
+WDEOF
+    chmod 700 "$BASE_DIR/watchdog.sh"
 }
 
-# ------------------------------------------------------------------------------
-# Server
-# ------------------------------------------------------------------------------
+write_server_config() {
+    local token="$1" dash_pass="$2"
 
-install_server() {
-    log "=== Installing FRP Server on Iran ==="
-    install_deps
-    mkdir -p "$BASE_DIR/server"
-
-    write_sysctl_tuning
-    apply_mss_clamp
-    download_frp frps
-
-    local token dashboard_pass
-    token="$(gen_secret 32)"
-    dashboard_pass="$(gen_secret 12)"
-
-    cat > "$BASE_DIR/server/${SERVER_INSTANCE}.toml" <<EOF
+    cat > "$BASE_DIR/server/server-3090.toml" <<EOF
 bindAddr = "0.0.0.0"
-bindPort = ${BIND_PORT}
+bindPort = ${FRP_SERVER_PORT}
 
-# TCP transport only. TCP mux is enabled by default and is appropriate for
-# many parallel HTTP/HTTPS requests because it avoids a new control connection
-# for every request.
-transport.tcpMux = true
-transport.tcpMuxKeepaliveInterval = 15
+transport.maxPoolCount = 8
 transport.tcpKeepalive = 30
-transport.heartbeatTimeout = 60
-
-# Connection pooling is deliberately not inflated here: with tcpMux enabled,
-# poolCount is a backend-service connection pool, not a pool of independent
-# Internet TCP control connections. Large values waste sockets and can hurt
-# rather than help ordinary web traffic.
-transport.maxPoolCount = 5
-
-# TLS protects the frpc <-> frps control/data channel.
+transport.tcpMux = true
+transport.tcpMuxKeepaliveInterval = 30
 transport.tls.force = true
 
 auth.method = "token"
 auth.token = "${token}"
 
-# Keep the admin API on loopback only.
 webServer.addr = "127.0.0.1"
-webServer.port = 7500
+webServer.port = ${FRP_DASH_PORT}
 webServer.user = "admin"
-webServer.password = "${dashboard_pass}"
+webServer.password = "${dash_pass}"
 
 log.to = "console"
 log.level = "warn"
-log.maxDays = 3
-
-# Avoid accidental exposure of arbitrary ports through this frps instance.
-allowPorts = [
-  { start = 1, end = 65535 }
-]
 EOF
-    chmod 0600 "$BASE_DIR/server/${SERVER_INSTANCE}.toml"
+    chmod 600 "$BASE_DIR/server/server-3090.toml"
 
     cat > "$BASE_DIR/server/meta.env" <<EOF
-SERVER_PORT=${BIND_PORT}
-INSTANCE=${SERVER_INSTANCE}
+INSTANCE=server-3090
+PORT=${FRP_SERVER_PORT}
+SERVER_PORT=${FRP_SERVER_PORT}
 EOF
-    chmod 0600 "$BASE_DIR/server/meta.env"
-
-    write_systemd_units
-    write_watchdog
-
-    /usr/local/bin/frps verify -c "$BASE_DIR/server/${SERVER_INSTANCE}.toml"
-
-    systemctl enable "frps@${SERVER_INSTANCE}.service" >/dev/null
-    systemctl restart "frps@${SERVER_INSTANCE}.service"
-
-    wait_for_active "frps@${SERVER_INSTANCE}.service" 20 ||
-        die "frps failed to start. Run: journalctl -u frps@${SERVER_INSTANCE}.service -n 50 --no-pager"
-
-    open_firewall "$BIND_PORT"
-
-    systemctl enable "frp-watchdog@server.service" >/dev/null
-    systemctl restart "frp-watchdog@server.service"
-
-    log "FRP server is active."
-    echo
-    echo "=============================================================="
-    echo " FRP TCP SERVER READY"
-    echo "=============================================================="
-    echo " Bind port      : ${BIND_PORT}/tcp"
-    echo " TCP mux        : enabled"
-    echo " TCP keepalive  : 30s"
-    echo " Mux heartbeat  : 15s"
-    echo " Heartbeat timeout: 60s"
-    echo " TLS             : forced"
-    echo " Watchdog        : active"
-    echo
-    echo " IMPORTANT: save this token now; it is not printed again:"
-    echo " Auth token      : ${token}"
-    echo " Dashboard       : http://127.0.0.1:7500"
-    echo " Dashboard user  : admin"
-    echo " Dashboard pass  : ${dashboard_pass}"
-    echo "=============================================================="
+    chmod 600 "$BASE_DIR/server/meta.env"
 }
 
-# ------------------------------------------------------------------------------
-# Client
-# ------------------------------------------------------------------------------
+write_client_config() {
+    local server_addr="$1" token="$2" mode="$3" paths="$4" ports_csv="$5"
 
-install_client() {
-    log "=== Installing FRP Client on Kharej ==="
-    install_deps
-    mkdir -p "$BASE_DIR/client"
+    local pool
+    if [[ "$mode" == "multi" ]]; then
+        pool=1
+    else
+        pool=0
+    fi
 
-    write_sysctl_tuning
-    apply_mss_clamp
-    download_frp frpc
-
-    local server_addr token input_ports clean_ports
-    local -a ports
-
-    read -r -p "Iran server IP/hostname: " server_addr
-    [[ -n "$server_addr" ]] || die "Server address cannot be empty."
-
-    read -r -p "FRP auth token: " token
-    [[ -n "$token" ]] || die "Token cannot be empty."
-
-    read -r -p "Ports to forward (example: 80,443,8080-8090) [8080]: " input_ports
-    input_ports="${input_ports:-8080}"
-
-    mapfile -t ports < <(parse_ports_string "$input_ports")
-    ((${#ports[@]})) || die "No valid ports were supplied."
-
-    clean_ports="$(IFS=,; echo "${ports[*]}")"
-
-    cat > "$BASE_DIR/client/${CLIENT_INSTANCE}.toml" <<EOF
+    cat > "$BASE_DIR/client/client-3090.toml" <<EOF
 serverAddr = "${server_addr}"
-serverPort = ${BIND_PORT}
+serverPort = ${FRP_SERVER_PORT}
 
-# Authentication failure should terminate frpc so systemd can restart it
-# instead of leaving a misleading "active but disconnected" process.
-loginFailExit = true
+# Stay alive through transient route failures and let systemd/watchdog recover.
+loginFailExit = false
 
 auth.method = "token"
 auth.token = "${token}"
 
-[transport]
-protocol = "tcp"
-tcpMux = true
-tcpMuxKeepaliveInterval = 15
-dialServerTimeout = 10
-dialServerKeepalive = 30
+transport.protocol = "tcp"
+transport.tcpMux = $([[ "$mode" == "mux" ]] && echo true || echo false)
+transport.poolCount = ${pool}
+transport.dialServerTimeout = 10
+transport.dialServerKeepalive = 30
+transport.tcpMuxKeepaliveInterval = 30
+transport.tls.enable = true
 
-# heartbeatInterval=-1 lets tcpMux keepalive be the heartbeat mechanism,
-# avoiding redundant heartbeat traffic.
-heartbeatInterval = -1
-heartbeatTimeout = 60
+webServer.addr = "127.0.0.1"
+webServer.port = ${FRP_CLIENT_DASH_PORT}
+webServer.user = "admin"
+webServer.password = "$(gen_secret 12)"
 
-# poolCount is a backend connection pool, not a control-channel speed knob.
-# Keep it modest for general HTTP/HTTPS workloads.
-poolCount = 2
-
-[webServer]
-addr = "127.0.0.1"
-port = 7400
-user = "admin"
-password = "$(gen_secret 12)"
-
-[log]
-to = "console"
-level = "warn"
-maxDays = 3
+log.to = "console"
+log.level = "warn"
 EOF
 
-    for p in "${ports[@]}"; do
-        cat >> "$BASE_DIR/client/${CLIENT_INSTANCE}.toml" <<EOF
+    local p i name
+    IFS=',' read -r -a ports <<< "$ports_csv"
+
+    if [[ "$mode" == "mux" ]]; then
+        for p in "${ports[@]}"; do
+            cat >> "$BASE_DIR/client/client-3090.toml" <<EOF
 
 [[proxies]]
 name = "tcp-${p}"
@@ -686,91 +500,182 @@ type = "tcp"
 localIP = "127.0.0.1"
 localPort = ${p}
 remotePort = ${p}
-
-# Health check verifies the local backend service. It is intentionally
-# separate from the watchdog, which verifies the FRP control connection.
 healthCheck.type = "tcp"
 healthCheck.timeoutSeconds = 3
 healthCheck.maxFailed = 3
 healthCheck.intervalSeconds = 10
-
-[proxies.transport]
-useEncryption = false
-useCompression = false
 EOF
-    done
+        done
+    else
+        # Multi mode: duplicate each TCP proxy into a load-balancer group.
+        # Each replica has an independent non-mux work connection pool.
+        # New incoming sessions are distributed between replicas.
+        for p in "${ports[@]}"; do
+            for ((i=1; i<=paths; i++)); do
+                name="tcp-${p}-path-${i}"
+                cat >> "$BASE_DIR/client/client-3090.toml" <<EOF
 
-    chmod 0600 "$BASE_DIR/client/${CLIENT_INSTANCE}.toml"
-
-    cat > "$BASE_DIR/client/meta.env" <<EOF
-INSTANCE=${CLIENT_INSTANCE}
-SERVER_ADDR=${server_addr}
-SERVER_PORT=${BIND_PORT}
-PORTS="${clean_ports}"
+[[proxies]]
+name = "${name}"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = ${p}
+remotePort = ${p}
+loadBalancer.group = "frp-${p}"
+loadBalancer.groupKey = "${token}"
+healthCheck.type = "tcp"
+healthCheck.timeoutSeconds = 3
+healthCheck.maxFailed = 3
+healthCheck.intervalSeconds = 10
 EOF
-    chmod 0600 "$BASE_DIR/client/meta.env"
-
-    write_systemd_units
-    write_watchdog
-
-    /usr/local/bin/frpc verify -c "$BASE_DIR/client/${CLIENT_INSTANCE}.toml"
-
-    # Check reachability before starting, without sending application data.
-    if command_exists timeout; then
-        if ! timeout 5 bash -c "</dev/tcp/${server_addr}/${BIND_PORT}" 2>/dev/null; then
-            log "WARNING: ${server_addr}:${BIND_PORT} is not reachable over TCP yet."
-            log "The service will still be installed and systemd/watchdog will keep retrying."
-        fi
+            done
+        done
     fi
 
-    systemctl enable "frpc@${CLIENT_INSTANCE}.service" >/dev/null
-    systemctl restart "frpc@${CLIENT_INSTANCE}.service"
+    chmod 600 "$BASE_DIR/client/client-3090.toml"
 
-    wait_for_active "frpc@${CLIENT_INSTANCE}.service" 20 ||
-        die "frpc failed to start. Run: journalctl -u frpc@${CLIENT_INSTANCE}.service -n 50 --no-pager"
+    cat > "$BASE_DIR/client/meta.env" <<EOF
+INSTANCE=client-3090
+SERVER_ADDR=${server_addr}
+SERVER_PORT=${FRP_SERVER_PORT}
+MODE=${mode}
+PATHS=${paths}
+PORTS=${ports_csv}
+EOF
+    chmod 600 "$BASE_DIR/client/meta.env"
+}
 
-    systemctl enable "frp-watchdog@client.service" >/dev/null
-    systemctl restart "frp-watchdog@client.service"
+server_install() {
+    install_deps
+    mkdir -p "$BASE_DIR/server" "$BASE_DIR/client"
+    write_tcp_tuning
+    download_frp frps
+    install_units
+    write_watchdog
 
-    log "Waiting for the actual TCP control connection..."
+    local token dash
+    token="$(gen_secret 24)"
+    dash="$(gen_secret 12)"
+    write_server_config "$token" "$dash"
+
+    /usr/local/bin/frps verify -c "$BASE_DIR/server/server-3090.toml" ||
+        die "Generated frps configuration failed verification."
+
+    systemctl enable --now frps@server-3090.service
+    wait_active frps@server-3090.service 20 ||
+        { journalctl -u frps@server-3090.service -n 40 --no-pager; die "frps did not start."; }
+
+    open_firewall "$FRP_SERVER_PORT" tcp
+
+    systemctl enable --now frp-watchdog@server.service
+
+    cat > "$BASE_DIR/server/credentials.txt" <<EOF
+FRP_SERVER=${FRP_SERVER_PORT}
+AUTH_TOKEN=${token}
+DASHBOARD_USER=admin
+DASHBOARD_PASSWORD=${dash}
+EOF
+    chmod 600 "$BASE_DIR/server/credentials.txt"
+
+    echo
+    echo "=============================================================="
+    echo " FRP SERVER READY"
+    echo "=============================================================="
+    echo "TCP port : ${FRP_SERVER_PORT}"
+    echo "Token    : ${token}"
+    echo
+    echo "Copy the token to the foreign client."
+    echo "Credentials are also stored root-only at:"
+    echo "  ${BASE_DIR}/server/credentials.txt"
+    echo "=============================================================="
+}
+
+client_install() {
+    install_deps
+    mkdir -p "$BASE_DIR/client" "$BASE_DIR/server"
+    write_tcp_tuning
+    download_frp frpc
+    install_units
+    write_watchdog
+
+    local server_addr token mode paths input ports_csv
+
+    read -rp "Iran server IP/hostname: " server_addr
+    [[ -n "$server_addr" ]] || die "Server address cannot be empty."
+
+    read -rp "FRP auth token: " token
+    [[ -n "$token" ]] || die "Token cannot be empty."
+
+    echo
+    echo "Transport mode:"
+    echo "  1) mux   - FRP TCP multiplexing; best default for general web traffic"
+    echo "  2) multi - tcpMux=false + multiple independent proxy paths"
+    echo
+    read -rp "Mode [1/2, default 1]: " mode
+    mode="${mode:-1}"
+
+    if [[ "$mode" == "2" ]]; then
+        mode="multi"
+        read -rp "Number of independent paths [4]: " paths
+        paths="${paths:-4}"
+        [[ "$paths" =~ ^[1-9][0-9]*$ ]] || die "Invalid path count."
+        ((paths <= 8)) || die "Use 1-8 paths."
+    else
+        mode="mux"
+        paths=1
+    fi
+
+    read -rp "Ports to forward [8080]: " input
+    input="${input:-8080}"
+
+    mapfile -t parsed < <(parse_ports "$input") ||
+        die "No valid TCP ports were supplied."
+
+    ports_csv="$(IFS=,; echo "${parsed[*]}")"
+
+    write_client_config "$server_addr" "$token" "$mode" "$paths" "$ports_csv"
+
+    /usr/local/bin/frpc verify -c "$BASE_DIR/client/client-3090.toml" ||
+        die "Generated frpc configuration failed verification."
+
+    systemctl enable --now frpc@client-3090.service
+    wait_active frpc@client-3090.service 20 ||
+        { journalctl -u frpc@client-3090.service -n 50 --no-pager; die "frpc did not start."; }
+
+    # Give the control connection a short window to establish.
     local ok=0 i
-    for ((i=0; i<20; i++)); do
-        if tcp_established_to "$server_addr" "$BIND_PORT"; then
+    for ((i=0; i<15; i++)); do
+        if ss -Htn state established 2>/dev/null |
+            awk -v host="$server_addr" -v port=":${FRP_SERVER_PORT}" '
+            {a=$4;b=$5;if((a~host&&a~port)||(b~host&&b~port))ok=1}
+            END{exit(ok?0:1)}'; then
             ok=1
             break
         fi
         sleep 1
     done
 
+    ((ok)) || {
+        journalctl -u frpc@client-3090.service -n 50 --no-pager
+        die "frpc is running but no established control connection was detected."
+    }
+
+    systemctl enable --now frp-watchdog@client.service
+
     echo
     echo "=============================================================="
-    if ((ok)); then
-        echo " FRP TCP CLIENT ONLINE"
-    else
-        echo " FRP CLIENT INSTALLED - CONTROL CONNECTION NOT YET CONFIRMED"
-        echo " Check: journalctl -u frpc@${CLIENT_INSTANCE}.service -n 50 --no-pager"
-    fi
+    echo " FRP CLIENT READY"
     echo "=============================================================="
-    echo " Server          : ${server_addr}:${BIND_PORT}/tcp"
-    echo " Transport       : TCP"
-    echo " TCP mux         : enabled"
-    echo " Ports           : ${clean_ports}"
-    echo " Watchdog        : active"
-    echo " MSS mode        : PMTU-aware clamp"
-    echo " Compression     : disabled"
-    echo " Bandwidth limit : none"
+    echo "Server : ${server_addr}:${FRP_SERVER_PORT}"
+    echo "Mode   : ${mode}"
+    echo "Paths  : ${paths}"
+    echo "Ports  : ${ports_csv}"
+    echo "Watchdog: active"
     echo "=============================================================="
 }
 
-# ------------------------------------------------------------------------------
-# Status / diagnostics
-# ------------------------------------------------------------------------------
-
-show_status() {
-    clear || true
-    echo "=============================================================="
-    echo "                    FRP TCP STATUS"
-    echo "=============================================================="
+status() {
+    echo "================ FRP STATUS ================"
 
     if [[ -f "$BASE_DIR/server/meta.env" ]]; then
         # shellcheck disable=SC1090
@@ -778,11 +683,12 @@ show_status() {
         echo
         echo "[SERVER]"
         systemctl is-active --quiet "frps@${INSTANCE}.service" &&
-            echo "Service       : ACTIVE" || echo "Service       : DOWN"
-        tcp_listening "$SERVER_PORT" &&
-            echo "Listen ${SERVER_PORT}/tcp : YES" || echo "Listen ${SERVER_PORT}/tcp : NO"
+            echo "service: ACTIVE" || echo "service: INACTIVE"
+        ss -Hltn 2>/dev/null | grep -q ":${PORT}" &&
+            echo "listen :${PORT}: YES" || echo "listen :${PORT}: NO"
         systemctl is-active --quiet frp-watchdog@server.service &&
-            echo "Watchdog      : ACTIVE" || echo "Watchdog      : DOWN"
+            echo "watchdog: ACTIVE" || echo "watchdog: INACTIVE"
+        echo "established FRP sockets: $(ss -Htn state established "( sport = :${PORT} or dport = :${PORT} )" 2>/dev/null | wc -l)"
     fi
 
     if [[ -f "$BASE_DIR/client/meta.env" ]]; then
@@ -791,127 +697,81 @@ show_status() {
         echo
         echo "[CLIENT]"
         systemctl is-active --quiet "frpc@${INSTANCE}.service" &&
-            echo "Service       : ACTIVE" || echo "Service       : DOWN"
-        echo "Server        : ${SERVER_ADDR}:${SERVER_PORT}/tcp"
-        echo "Ports         : ${PORTS}"
-        tcp_established_to "$SERVER_ADDR" "$SERVER_PORT" &&
-            echo "Control TCP   : ESTABLISHED" || echo "Control TCP   : NOT ESTABLISHED"
+            echo "service: ACTIVE" || echo "service: INACTIVE"
+        echo "server: ${SERVER_ADDR}:${SERVER_PORT}"
+        echo "mode: ${MODE}"
+        echo "paths: ${PATHS}"
+        echo "ports: ${PORTS}"
         systemctl is-active --quiet frp-watchdog@client.service &&
-            echo "Watchdog      : ACTIVE" || echo "Watchdog      : DOWN"
-
-        echo
-        echo "[FRPC PROXY STATUS]"
-        /usr/local/bin/frpc status -c "$BASE_DIR/client/${INSTANCE}.toml" 2>&1 |
-            sed 's/^/  /' || true
+            echo "watchdog: ACTIVE" || echo "watchdog: INACTIVE"
+        echo "established TCP sockets to FRP:"
+        ss -Htn state established 2>/dev/null | grep "${SERVER_ADDR}:${SERVER_PORT}\|:${SERVER_PORT}" || true
     fi
 
     echo
-    echo "[TCP CONGESTION]"
-    printf '  qdisc       : %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
-    printf '  congestion  : %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-    printf '  MTU probing : %s\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unknown)"
-
-    if [[ -f "$BASE_DIR/watchdog.log" ]]; then
-        echo
-        echo "[LAST WATCHDOG EVENTS]"
-        tail -n 10 "$BASE_DIR/watchdog.log" | sed 's/^/  /'
-    fi
+    echo "[KERNEL]"
+    printf 'qdisc: '; sysctl -n net.core.default_qdisc 2>/dev/null || true
+    printf 'cc:    '; sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true
+    printf 'mtu probing: '; sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || true
 }
 
-diagnostics() {
-    echo "=== FRP TCP diagnostics ==="
-    echo
-    echo "Kernel:"
-    uname -a
-    echo
-    echo "Congestion:"
-    sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
-    echo
-    echo "Routes:"
-    ip route 2>/dev/null || true
-    echo
-    echo "TCP sockets:"
-    ss -s 2>/dev/null || true
-    echo
-    echo "FRP services:"
-    systemctl --no-pager --type=service --all 'frp*' 2>/dev/null || true
-}
-
-# ------------------------------------------------------------------------------
-# Uninstall
-# ------------------------------------------------------------------------------
-
-remove_frp() {
-    echo "=== Complete FRP uninstall ==="
-    read -r -p "Remove FRP, services, firewall rule, and TCP tuning? [y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || {
-        echo "Aborted."
-        return 0
-    }
+uninstall() {
+    read -rp "Remove FRP services, binaries, configs, watchdog and tuning? [y/N]: " x
+    [[ "$x" =~ ^[Yy]$ ]] || return 0
 
     if [[ -f "$BASE_DIR/server/meta.env" ]]; then
         # shellcheck disable=SC1090
         source "$BASE_DIR/server/meta.env"
-        close_firewall "${SERVER_PORT:-$BIND_PORT}" || true
-    else
-        close_firewall "$BIND_PORT" || true
+        close_firewall "${PORT:-$FRP_SERVER_PORT}" tcp
     fi
 
     systemctl disable --now \
-        "frps@${SERVER_INSTANCE}.service" \
-        "frpc@${CLIENT_INSTANCE}.service" \
+        frps@server-3090.service \
+        frpc@client-3090.service \
         frp-watchdog@server.service \
         frp-watchdog@client.service 2>/dev/null || true
 
     rm -f /etc/systemd/system/frps@.service \
           /etc/systemd/system/frpc@.service \
           /etc/systemd/system/frp-watchdog@.service
-
     systemctl daemon-reload
-    remove_mss_clamp
-    remove_sysctl_tuning
 
-    rm -rf "$BASE_DIR"
+    remove_tcp_tuning
+
     rm -f /usr/local/bin/frps /usr/local/bin/frpc
+    rm -rf "$BASE_DIR"
 
-    log "FRP removed."
+    echo "FRP installation removed."
 }
 
-# ------------------------------------------------------------------------------
-# Menu
-# ------------------------------------------------------------------------------
+main() {
+    check_root
 
-press_enter() {
-    echo
-    read -r -p "Press Enter to continue..." _
+    while :; do
+        clear 2>/dev/null || true
+        echo "=============================================================="
+        echo " FRP Adaptive TCP Multi-Path Tunnel Manager"
+        echo "=============================================================="
+        echo "1) Install / configure Iran server (frps)"
+        echo "2) Install / configure foreign client (frpc)"
+        echo "3) Status"
+        echo "4) Uninstall"
+        echo "5) Exit"
+        echo "=============================================================="
+        read -rp "Select [1-5]: " c
+
+        case "$c" in
+            1) server_install ;;
+            2) client_install ;;
+            3) status ;;
+            4) uninstall ;;
+            5) exit 0 ;;
+            *) echo "Invalid choice." ;;
+        esac
+
+        echo
+        read -rp "Press Enter..." _
+    done
 }
 
-show_menu() {
-    clear || true
-    echo "=============================================================="
-    echo "             FRP REVERSE TUNNEL - TCP EDITION"
-    echo "=============================================================="
-    echo "1) Install FRP Server (Iran)"
-    echo "2) Install FRP Client (Kharej)"
-    echo "3) Show Status"
-    echo "4) Diagnostics"
-    echo "5) Uninstall"
-    echo "6) Exit"
-    echo "=============================================================="
-    read -r -p "Selection [1-6]: " choice
-}
-
-check_root
-
-while :; do
-    show_menu
-    case "${choice:-}" in
-        1) install_server; press_enter ;;
-        2) install_client; press_enter ;;
-        3) show_status; press_enter ;;
-        4) diagnostics; press_enter ;;
-        5) remove_frp; press_enter ;;
-        6) exit 0 ;;
-        *) echo "Invalid selection."; press_enter ;;
-    esac
-done
+main "$@"
