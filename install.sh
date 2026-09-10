@@ -19,10 +19,16 @@
 # published v0.71.0 GitHub release checksums).
 #
 # Fixes / changes vs. the original version of this script:
-#   - frps now also opens firewall ports for the actual forwarded traffic,
-#     not just the FRP control port (see manage_server_ports / menu item 6).
-#     Previously, traffic to the forwarded ports could be silently dropped
-#     by ufw/iptables on hosts with a restrictive default policy.
+#   - Port forwarding/firewall handling for the actual proxied traffic now
+#     happens only on the foreign client (frpc), automatically during
+#     client_install and via menu item 5 (manage_client_ports /
+#     open_client_ports). Nothing needs to be opened on the Iran server
+#     beyond its FRP control port, which server_install already opens.
+#   - The frps<->frpc auth token is now a fixed default (FRP_AUTH_TOKEN,
+#     "123" unless overridden) instead of a randomly generated value the
+#     operator had to copy from the server prompt to the client prompt.
+#     Setup no longer asks for it. Note this trades away the security of a
+#     random token - see the FRP_AUTH_TOKEN comment near the top.
 #   - parse_ports no longer leaks its "items" array into global scope.
 #   - MULTI_PATHS env var is now actually honored as the interactive default.
 #   - Client dashboard password is now saved to credentials.txt (parity
@@ -48,6 +54,16 @@ FRP_SHA256_LINUX_ARM64="f33c293c275d8fc68c654b6fba8f10b2551d6463d09a9fc9cffb7227
 FRP_SERVER_PORT="${FRP_SERVER_PORT:-3090}"
 FRP_DASH_PORT="${FRP_DASH_PORT:-7500}"
 FRP_CLIENT_DASH_PORT="${FRP_CLIENT_DASH_PORT:-7400}"
+
+# Shared auth token between frps and frpc. Fixed to a hardcoded default so
+# install never prompts for it and there is nothing to copy/paste between
+# the two machines (a mistyped token here previously made frpc run but
+# never actually authenticate - see client_install). This is a much weaker
+# secret than a random token: anyone who reaches the control port and knows
+# (or guesses) this value can authenticate against your frps. Override with
+# FRP_AUTH_TOKEN=... before running the script if you want something less
+# guessable while still skipping the prompt.
+FRP_AUTH_TOKEN="${FRP_AUTH_TOKEN:-123}"
 
 # Number of independent proxy replicas in multi mode.
 # 4 is a sane starting point; 2-8 is normally enough.
@@ -660,29 +676,40 @@ EOF
     chmod 600 "$BASE_DIR/client/meta.env"
 }
 
-manage_server_ports() {
-    mkdir -p "$BASE_DIR/server"
+manage_client_ports() {
+    mkdir -p "$BASE_DIR/client"
     local input
     local -a parsed=()
     local p
 
-    echo "These are the ports that frpc forwards traffic TO on this server"
-    echo "(the 'remotePort' values you chose during client setup) - NOT the"
-    echo "FRP control port (${FRP_SERVER_PORT}), which is already open."
+    echo "These are the ports this client forwards (the 'localPort'/"
+    echo "'remotePort' values you chose during client setup)."
+    echo "Port forwarding is handled only here, on the foreign client -"
+    echo "the Iran server side needs no port management beyond its"
+    echo "FRP control port (${FRP_SERVER_PORT}), which is opened automatically."
     read -rp "Ports to open (e.g. 8080 or 8080,9000-9005): " input
     [[ -n "$input" ]] || { echo "No ports given, nothing to do."; return 0; }
 
     mapfile -t parsed < <(parse_ports "$input") ||
         die "No valid TCP ports were supplied."
 
-    touch "$BASE_DIR/server/forwarded_ports.txt"
-    for p in "${parsed[@]}"; do
-        open_firewall "$p" tcp
-        grep -qxF "$p" "$BASE_DIR/server/forwarded_ports.txt" ||
-            echo "$p" >> "$BASE_DIR/server/forwarded_ports.txt"
-    done
+    open_client_ports "${parsed[@]}"
+    log "Opened TCP ports on this client: ${parsed[*]}"
+}
 
-    log "Opened TCP ports on this server: ${parsed[*]}"
+# Opens (and records, for later uninstall) TCP ports on THIS machine's
+# firewall. Called automatically from client_install for the ports chosen
+# during setup, and available standalone via the "Open forwarded ports"
+# menu item for adding more later.
+open_client_ports() {
+    mkdir -p "$BASE_DIR/client"
+    touch "$BASE_DIR/client/forwarded_ports.txt"
+    local p
+    for p in "$@"; do
+        open_firewall "$p" tcp
+        grep -qxF "$p" "$BASE_DIR/client/forwarded_ports.txt" ||
+            echo "$p" >> "$BASE_DIR/client/forwarded_ports.txt"
+    done
 }
 
 server_install() {
@@ -694,7 +721,7 @@ server_install() {
     write_watchdog
 
     local token dash
-    token="$(gen_secret 24)"
+    token="$FRP_AUTH_TOKEN"
     dash="$(gen_secret 12)"
     write_server_config "$token" "$dash"
 
@@ -727,26 +754,16 @@ EOF
     echo " FRP SERVER READY"
     echo "=============================================================="
     echo "TCP port : ${FRP_SERVER_PORT}"
-    echo "Token    : ${token}"
+    echo "Token    : ${token} (fixed default, already hardcoded on the client too)"
     echo
-    echo "Copy the token to the foreign client."
     echo "Credentials are also stored root-only at:"
     echo "  ${BASE_DIR}/server/credentials.txt"
     echo "=============================================================="
     echo
-    echo "IMPORTANT: this only opened the FRP control port (${FRP_SERVER_PORT})."
-    echo "The ports you actually forward traffic to (e.g. 8080) still need"
-    echo "to be opened on THIS server's firewall, or external users won't"
-    echo "be able to reach them even though the tunnel itself is up."
-    echo
-
-    local open_now
-    read -rp "Open forwarded ports on this server now? [y/N]: " open_now
-    if [[ "$open_now" =~ ^[Yy]$ ]]; then
-        manage_server_ports
-    else
-        echo "You can do this later from the main menu (\"Open forwarded ports\")."
-    fi
+    echo "This opened the FRP control port (${FRP_SERVER_PORT}) only. Port"
+    echo "forwarding/firewall handling for the actual proxied ports (e.g."
+    echo "8080) is now done entirely on the foreign client during its own"
+    echo "setup - nothing further to do here on the Iran server for that."
 }
 
 client_install() {
@@ -767,8 +784,7 @@ client_install() {
     read -rp "Iran server IP/hostname: " server_addr
     [[ -n "$server_addr" ]] || die "Server address cannot be empty."
 
-    read -rp "FRP auth token: " token
-    [[ -n "$token" ]] || die "Token cannot be empty."
+    token="$FRP_AUTH_TOKEN"
 
     echo
     echo "Transport mode:"
@@ -796,6 +812,10 @@ client_install() {
         die "No valid TCP ports were supplied."
 
     ports_csv="$(IFS=,; echo "${parsed[*]}")"
+
+    # Port forwarding/firewall handling happens only on this (foreign)
+    # client, never on the Iran server.
+    open_client_ports "${parsed[@]}"
 
     write_client_config "$server_addr" "$token" "$mode" "$paths" "$ports_csv"
 
@@ -890,10 +910,10 @@ uninstall() {
         close_firewall "${PORT:-$FRP_SERVER_PORT}" tcp
     fi
 
-    if [[ -f "$BASE_DIR/server/forwarded_ports.txt" ]]; then
+    if [[ -f "$BASE_DIR/client/forwarded_ports.txt" ]]; then
         while read -r fp; do
             [[ -n "$fp" ]] && close_firewall "$fp" tcp
-        done < "$BASE_DIR/server/forwarded_ports.txt"
+        done < "$BASE_DIR/client/forwarded_ports.txt"
     fi
 
     systemctl disable --now \
@@ -927,7 +947,7 @@ main() {
         echo "2) Install / configure foreign client (frpc)"
         echo "3) Status"
         echo "4) Uninstall"
-        echo "5) Open forwarded ports on this server (Iran)"
+        echo "5) Open forwarded ports on this client (foreign)"
         echo "6) Exit"
         echo "=============================================================="
         read -rp "Select [1-6]: " c
@@ -937,7 +957,7 @@ main() {
             2) client_install ;;
             3) status ;;
             4) uninstall ;;
-            5) manage_server_ports ;;
+            5) manage_client_ports ;;
             6) exit 0 ;;
             *) echo "Invalid choice." ;;
         esac
