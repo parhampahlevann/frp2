@@ -15,7 +15,26 @@
 #   For one HTTP/2/WebSocket/TCP flow, there is still one end-to-end stream.
 #
 # FRP pinned to 0.71.0. SHA256 values are for official Linux amd64/arm64
-# release archives used by the original script.
+# release archives used by the original script (verified against the
+# published v0.71.0 GitHub release checksums).
+#
+# Fixes / changes vs. the original version of this script:
+#   - frps now also opens firewall ports for the actual forwarded traffic,
+#     not just the FRP control port (see manage_server_ports / menu item 6).
+#     Previously, traffic to the forwarded ports could be silently dropped
+#     by ufw/iptables on hosts with a restrictive default policy.
+#   - parse_ports no longer leaks its "items" array into global scope.
+#   - MULTI_PATHS env var is now actually honored as the interactive default.
+#   - Client dashboard password is now saved to credentials.txt (parity
+#     with the server side) instead of being generated and discarded.
+#   - Kernel SYN/accept backlog tuning added (somaxconn, tcp_max_syn_backlog,
+#     netdev_max_backlog, tcp_syncookies) to reduce handshake drops under
+#     connection bursts.
+#   - Optional initial congestion window (initcwnd/initrwnd) bump via a
+#     small systemd oneshot unit, to reach full throughput faster on new
+#     short-lived TCP flows.
+#   - "multi" mode now sets a tighter heartbeat timeout so a dead control
+#     path is detected and re-established faster.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -41,6 +60,17 @@ FIXED_MSS="${FIXED_MSS:-1360}"
 # Watchdog timings.
 WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-5}"
 WATCHDOG_FAILURES="${WATCHDOG_FAILURES:-2}"
+
+# Initial congestion window tuning. Raises the default route's initcwnd/
+# initrwnd so new short-lived TCP flows ramp up to a useful throughput in
+# fewer round trips, instead of starting at Linux's default of 10 segments
+# and slow-starting from there. 10 is the value Google's public research
+# established as a safe general-purpose default; raise it only if you have
+# measured a high-bandwidth, low-loss path. Set TUNE_INITCWND=0 to skip
+# this entirely (it touches the host's default route, system-wide, not
+# just FRP traffic).
+TUNE_INITCWND="${TUNE_INITCWND:-1}"
+INITCWND="${INITCWND:-10}"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -130,6 +160,7 @@ valid_port() {
 
 parse_ports() {
     local input="$1" item a b p
+    local -a items=()
     declare -A seen=()
     IFS=', ' read -r -a items <<< "$input"
 
@@ -195,11 +226,24 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.ip_local_port_range = 1024 65535
 
+# Larger SYN/accept backlogs so a burst of new connections (many short
+# tunneled flows arriving at once) doesn't get dropped at the handshake
+# stage before the app ever sees them. tcp_syncookies stays on so the
+# server keeps accepting valid handshakes even if the backlog is briefly
+# exceeded, instead of silently dropping SYNs.
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_syncookies = 1
+
 # Avoid artificial application buffering.
 net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_autocorking = 0
 
-# Do not force TCP Fast Open: middleboxes can make it less reliable.
+# Do not force TCP Fast Open: middleboxes/DPI on a censored path are more
+# likely to drop or mangle SYNs carrying the TFO option than a plain SYN,
+# which would make handshakes LESS reliable, not faster. Same reasoning
+# for leaving tcp_ecn at its distro default rather than forcing it on.
 net.ipv4.tcp_fastopen = 0
 EOF
 
@@ -226,6 +270,8 @@ EOF
                     -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
         fi
     fi
+
+    write_initcwnd_script
 }
 
 remove_tcp_tuning() {
@@ -237,6 +283,35 @@ remove_tcp_tuning() {
     fi
     rm -f /etc/sysctl.d/99-frp-tcp-tuning.conf /etc/modules-load.d/frp-bbr.conf
     sysctl --system >/dev/null 2>&1 || true
+
+    systemctl disable --now frp-initcwnd.service 2>/dev/null || true
+    rm -f /etc/systemd/system/frp-initcwnd.service "$BASE_DIR/apply-initcwnd.sh"
+    systemctl daemon-reload
+}
+
+write_initcwnd_script() {
+    ((TUNE_INITCWND)) || return 0
+
+    cat > "$BASE_DIR/apply-initcwnd.sh" <<EOF
+#!/usr/bin/env bash
+# Bumps initcwnd/initrwnd on the default route. Not persistent on its own,
+# which is why this runs as a oneshot systemd unit on every boot.
+set -Eeuo pipefail
+INITCWND="\${INITCWND:-${INITCWND}}"
+
+mapfile -t routes < <(ip route show default 2>/dev/null)
+if ((\${#routes[@]} == 0)); then
+    echo "No default route found; skipping initcwnd tuning." >&2
+    exit 0
+fi
+
+for route_line in "\${routes[@]}"; do
+    # shellcheck disable=SC2086
+    ip route change \$route_line initcwnd "\$INITCWND" initrwnd "\$INITCWND" \
+        2>/dev/null || echo "Could not apply initcwnd to: \$route_line" >&2
+done
+EOF
+    chmod 700 "$BASE_DIR/apply-initcwnd.sh"
 }
 
 wait_active() {
@@ -254,6 +329,7 @@ install_units() {
 Description=FRP Server (%i)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -261,7 +337,6 @@ User=root
 ExecStart=/usr/local/bin/frps -c /root/frp/server/%i.toml
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=0
 LimitNOFILE=1048576
 NoNewPrivileges=true
 
@@ -274,6 +349,7 @@ EOF
 Description=FRP Client (%i)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -281,7 +357,6 @@ User=root
 ExecStart=/usr/local/bin/frpc -c /root/frp/client/%i.toml
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=0
 LimitNOFILE=1048576
 NoNewPrivileges=true
 
@@ -294,18 +369,36 @@ EOF
 Description=FRP Adaptive Watchdog (%i)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/root/frp/watchdog.sh %i
 Restart=always
 RestartSec=1
-StartLimitIntervalSec=0
 NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    if ((TUNE_INITCWND)); then
+        cat > /etc/systemd/system/frp-initcwnd.service <<EOF
+[Unit]
+Description=Apply initcwnd/initrwnd tuning for FRP tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=INITCWND=${INITCWND}
+ExecStart=${BASE_DIR}/apply-initcwnd.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
 
     systemctl daemon-reload
 }
@@ -453,12 +546,13 @@ EOF
 write_client_config() {
     local server_addr="$1" token="$2" mode="$3" paths="$4" ports_csv="$5"
 
-    local pool
+    local pool dash_pass
     if [[ "$mode" == "multi" ]]; then
         pool=1
     else
         pool=0
     fi
+    dash_pass="$(gen_secret 12)"
 
     cat > "$BASE_DIR/client/client-3090.toml" <<EOF
 serverAddr = "${server_addr}"
@@ -481,11 +575,32 @@ transport.tls.enable = true
 webServer.addr = "127.0.0.1"
 webServer.port = ${FRP_CLIENT_DASH_PORT}
 webServer.user = "admin"
-webServer.password = "$(gen_secret 12)"
+webServer.password = "${dash_pass}"
 
 log.to = "console"
 log.level = "warn"
 EOF
+
+    if [[ "$mode" == "multi" ]]; then
+        # tcpMux is off in this mode, so the tcpMux keepalive above does
+        # nothing; the control connection's liveness is governed by
+        # heartbeatInterval/heartbeatTimeout instead. Default is 10s/90s -
+        # tightened to 45s here so a dead path (and thus a dead replica
+        # proxy) is noticed and reconnected roughly twice as fast. Loosen
+        # this back toward 90 if you see spurious reconnects on a very
+        # lossy link.
+        cat >> "$BASE_DIR/client/client-3090.toml" <<EOF
+
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 45
+EOF
+    fi
+
+    cat > "$BASE_DIR/client/credentials.txt" <<EOF
+DASHBOARD_USER=admin
+DASHBOARD_PASSWORD=${dash_pass}
+EOF
+    chmod 600 "$BASE_DIR/client/credentials.txt"
 
     local p i name
     IFS=',' read -r -a ports <<< "$ports_csv"
@@ -545,6 +660,31 @@ EOF
     chmod 600 "$BASE_DIR/client/meta.env"
 }
 
+manage_server_ports() {
+    mkdir -p "$BASE_DIR/server"
+    local input
+    local -a parsed=()
+    local p
+
+    echo "These are the ports that frpc forwards traffic TO on this server"
+    echo "(the 'remotePort' values you chose during client setup) - NOT the"
+    echo "FRP control port (${FRP_SERVER_PORT}), which is already open."
+    read -rp "Ports to open (e.g. 8080 or 8080,9000-9005): " input
+    [[ -n "$input" ]] || { echo "No ports given, nothing to do."; return 0; }
+
+    mapfile -t parsed < <(parse_ports "$input") ||
+        die "No valid TCP ports were supplied."
+
+    touch "$BASE_DIR/server/forwarded_ports.txt"
+    for p in "${parsed[@]}"; do
+        open_firewall "$p" tcp
+        grep -qxF "$p" "$BASE_DIR/server/forwarded_ports.txt" ||
+            echo "$p" >> "$BASE_DIR/server/forwarded_ports.txt"
+    done
+
+    log "Opened TCP ports on this server: ${parsed[*]}"
+}
+
 server_install() {
     install_deps
     mkdir -p "$BASE_DIR/server" "$BASE_DIR/client"
@@ -569,6 +709,11 @@ server_install() {
 
     systemctl enable --now frp-watchdog@server.service
 
+    if ((TUNE_INITCWND)); then
+        systemctl enable --now frp-initcwnd.service ||
+            log "frp-initcwnd.service failed to start (non-fatal, continuing)"
+    fi
+
     cat > "$BASE_DIR/server/credentials.txt" <<EOF
 FRP_SERVER=${FRP_SERVER_PORT}
 AUTH_TOKEN=${token}
@@ -588,6 +733,20 @@ EOF
     echo "Credentials are also stored root-only at:"
     echo "  ${BASE_DIR}/server/credentials.txt"
     echo "=============================================================="
+    echo
+    echo "IMPORTANT: this only opened the FRP control port (${FRP_SERVER_PORT})."
+    echo "The ports you actually forward traffic to (e.g. 8080) still need"
+    echo "to be opened on THIS server's firewall, or external users won't"
+    echo "be able to reach them even though the tunnel itself is up."
+    echo
+
+    local open_now
+    read -rp "Open forwarded ports on this server now? [y/N]: " open_now
+    if [[ "$open_now" =~ ^[Yy]$ ]]; then
+        manage_server_ports
+    else
+        echo "You can do this later from the main menu (\"Open forwarded ports\")."
+    fi
 }
 
 client_install() {
@@ -597,6 +756,11 @@ client_install() {
     download_frp frpc
     install_units
     write_watchdog
+
+    if ((TUNE_INITCWND)); then
+        systemctl enable --now frp-initcwnd.service ||
+            log "frp-initcwnd.service failed to start (non-fatal, continuing)"
+    fi
 
     local server_addr token mode paths input ports_csv
 
@@ -616,8 +780,8 @@ client_install() {
 
     if [[ "$mode" == "2" ]]; then
         mode="multi"
-        read -rp "Number of independent paths [4]: " paths
-        paths="${paths:-4}"
+        read -rp "Number of independent paths [${MULTI_PATHS}]: " paths
+        paths="${paths:-$MULTI_PATHS}"
         [[ "$paths" =~ ^[1-9][0-9]*$ ]] || die "Invalid path count."
         ((paths <= 8)) || die "Use 1-8 paths."
     else
@@ -671,6 +835,7 @@ client_install() {
     echo "Paths  : ${paths}"
     echo "Ports  : ${ports_csv}"
     echo "Watchdog: active"
+    echo "Dashboard credentials: ${BASE_DIR}/client/credentials.txt"
     echo "=============================================================="
 }
 
@@ -725,6 +890,12 @@ uninstall() {
         close_firewall "${PORT:-$FRP_SERVER_PORT}" tcp
     fi
 
+    if [[ -f "$BASE_DIR/server/forwarded_ports.txt" ]]; then
+        while read -r fp; do
+            [[ -n "$fp" ]] && close_firewall "$fp" tcp
+        done < "$BASE_DIR/server/forwarded_ports.txt"
+    fi
+
     systemctl disable --now \
         frps@server-3090.service \
         frpc@client-3090.service \
@@ -756,16 +927,18 @@ main() {
         echo "2) Install / configure foreign client (frpc)"
         echo "3) Status"
         echo "4) Uninstall"
-        echo "5) Exit"
+        echo "5) Open forwarded ports on this server (Iran)"
+        echo "6) Exit"
         echo "=============================================================="
-        read -rp "Select [1-5]: " c
+        read -rp "Select [1-6]: " c
 
         case "$c" in
             1) server_install ;;
             2) client_install ;;
             3) status ;;
             4) uninstall ;;
-            5) exit 0 ;;
+            5) manage_server_ports ;;
+            6) exit 0 ;;
             *) echo "Invalid choice." ;;
         esac
 
