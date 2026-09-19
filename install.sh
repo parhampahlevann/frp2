@@ -13,9 +13,7 @@ fi
 exec python3 - "$@" <<'PYTHON'
 import argparse
 import base64
-import contextlib
 import fcntl
-import getpass
 import hashlib
 import ipaddress
 import json
@@ -529,12 +527,24 @@ def configure(side):
     ):
         return
 
+    host = None
+    if side == "frpc":
+        # Asked first, before anything else: which Iran server this client dials.
+        host = ask("Server IP (Iran frps address, IPv4/IPv6/hostname)")
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if not re.fullmatch(
+                r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?", host
+            ):
+                raise ValueError("Invalid hostname/IP.")
+
     mux, pool = choose_transport()
     token = FIXED_TOKEN
 
     c = base_config(side, token, mux, pool)
     ports = parse_ports(
-        ask("Forwarded/allowed ports", "8080"),
+        ask("Ports to forward, comma-separated (ranges OK, e.g. 80,443,8000-8010)", "8080"),
         {PORT, 7400, 7500},
     )
 
@@ -559,14 +569,6 @@ def configure(side):
                 keyFile=str(Path(key).resolve()),
             )
     else:
-        host = ask("Iran frps hostname or IP, WITHOUT scheme or port")
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            if not re.fullmatch(
-                r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?", host
-            ):
-                raise ValueError("Invalid hostname/IP.")
         c.update(serverAddr=host, serverPort=PORT)
 
         ca = ask(
@@ -764,135 +766,6 @@ def diagnose():
     say("A failed site/IPv6 test is not proof of a broken tunnel. No network settings were changed.")
     say("FRP forwards ports; it is not itself a general-purpose VPN or an open Internet proxy.")
 
-def network_options():
-    say("1) Optional minimal sysctl tuning  2) Restore v5 tuning  3) IPv4 preference  4) Undo IPv4 preference")
-    say("5) Enable host-wide UDP/443 reject (nftables)  6) Disable v5 UDP/443 reject")
-    choice = ask("Select")
-
-    if choice in ("1", "2"):
-        statefile = STATE / "sysctl.json"
-        conf = Path("/etc/sysctl.d/99-frp-v5.conf")
-        if choice == "1":
-            if statefile.exists() or conf.exists():
-                raise ValueError("Existing v5 tuning found; restore it first.")
-            if not yes("Change these HOST-WIDE settings: TCP MTU probing and keepalive timers"):
-                return
-            values = {
-                "net.ipv4.tcp_mtu_probing": "1",
-                "net.ipv4.tcp_keepalive_time": "30",
-                "net.ipv4.tcp_keepalive_intvl": "10",
-                "net.ipv4.tcp_keepalive_probes": "6",
-            }
-            state = {k: {"old": run(["sysctl", "-n", k]), "new": v} for k, v in values.items()}
-            atomic(statefile, json.dumps(state))
-            try:
-                for k, v in values.items():
-                    run(["sysctl", "-w", f"{k}={v}"])
-                atomic(
-                    conf,
-                    TAG + "\n" + "\n".join(f"{k} = {v}" for k, v in values.items()) + "\n",
-                    0o644,
-                )
-            except BaseException:
-                for k, v in state.items():
-                    run(["sysctl", "-w", f"{k}={v['old']}"], check=False)
-                say("Apply failed; restoration attempted. Snapshot retained in /etc/frp-manager/sysctl.json")
-                raise
-        elif statefile.exists():
-            state = json.loads(statefile.read_text())
-            if conf.exists() and not conf.read_text().startswith(TAG):
-                raise ValueError("Tuning file ownership marker changed; refusing removal.")
-            for k, v in state.items():
-                current = run(["sysctl", "-n", k])
-                if current == v["new"]:
-                    run(["sysctl", "-w", f"{k}={v['old']}"])
-                else:
-                    say(f"Leaving externally changed value: {k}")
-            conf.unlink(missing_ok=True)
-            statefile.unlink()
-
-    elif choice in ("3", "4"):
-        path = Path("/etc/gai.conf")
-        block = "\n# BEGIN frp-manager-v5\nprecedence ::ffff:0:0/96 100\n# END frp-manager-v5\n"
-        text = path.read_text() if path.exists() else ""
-        if choice == "3":
-            if not yes("Prefer IPv4 system-wide for glibc applications (Go apps may ignore it)"):
-                return
-            if block not in text:
-                snapshot([path], ROOT / "backups" / f"gai-{time.time_ns()}")
-                atomic(path, text + block, 0o644)
-        elif block in text:
-            atomic(path, text.replace(block, ""), 0o644)
-
-    elif choice in ("5", "6"):
-        nft = shutil.which("nft")
-        if not nft:
-            raise ValueError("nft is required. No iptables/nftables backends are mixed automatically.")
-        rules = STATE / "quic.nft"
-        unit = Path("/etc/systemd/system/frp-v5-quic.service")
-
-        if choice == "5":
-            if rules.exists() or unit.exists():
-                raise ValueError("v5 QUIC block already configured; disable it first.")
-            p = subprocess.run([nft, "list", "table", "inet", "frp_v5_quic"], capture_output=True)
-            if p.returncode == 0:
-                raise ValueError("Reserved nft table already exists; refusing to replace it.")
-            if not yes("Reject ALL outbound/forwarded UDP/443 on this host? This affects non-FRP apps too"):
-                return
-
-            atomic(
-                rules,
-                """table inet frp_v5_quic {
- chain output {
-  type filter hook output priority -5;
-  policy accept;
-  udp dport 443 reject;
- }
- chain forward {
-  type filter hook forward priority -5;
-  policy accept;
-  udp dport 443 reject;
- }
-}
-""",
-            )
-            try:
-                run([nft, "-c", "-f", rules])
-                atomic(
-                    unit,
-                    f"""{TAG}
-[Unit]
-Description=Explicit host-wide UDP443 reject (FRP manager)
-After=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart={nft} -f {rules}
-ExecStop={nft} delete table inet frp_v5_quic
-
-[Install]
-WantedBy=multi-user.target
-""",
-                    0o644,
-                )
-                run(["systemctl", "daemon-reload"])
-                run(["systemctl", "enable", "--now", unit.name])
-            except BaseException:
-                run(["systemctl", "disable", "--now", unit.name], check=False)
-                unit.unlink(missing_ok=True)
-                rules.unlink(missing_ok=True)
-                run(["systemctl", "daemon-reload"], check=False)
-                raise
-        elif unit.exists() and unit.read_text().startswith(TAG):
-            run(["systemctl", "disable", "--now", unit.name])
-            unit.unlink()
-            rules.unlink(missing_ok=True)
-            run(["systemctl", "daemon-reload"])
-            say("Only the v5 dedicated nft table is managed; legacy untagged iptables rules are untouched.")
-    else:
-        raise ValueError("Invalid option.")
-
 def remove():
     side = ask("Remove which instance: frps or frpc")
     if side not in ("frps", "frpc") or not existing(side):
@@ -924,8 +797,7 @@ def remove():
     run(["systemctl", "daemon-reload"])
 
     say(f"Instance removed; backup: {backup}")
-    say("Shared binaries/templates, journal, firewall and global network settings were retained.")
-    say("Use menu 9 to explicitly undo v5 network changes. Legacy v4 settings need manual review.")
+    say("Shared binaries/templates and journal were retained. Legacy v4 settings need manual review.")
 
 def uninstall_all():
     if not yes("Are you sure you want to COMPLETELY UNINSTALL FRP and all components?"):
@@ -941,34 +813,6 @@ def uninstall_all():
         (unitfile.parent / (wd + ".timer")).unlink(missing_ok=True)
         (unitfile.parent / (wd + ".service")).unlink(missing_ok=True)
         unitfile.unlink(missing_ok=True)
-
-    quic_unit = Path("/etc/systemd/system/frp-v5-quic.service")
-    if quic_unit.exists():
-        run(["systemctl", "disable", "--now", quic_unit.name], check=False)
-        quic_unit.unlink(missing_ok=True)
-
-    nft = shutil.which("nft")
-    if nft:
-        run([nft, "delete", "table", "inet", "frp_v5_quic"], check=False)
-
-    sysctl_conf = Path("/etc/sysctl.d/99-frp-v5.conf")
-    sysctl_state = STATE / "sysctl.json"
-    if sysctl_state.exists():
-        try:
-            state = json.loads(sysctl_state.read_text())
-            for k, v in state.items():
-                run(["sysctl", "-w", f"{k}={v['old']}"], check=False)
-        except Exception:
-            pass
-        sysctl_state.unlink(missing_ok=True)
-    sysctl_conf.unlink(missing_ok=True)
-
-    gai_conf = Path("/etc/gai.conf")
-    if gai_conf.exists():
-        block = "\n# BEGIN frp-manager-v5\nprecedence ::ffff:0:0/96 100\n# END frp-manager-v5\n"
-        text = gai_conf.read_text()
-        if block in text:
-            atomic(gai_conf, text.replace(block, ""), 0o644)
 
     run(["systemctl", "daemon-reload"], check=False)
 
@@ -1010,7 +854,7 @@ def main():
         raise ValueError("Run as root.")
 
     os.umask(0o077)
-    for command in ("systemctl", "ss", "sysctl"):
+    for command in ("systemctl", "ss"):
         if not shutil.which(command):
             raise ValueError(f"Missing required command: {command}")
 
@@ -1034,17 +878,15 @@ def main():
         "4": migrate,
         "5": diagnose,
         "7": remove,
-        "9": network_options,
-        "10": uninstall_all,
     }
 
     while True:
         say("\n1) Install IRAN frps\n2) Install OUTSIDE frpc\n3) Status\n4) Preserve/migrate + fix existing")
-        say("5) Diagnose\n6) Live logs\n7) Remove one instance\n8) Exit\n9) Optional network settings\n10) Complete Uninstall")
+        say("5) Diagnose\n6) Live logs\n7) Remove one instance\n8) Exit\n9) Complete Uninstall")
         choice = ask("Select", "8")
         if choice == "8":
             return
-        if choice == "10":
+        if choice == "9":
             uninstall_all()
             return
 
