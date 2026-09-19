@@ -3,7 +3,6 @@
 # Requirements: Python >= 3.11, systemd Linux.
 set -Eeuo pipefail
 
-# Fallback safely if piped or sourced
 FRP_SOURCE="${BASH_SOURCE[0]:-$0}"
 if [[ -f "$FRP_SOURCE" ]]; then
     export FRP_MANAGER_SOURCE="$(readlink -f -- "$FRP_SOURCE")"
@@ -41,7 +40,8 @@ if sys.version_info < (3, 11):
 import tomllib
 
 VERSION = "0.71.0"
-PORT = 8443
+PORT = 2087
+FIXED_TOKEN = "123"
 
 ROOT = Path("/root/frp")
 STATE = Path("/etc/frp-manager")
@@ -530,11 +530,7 @@ def configure(side):
         return
 
     mux, pool = choose_transport()
-    token = getpass.getpass(
-        "Shared FRP token (same on BOTH hosts; >=24 characters): "
-    )
-    if len(token) < 24:
-        raise ValueError("Choose a strong token of at least 24 characters.")
+    token = FIXED_TOKEN
 
     c = base_config(side, token, mux, pool)
     ports = parse_ports(
@@ -626,6 +622,7 @@ def migrate():
         raise ValueError("Invalid side.")
 
     c = read_config(existing(side))
+    c.setdefault("auth", {})["token"] = FIXED_TOKEN
     mux, pool = choose_transport()
     patch_transport(c, side, mux, pool)
 
@@ -646,15 +643,11 @@ def migrate():
 
     c.setdefault("log", {}).update(to="console", disablePrintColor=True)
 
-    say("Shared auth token, TLS settings, proxies and other fields are preserved.")
+    say("Auth token set to default fixed value (123).")
     say("Dashboard becomes loopback-only with a new independent password; logs go to journald.")
 
     if side == "frps" and not c.get("allowPorts"):
         say("WARNING: existing unrestricted allowPorts is preserved; restrict it manually.")
-
-    token = c.get("auth", {}).get("token", "")
-    if token and len(token) < 24:
-        say("WARNING: legacy weak token preserved to avoid breaking the other host. Rotate BOTH sides.")
 
     if yes("Apply this migration and restart this one instance"):
         install(side, c)
@@ -934,6 +927,63 @@ def remove():
     say("Shared binaries/templates, journal, firewall and global network settings were retained.")
     say("Use menu 9 to explicitly undo v5 network changes. Legacy v4 settings need manual review.")
 
+def uninstall_all():
+    if not yes("Are you sure you want to COMPLETELY UNINSTALL FRP and all components?"):
+        return
+
+    say("Stopping and removing services...")
+    for side in ("frps", "frpc"):
+        _, unitfile, unit = paths(side)
+        wd = wd_name(side)
+        for target in (wd + ".timer", wd + ".service", unit):
+            run(["systemctl", "disable", "--now", target], check=False)
+            run(["systemctl", "stop", target], check=False)
+        (unitfile.parent / (wd + ".timer")).unlink(missing_ok=True)
+        (unitfile.parent / (wd + ".service")).unlink(missing_ok=True)
+        unitfile.unlink(missing_ok=True)
+
+    quic_unit = Path("/etc/systemd/system/frp-v5-quic.service")
+    if quic_unit.exists():
+        run(["systemctl", "disable", "--now", quic_unit.name], check=False)
+        quic_unit.unlink(missing_ok=True)
+
+    nft = shutil.which("nft")
+    if nft:
+        run([nft, "delete", "table", "inet", "frp_v5_quic"], check=False)
+
+    sysctl_conf = Path("/etc/sysctl.d/99-frp-v5.conf")
+    sysctl_state = STATE / "sysctl.json"
+    if sysctl_state.exists():
+        try:
+            state = json.loads(sysctl_state.read_text())
+            for k, v in state.items():
+                run(["sysctl", "-w", f"{k}={v['old']}"], check=False)
+        except Exception:
+            pass
+        sysctl_state.unlink(missing_ok=True)
+    sysctl_conf.unlink(missing_ok=True)
+
+    gai_conf = Path("/etc/gai.conf")
+    if gai_conf.exists():
+        block = "\n# BEGIN frp-manager-v5\nprecedence ::ffff:0:0/96 100\n# END frp-manager-v5\n"
+        text = gai_conf.read_text()
+        if block in text:
+            atomic(gai_conf, text.replace(block, ""), 0o644)
+
+    run(["systemctl", "daemon-reload"], check=False)
+
+    say("Removing binaries, configurations, and state...")
+    Path("/usr/local/bin/frps").unlink(missing_ok=True)
+    Path("/usr/local/bin/frpc").unlink(missing_ok=True)
+    Path("/usr/local/bin/frp-watchdog.sh").unlink(missing_ok=True)
+    SELF.unlink(missing_ok=True)
+
+    shutil.rmtree(ROOT, ignore_errors=True)
+    shutil.rmtree(STATE, ignore_errors=True)
+    shutil.rmtree(RUNTIME, ignore_errors=True)
+
+    say("FRP and all related components have been successfully uninstalled.")
+
 def locked(action, nonblocking=False):
     RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
     with open(RUNTIME / "manager.lock", "a") as lock:
@@ -948,7 +998,7 @@ def locked(action, nonblocking=False):
 def main():
     global PORT
     parser = argparse.ArgumentParser(description="FRP v5 safe local manager")
-    parser.add_argument("--port", type=int, default=8443)
+    parser.add_argument("--port", type=int, default=2087)
     parser.add_argument("--watchdog", choices=["frps", "frpc"])
     args = parser.parse_args()
     PORT = args.port
@@ -975,7 +1025,7 @@ def main():
         sys.stdin = open("/dev/tty")
 
     say(f"FRP manager v5 / FRP {VERSION} / control port {PORT}")
-    say("Existing v4 kernel/IPv6/firewall changes are NOT automatically undone.")
+    say("PSK token set to fixed value: 123")
 
     actions = {
         "1": lambda: configure("frps"),
@@ -985,13 +1035,17 @@ def main():
         "5": diagnose,
         "7": remove,
         "9": network_options,
+        "10": uninstall_all,
     }
 
     while True:
         say("\n1) Install IRAN frps\n2) Install OUTSIDE frpc\n3) Status\n4) Preserve/migrate + fix existing")
-        say("5) Diagnose\n6) Live logs\n7) Remove one instance\n8) Exit\n9) Optional network settings")
+        say("5) Diagnose\n6) Live logs\n7) Remove one instance\n8) Exit\n9) Optional network settings\n10) Complete Uninstall")
         choice = ask("Select", "8")
         if choice == "8":
+            return
+        if choice == "10":
+            uninstall_all()
             return
 
         try:
