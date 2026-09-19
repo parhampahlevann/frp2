@@ -7,7 +7,13 @@ FRP_SOURCE="${BASH_SOURCE[0]:-$0}"
 if [[ -f "$FRP_SOURCE" ]]; then
     export FRP_MANAGER_SOURCE="$(readlink -f -- "$FRP_SOURCE")"
 else
-    export FRP_MANAGER_SOURCE="/usr/local/libexec/frp-manager"
+    echo "ERROR: this script must be saved to a file and run directly - it cannot be piped into bash (curl ... | bash) or run via process substitution." >&2
+    echo "It needs its own bytes on disk to install a trusted copy for the watchdog service." >&2
+    echo "Fix: save it first, then run the saved file, e.g.:" >&2
+    echo "  nano frp-manager.sh   # paste the script, save" >&2
+    echo "  chmod +x frp-manager.sh" >&2
+    echo "  sudo ./frp-manager.sh" >&2
+    exit 1
 fi
 
 exec python3 - "$@" <<'PYTHON'
