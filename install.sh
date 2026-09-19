@@ -40,6 +40,8 @@ import tomllib
 VERSION = "0.71.0"
 PORT = 2087
 FIXED_TOKEN = "123"
+MUX = True    # tcpMux fixed on both sides; fewer TCP connections, more reliable through restrictive networks
+POOL = 5      # pre-established connection pool, fixed
 
 ROOT = Path("/root/frp")
 STATE = Path("/etc/frp-manager")
@@ -143,18 +145,6 @@ def parse_ports(value, reserved=()):
     if found.intersection(reserved):
         raise ValueError("A selected port conflicts with a control/dashboard port.")
     return sorted(found)
-
-def choose_transport():
-    mode = ask(
-        "Mode: 1=multiplexed, 2=parallel; MUST match on both hosts",
-        "2",
-    )
-    if mode not in ("1", "2"):
-        raise ValueError("Invalid mode.")
-    pool = int(ask("Pre-established pool count (0..100)", "5"))
-    if not 0 <= pool <= 100:
-        raise ValueError("Pool must be 0..100.")
-    return mode == "1", pool
 
 def patch_transport(c, side, mux, pool):
     t = c.setdefault("transport", {})
@@ -522,14 +512,12 @@ WantedBy=timers.target
     say("Local liveness passed. This does NOT prove end-to-end tunnel connectivity.")
 
 def configure(side):
-    if existing(side) and not yes(
-        "Replace existing configuration? Use menu 4 to preserve settings"
-    ):
-        return
-
+    # frps (Iran server): fully automatic, nothing to ask.
+    # frpc (Kharej/outside client): exactly two questions, Server IP first.
     host = None
+    ports = []
+
     if side == "frpc":
-        # Asked first, before anything else: which Iran server this client dials.
         host = ask("Server IP (Iran frps address, IPv4/IPv6/hostname)")
         try:
             ipaddress.ip_address(host)
@@ -539,62 +527,26 @@ def configure(side):
             ):
                 raise ValueError("Invalid hostname/IP.")
 
-    mux, pool = choose_transport()
-    token = FIXED_TOKEN
+        ports = parse_ports(
+            ask("Ports to forward, comma-separated (ranges OK, e.g. 80,443,8000-8010)", "8080"),
+            {PORT, 7400, 7500},
+        )
 
-    c = base_config(side, token, mux, pool)
-    ports = parse_ports(
-        ask("Ports to forward, comma-separated (ranges OK, e.g. 80,443,8000-8010)", "8080"),
-        {PORT, 7400, 7500},
-    )
+    c = base_config(side, FIXED_TOKEN, MUX, POOL)
 
     if side == "frps":
         c.update(
             bindAddr="0.0.0.0",
             bindPort=PORT,
             proxyBindAddr="0.0.0.0",
-            allowPorts=[{"single": p} for p in ports],
             detailedErrorsToClient=False,
         )
-        cert = ask(
-            "TLS certificate fullchain path (blank = FRP automatic certificate)"
-        )
-        if cert:
-            key = ask("TLS private key path")
-            for p in (cert, key):
-                if not Path(p).is_file():
-                    raise ValueError("Certificate/private-key file missing.")
-            c["transport"]["tls"].update(
-                certFile=str(Path(cert).resolve()),
-                keyFile=str(Path(key).resolve()),
-            )
+        # No allowPorts restriction: whatever the client registers is accepted,
+        # so a forgotten server-side allow-list can never block the tunnel.
     else:
         c.update(serverAddr=host, serverPort=PORT)
-
-        ca = ask(
-            "Trusted CA PEM path (recommended; blank disables server-certificate verification)"
-        )
-        if ca:
-            if not Path(ca).is_file():
-                raise ValueError("CA file not found.")
-            c["transport"]["tls"].update(
-                trustedCaFile=str(Path(ca).resolve()),
-                serverName=ask("Certificate DNS name or IP (SAN)", host),
-            )
-        elif not yes(
-            "WARNING: encryption WITHOUT server identity verification. Continue insecurely"
-        ):
-            return
-        else:
-            sni = ask("Optional SNI (does NOT authenticate the server)")
-            if sni:
-                c["transport"]["tls"]["serverName"] = sni
-
-        kinds = (
-            ["tcp", "udp"]
-            if yes("Also forward UDP? Only if the application needs it")
-            else ["tcp"]
-        )
+        # TLS stays encrypted but unauthenticated (frps uses its own automatic
+        # certificate, so there is nothing fixed to pin against).
         c["proxies"] = [
             {
                 "name": f"{kind}-{p}",
@@ -603,56 +555,15 @@ def configure(side):
                 "localPort": p,
                 "remotePort": p,
             }
-            for kind in kinds
+            for kind in ("tcp", "udp")
             for p in ports
         ]
 
     install(side, c, upgrade=True)
     say("No firewall was changed. Allow ONLY required ports in the Iran host/provider firewall.")
-    say(f"Control: {PORT}/tcp; proxy TCP ports: " + " ".join(map(str, ports)))
-    if side == "frpc" and "udp" in [p.get("type") for p in c.get("proxies", [])]:
-        say("Also allow these UDP proxy ports on the Iran server.")
+    if ports:
+        say(f"Control: {PORT}/tcp; forwarded TCP+UDP ports: " + " ".join(map(str, ports)))
     say("Dashboard stays on loopback. Credentials are in the root-only config; use an SSH tunnel.")
-
-def migrate():
-    available = [s for s in ("frps", "frpc") if existing(s)]
-    if not available:
-        raise ValueError("No existing configuration found for this --port.")
-
-    side = available[0] if len(available) == 1 else ask("Which side: frps or frpc")
-    if side not in available:
-        raise ValueError("Invalid side.")
-
-    c = read_config(existing(side))
-    c.setdefault("auth", {})["token"] = FIXED_TOKEN
-    mux, pool = choose_transport()
-    patch_transport(c, side, mux, pool)
-
-    if side == "frpc" and yes("Remove only UDP proxies from this configuration"):
-        c["proxies"] = [p for p in c.get("proxies", []) if p.get("type") != "udp"]
-        if not c["proxies"]:
-            raise ValueError("Refusing to leave zero proxies.")
-
-    c.setdefault("webServer", {})["addr"] = "127.0.0.1"
-    if c["webServer"].get("tls", {}).get("certFile"):
-        raise ValueError("Custom HTTPS dashboard requires manual loopback/TLS migration.")
-
-    if not c["webServer"].get("port"):
-        c["webServer"]["port"] = 7500 if side == "frps" else 7400
-    if not c["webServer"].get("user"):
-        c["webServer"]["user"] = "admin"
-    c["webServer"]["password"] = secrets.token_urlsafe(32)
-
-    c.setdefault("log", {}).update(to="console", disablePrintColor=True)
-
-    say("Auth token set to default fixed value (123).")
-    say("Dashboard becomes loopback-only with a new independent password; logs go to journald.")
-
-    if side == "frps" and not c.get("allowPorts"):
-        say("WARNING: existing unrestricted allowPorts is preserved; restrict it manually.")
-
-    if yes("Apply this migration and restart this one instance"):
-        install(side, c)
 
 def watchdog(side):
     path = existing(side)
@@ -724,47 +635,24 @@ def status():
         except (OSError, ValueError, KeyError) as error:
             say(f"Admin API unavailable: {type(error).__name__}")
 
-def diagnose():
-    status()
-    side = existing("frpc")
-    if not side:
-        say("Run destination/backend checks on the OUTSIDE client host.")
-        return
+        if side == "frpc":
+            try:
+                with socket.create_connection((c["serverAddr"], c["serverPort"]), timeout=5):
+                    say("Tunnel to Iran server: control port TCP connect OK")
+            except OSError as error:
+                say(f"Tunnel to Iran server: control TCP connect FAILED ({error})")
 
-    c = read_config(side)
-    try:
-        with socket.create_connection((c["serverAddr"], c["serverPort"]), timeout=5):
-            say("FRP control port TCP connect: OK (not an authentication test)")
-    except OSError as error:
-        say(f"FRP control TCP connect failed: {error}")
-
-    proxies = [p for p in c.get("proxies", []) if p.get("type") == "tcp" and "localPort" in p]
-    for p in proxies[:20]:
-        try:
-            with socket.create_connection(
-                (p.get("localIP", "127.0.0.1"), p["localPort"]), timeout=2
-            ):
-                say(f"Backend {p['name']}: TCP reachable")
-        except OSError:
-            say(f"Backend {p['name']}: TCP FAILED")
-
-    if len(proxies) > 20:
-        say("Backend tests limited to the first 20 proxies.")
-
-    if shutil.which("curl"):
-        for family in ("-4", "-6"):
-            for url in ("https://www.google.com", "https://www.cloudflare.com"):
-                result = run(
-                    [
-                        "curl", "--noproxy", "*", family, "-sS", "-o", "/dev/null",
-                        "-w", "%{http_code}", "--connect-timeout", "4", "--max-time", "8", url,
-                    ],
-                    check=False,
-                )
-                say(f"{family} {url}: HTTP {result or 'unavailable'}")
-
-    say("A failed site/IPv6 test is not proof of a broken tunnel. No network settings were changed.")
-    say("FRP forwards ports; it is not itself a general-purpose VPN or an open Internet proxy.")
+            proxies = [p for p in c.get("proxies", []) if p.get("type") == "tcp" and "localPort" in p]
+            for p in proxies[:20]:
+                try:
+                    with socket.create_connection(
+                        (p.get("localIP", "127.0.0.1"), p["localPort"]), timeout=2
+                    ):
+                        say(f"  Backend {p['name']}: TCP reachable")
+                except OSError:
+                    say(f"  Backend {p['name']}: TCP FAILED")
+            if len(proxies) > 20:
+                say("  Backend tests limited to the first 20 proxies.")
 
 def remove():
     side = ask("Remove which instance: frps or frpc")
@@ -772,8 +660,6 @@ def remove():
         raise ValueError("No such managed configuration.")
 
     cfg, unitfile, unit = paths(side)
-    if not unitfile.exists() or not unitfile.read_text().startswith(TAG):
-        raise ValueError("Migrate this legacy instance using option 4 before v5 removal.")
 
     if not yes(f"Stop and remove ONLY {unit}? Backups and shared binaries will remain"):
         return
@@ -797,7 +683,7 @@ def remove():
     run(["systemctl", "daemon-reload"])
 
     say(f"Instance removed; backup: {backup}")
-    say("Shared binaries/templates and journal were retained. Legacy v4 settings need manual review.")
+    say("Shared binaries/templates and journal were retained.")
 
 def uninstall_all():
     if not yes("Are you sure you want to COMPLETELY UNINSTALL FRP and all components?"):
@@ -875,23 +761,21 @@ def main():
         "1": lambda: configure("frps"),
         "2": lambda: configure("frpc"),
         "3": status,
-        "4": migrate,
-        "5": diagnose,
-        "7": remove,
+        "5": remove,
     }
 
     while True:
-        say("\n1) Install IRAN frps\n2) Install OUTSIDE frpc\n3) Status\n4) Preserve/migrate + fix existing")
-        say("5) Diagnose\n6) Live logs\n7) Remove one instance\n8) Exit\n9) Complete Uninstall")
-        choice = ask("Select", "8")
-        if choice == "8":
+        say("\n1) Install IRAN frps\n2) Install OUTSIDE frpc\n3) Status\n4) Live logs")
+        say("5) Remove one instance\n6) Exit\n7) Complete Uninstall")
+        choice = ask("Select", "6")
+        if choice == "6":
             return
-        if choice == "9":
+        if choice == "7":
             uninstall_all()
             return
 
         try:
-            if choice == "6":
+            if choice == "4":
                 side = ask("frps or frpc", "frpc")
                 if side not in ("frps", "frpc"):
                     raise ValueError("Invalid side.")
