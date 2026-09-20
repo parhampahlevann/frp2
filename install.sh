@@ -641,6 +641,7 @@ WantedBy=timers.target
                     "Service/local health check failed. Inspect the journal."
                 )
 
+            (RUNTIME / f"{side}-{PORT}.json").unlink(missing_ok=True)  # fresh watchdog history after a (re)install
             run(["systemctl", "start", wd + ".timer"])
             if old and old != cfg:
                 old.chmod(0o600)
@@ -692,7 +693,10 @@ def post_install(side, c, profile):
         if total and running == total:
             say(f"TUNNEL UP: {running}/{total} proxies running.")
         else:
-            say(f"WARNING: tunnel is not fully up yet ({running}/{total} proxies running).")
+            if total:
+                say(f"WARNING: tunnel is not fully up yet ({running}/{total} proxies running).")
+            else:
+                say("WARNING: tunnel is NOT up: frpc has no connection to frps yet.")
             say("  Check: frps installed and running on the Iran server; its firewall allows "
                 f"{PORT}/tcp; the same token on both sides; then: journalctl -u {unit} -n 50 --no-pager")
     else:
@@ -809,16 +813,24 @@ def probe(side, c):
     except (OSError, http.client.HTTPException) as error:
         return "fail", f"admin API not responding ({type(error).__name__})"
 
-    if total == 0 or running > 0:
+    if running > 0:
         return "ok", f"{running}/{total} proxies running"
 
-    # every proxy is down: is the server even reachable from here?
+    expected = len(c.get("proxies") or [])
+    if total == 0 and expected == 0:
+        return "ok", "no proxies configured"
+
+    # Nothing is running. NOTE: while frpc has no connection to frps, its API
+    # returns an EMPTY list (total == 0), not "stopped" proxies - so total == 0
+    # with proxies configured means "tunnel down", exactly like 0/N running.
+    # Is the server even reachable from here?
+    seen = f"0/{total or expected} proxies running"
     try:
         socket.create_connection((c["serverAddr"], int(c["serverPort"])), timeout=5).close()
     except OSError as error:
-        return "wait", (f"0/{total} proxies running and the server is unreachable "
-                        f"({type(error).__name__}); frpc keeps retrying by itself, restart would not help")
-    return "fail", f"0/{total} proxies running although the server port is reachable"
+        return "wait", (f"{seen} and the server is unreachable ({type(error).__name__}); "
+                        "frpc keeps retrying by itself, a restart would not help")
+    return "fail", f"{seen} although the server port is reachable"
 
 
 def watchdog(side):
@@ -842,7 +854,8 @@ def watchdog(side):
         atomic(record, json.dumps(state))
 
     def restart(reason, reset_failed=False):
-        wait = min(WD_BACKOFF * 2 ** min(state["restarts"], 10), WD_BACKOFF_MAX)
+        # 1st automatic restart: immediate; 2nd: >=10 min later; 3rd: >=20 min; ... capped
+        wait = min(WD_BACKOFF * 2 ** min(max(state["restarts"] - 1, 0), 10), WD_BACKOFF_MAX)
         since = now - state["last"]
         if since < wait:
             say(f"watchdog: {unit}: {reason}; restart suppressed, backoff {int(wait - since)}s left")
@@ -925,7 +938,10 @@ def status():
             )
             if side == "frpc":
                 running, total = proxy_counts(data)
-                say(f"Registered running proxies: {running}/{total} (not a backend reachability test)")
+                if total == 0:
+                    say("Tunnel is DOWN: frpc has no active connection to frps (it keeps retrying by itself)")
+                else:
+                    say(f"Registered running proxies: {running}/{total} (not a backend reachability test)")
                 rows = [p for g in data.values() if isinstance(g, list)
                         for p in g if isinstance(p, dict)]
                 bad = [p for p in rows if p.get("status") != "running"]
