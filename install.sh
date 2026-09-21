@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FRP v5.1: safe local manager for FRP 0.71.0.
+# FRP v5.2: safe local manager for FRP 0.71.0.
 # Requirements: Python >= 3.8, systemd Linux.
 set -Eeuo pipefail
 
@@ -56,13 +56,20 @@ VERSION = "0.71.0"
 PORT = 2087
 DEFAULT_TOKEN = "123"
 TOKEN = DEFAULT_TOKEN
-MUX = True        # tcpMux fixed on both sides (must match); fewer TCP connections, reliable through restrictive networks
 MAX_POOL = 100    # frps accepts any client pool size up to this
 
-# Connection profiles. Only settings that do NOT have to match between the two
-# servers are tuned here (timers, keepalives, pool size), so frps and frpc can
-# use different profiles and still interoperate. tcpMux/TLS/protocol stay fixed.
-#   mux_ka   yamux keepalive interval (s), both sides
+# Connection profiles. Timers, keepalives and pool size are per side, so frps and
+# frpc may use different profiles. Two fields change the TRANSPORT itself and must
+# therefore agree between the two servers ("strict" profiles - choose them on BOTH):
+#   mux     tcpMux on/off. frp requires the same value on frps and frpc.
+#           on  = every proxied flow shares ONE TCP connection (few sockets, but a
+#                 lost packet or a bulk download stalls every other flow, game UDP included)
+#           off = every flow gets its own TCP connection (no head-of-line blocking)
+#   proto   tcp | kcp. frpc dials it; frps opens the matching listener (kcp = UDP).
+# Measured (100 ms RTT, 1% loss each way, game UDP + bulk in one tunnel): mux on gave
+# 141 ms median / 273 ms p95, mux off 105 / 210, kcp 119 / 135; with a saturated link
+# the median game RTT was 1326 ms (mux on) vs 158 ms (mux off).
+#   mux_ka   yamux keepalive interval (s), only used when mux is on
 #   tcp_ka   TCP keepalive (s): frps accepted conns / frpc dial
 #   hb_iv    frpc heartbeat interval (s)
 #   hb_to_c  frpc heartbeat timeout (s)
@@ -74,21 +81,33 @@ MAX_POOL = 100    # frps accepts any client pool size up to this
 PROFILES = {
     "balanced": dict(
         desc="recommended default: good speed, stable, low overhead",
+        proto="tcp", mux=True, strict=False,
         mux_ka=20, tcp_ka=30, hb_iv=15, hb_to_c=60, hb_to_s=120,
         dial_to=15, pool=10, user_to=30, strikes=5,
     ),
+    # gaming heartbeat 5/15/45: with mux off, a 25 s path blackout took 8.8 s to recover
+    # with 10/40/80 but 1.9 s with 5/15/45 (kcp recovers in ~1.4 s with either).
     "gaming": dict(
-        desc="low jitter: warm pool, fast failure detection/recovery, fail-fast",
+        desc="lowest jitter over TCP: own connection per flow, bulk can't stall games [BOTH servers]",
+        proto="tcp", mux=False, strict=True,
+        mux_ka=10, tcp_ka=15, hb_iv=5, hb_to_c=15, hb_to_s=45,
+        dial_to=10, pool=16, user_to=10, strikes=3,
+    ),
+    "gaming-kcp": dict(
+        desc="best jitter tail if UDP passes (KCP); game ports only; +~15 ms base [BOTH servers]",
+        proto="kcp", mux=True, strict=True,
         mux_ka=10, tcp_ka=15, hb_iv=10, hb_to_c=40, hb_to_s=80,
         dial_to=10, pool=16, user_to=10, strikes=3,
     ),
     "streaming": dict(
         desc="smooth long sessions: tolerant timeouts, big pool, no false drops",
+        proto="tcp", mux=True, strict=False,
         mux_ka=30, tcp_ka=30, hb_iv=20, hb_to_c=90, hb_to_s=180,
         dial_to=15, pool=16, user_to=45, strikes=5,
     ),
     "speed": dict(
         desc="max throughput: biggest pool, timeouts tolerant of a saturated link",
+        proto="tcp", mux=True, strict=False,
         mux_ka=30, tcp_ka=30, hb_iv=30, hb_to_c=120, hb_to_s=240,
         dial_to=20, pool=32, user_to=30, strikes=5,
     ),
@@ -269,9 +288,9 @@ def choose_profile(preset=None):
     if preset:
         return preset
     names = list(PROFILES)
-    say("\nConnection profile (choose the same one on both servers to keep them in sync):")
+    say("\nConnection profile ([BOTH servers] = must be the same profile on frps and frpc):")
     for i, name in enumerate(names, 1):
-        say(f"  {i}) {name:<9} - {PROFILES[name]['desc']}")
+        say(f"  {i}) {name:<10} - {PROFILES[name]['desc']}")
     while True:
         raw = ask("Profile", "1").lower()
         if raw in PROFILES:
@@ -284,10 +303,11 @@ def choose_profile(preset=None):
 def patch_transport(c, side, p):
     t = c.setdefault("transport", {})
     t.update(
-        tcpMux=MUX,
-        tcpMuxKeepaliveInterval=p["mux_ka"],
+        tcpMux=p["mux"],
         heartbeatTimeout=(p["hb_to_s"] if side == "frps" else p["hb_to_c"]),
     )
+    if p["mux"]:
+        t["tcpMuxKeepaliveInterval"] = p["mux_ka"]
     if side == "frps":
         t.update(tcpKeepalive=p["tcp_ka"], maxPoolCount=MAX_POOL)
         c["userConnTimeout"] = p["user_to"]
@@ -322,7 +342,7 @@ def base_config(side, token, p):
     patch_transport(c, side, p)
     c["transport"]["tls"] = {"force": True} if side == "frps" else {"enable": True}
     if side == "frpc":
-        c["transport"]["protocol"] = "tcp"
+        c["transport"]["protocol"] = p["proto"]
     return c
 
 
@@ -369,13 +389,13 @@ def proxy_counts(status):
     )
 
 
-def check_free(port):
+def check_free(port, udp=False):
     listeners = run(
-        ["ss", "-H", "-ltnp", f"sport = :{int(port)}"]
+        ["ss", "-H", "-lunp" if udp else "-ltnp", f"sport = :{int(port)}"]
     )
     if listeners:
         raise RuntimeError(
-            f"TCP port {port} is busy; no process killed.\n{listeners}"
+            f"{'UDP' if udp else 'TCP'} port {port} is busy; no process killed.\n{listeners}"
         )
 
 
@@ -580,6 +600,8 @@ def install(side, c, profile):
             check_free(c["webServer"]["port"])
             if side == "frps":
                 check_free(c["bindPort"])
+                if c.get("kcpBindPort"):
+                    check_free(c["kcpBindPort"], udp=True)
 
             if staged != executable:
                 atomic(executable, staged.read_bytes(), 0o755)
@@ -669,6 +691,38 @@ WantedBy=timers.target
     return backupdir
 
 
+def build_config(side, profile, host=None, ports=()):
+    prof = PROFILES[profile]
+    c = base_config(side, TOKEN, prof)
+    if side == "frps":
+        c.update(
+            bindAddr="0.0.0.0",
+            bindPort=PORT,
+            proxyBindAddr="0.0.0.0",
+            detailedErrorsToClient=False,
+        )
+        if prof["proto"] == "kcp":
+            c["kcpBindPort"] = PORT  # UDP listener next to the TCP one
+        # No allowPorts restriction: whatever the client registers is accepted,
+        # so a forgotten server-side allow-list can never block the tunnel.
+    else:
+        c.update(serverAddr=host, serverPort=PORT)
+        # TLS stays encrypted but unauthenticated (frps uses its own automatic
+        # certificate, so there is nothing fixed to pin against).
+        c["proxies"] = [
+            {
+                "name": f"{kind}-{p}",
+                "type": kind,
+                "localIP": "127.0.0.1",
+                "localPort": p,
+                "remotePort": p,
+            }
+            for kind in ("tcp", "udp")
+            for p in ports
+        ]
+    return c
+
+
 def wait_tunnel(c, seconds):
     running = total = 0
     deadline = time.time() + seconds
@@ -699,9 +753,21 @@ def post_install(side, c, profile):
                 say("WARNING: tunnel is NOT up: frpc has no connection to frps yet.")
             say("  Check: frps installed and running on the Iran server; its firewall allows "
                 f"{PORT}/tcp; the same token on both sides; then: journalctl -u {unit} -n 50 --no-pager")
+            pr = PROFILES[profile]
+            if pr["proto"] == "kcp":
+                say(f"  '{profile}' uses UDP: allow {PORT}/udp on the Iran server and its provider firewall, "
+                    f"and install frps with '{profile}' too. If UDP is filtered on this route, use 'gaming' "
+                    "(TCP) on both servers instead.")
+            elif not pr["mux"]:
+                say(f"  '{profile}' turns tcpMux off: frps must ALSO be installed with '{profile}' "
+                    "(a tcpMux mismatch makes the login fail).")
+            else:
+                say("  If frps runs 'gaming' (tcpMux off) or 'gaming-kcp', use that same profile here.")
     else:
-        say(f"frps is up and listening on {PORT}/tcp. Install frpc on the foreign server "
-            "with the same token.")
+        kcp = f" and {PORT}/udp (KCP)" if c.get("kcpBindPort") else ""
+        same = f" and the same profile ('{profile}')" if PROFILES[profile]["strict"] else ""
+        say(f"frps is up and listening on {PORT}/tcp{kcp}. Install frpc on the foreign server "
+            f"with the same token{same}.")
 
     timer = run(["systemctl", "is-active", wd + ".timer"], check=False)
     code, out = run_rc(["systemctl", "start", wd + ".service"], timeout=90)
@@ -732,37 +798,18 @@ def configure(side, preset=None):
         )
 
     profile = choose_profile(preset)
-    c = base_config(side, TOKEN, PROFILES[profile])
-
-    if side == "frps":
-        c.update(
-            bindAddr="0.0.0.0",
-            bindPort=PORT,
-            proxyBindAddr="0.0.0.0",
-            detailedErrorsToClient=False,
-        )
-        # No allowPorts restriction: whatever the client registers is accepted,
-        # so a forgotten server-side allow-list can never block the tunnel.
-    else:
-        c.update(serverAddr=host, serverPort=PORT)
-        # TLS stays encrypted but unauthenticated (frps uses its own automatic
-        # certificate, so there is nothing fixed to pin against).
-        c["proxies"] = [
-            {
-                "name": f"{kind}-{p}",
-                "type": kind,
-                "localIP": "127.0.0.1",
-                "localPort": p,
-                "remotePort": p,
-            }
-            for kind in ("tcp", "udp")
-            for p in ports
-        ]
+    prof = PROFILES[profile]
+    if prof["strict"]:
+        say(f"NOTE: '{profile}' changes the transport, so the OTHER server must use '{profile}' as well.")
+    c = build_config(side, profile, host, ports)
 
     locked(lambda: install(side, c, profile))
     say("No firewall was changed. Allow ONLY required ports in the Iran host/provider firewall.")
+    if side == "frps" and c.get("kcpBindPort"):
+        say(f"KCP needs {PORT}/udp open in the Iran host/provider firewall (in addition to {PORT}/tcp).")
     if ports:
-        say(f"Control: {PORT}/tcp; forwarded TCP+UDP ports: " + " ".join(map(str, ports)))
+        control = f"{PORT}/udp (KCP)" if prof["proto"] == "kcp" else f"{PORT}/tcp"
+        say(f"Control: {control}; forwarded TCP+UDP ports: " + " ".join(map(str, ports)))
     say("Dashboard stays on loopback. Credentials are in the root-only config; use an SSH tunnel.")
     post_install(side, c, profile)
 
@@ -919,6 +966,15 @@ def watchdog(side):
 # Status / removal
 # --------------------------------------------------------------------------
 
+def transport_summary(c, side):
+    t = c.get("transport", {})
+    if side == "frpc":
+        proto = t.get("protocol", "tcp")
+    else:
+        proto = "tcp+kcp" if c.get("kcpBindPort") else "tcp"
+    return f"{proto}, tcpMux {'on' if t.get('tcpMux', True) else 'off'}"
+
+
 def status():
     found = False
     for side in ("frps", "frpc"):
@@ -929,7 +985,7 @@ def status():
         c = read_config(path)
         unit = paths(side)[2]
         profile = load_profile(side)
-        say(f"\n{unit}  [profile: {profile}]")
+        say(f"\n{unit}  [profile: {profile}; transport: {transport_summary(c, side)}]")
         say(run(["systemctl", "status", "--no-pager", "--lines=5", unit], check=False))
         try:
             data = api(
@@ -1070,7 +1126,7 @@ def locked(action, nonblocking=False):
 
 def main():
     global PORT, TOKEN
-    parser = argparse.ArgumentParser(description="FRP v5.1 safe local manager")
+    parser = argparse.ArgumentParser(description="FRP v5.2 safe local manager")
     parser.add_argument("--port", type=int, default=2087)
     parser.add_argument("--watchdog", choices=["frps", "frpc"])
     parser.add_argument("--profile", choices=list(PROFILES),
@@ -1105,7 +1161,7 @@ def main():
     if not sys.stdin.isatty():
         sys.stdin = open("/dev/tty")
 
-    say(f"FRP manager v5.1 / FRP {VERSION} / control port {PORT}")
+    say(f"FRP manager v5.2 / FRP {VERSION} / control port {PORT}")
     if TOKEN == DEFAULT_TOKEN:
         say("WARNING: default token '123' is public knowledge. Anyone who can reach the control port")
         say("         can register ports on the Iran server. Use --token <secret> on BOTH servers.")
