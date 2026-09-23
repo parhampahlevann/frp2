@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FRP v5.4: safe, highly-optimized local manager for FRP 0.71.0.
+# FRP v5.5: safe, auto-reviving local manager for FRP 0.71.0.
 # Requirements: Python >= 3.8, systemd Linux.
 set -Eeuo pipefail
 
@@ -59,16 +59,16 @@ PROFILES = {
         desc="Balanced default: multiplexed TCP, low resource usage, solid stability",
         proto="tcp", mux=True, strict=False,
         mux_ka=25, tcp_ka=30, hb_iv=20, hb_to_c=60, hb_to_s=75,
-        dial_to=10, pool=12, user_to=30, strikes=4,
+        dial_to=10, pool=12, user_to=30, strikes=3,
     ),
     "gaming": dict(
-        desc="Lowest latency & jitter over TCP: mux OFF (no Head-of-Line blocking), pool=32 [BOTH servers]",
+        desc="Lowest latency & jitter over TCP: mux OFF, isolated flows, pool=32 [BOTH servers]",
         proto="tcp", mux=False, strict=True,
         mux_ka=10, tcp_ka=15, hb_iv=10, hb_to_c=30, hb_to_s=35,
         dial_to=10, pool=32, user_to=25, strikes=3,
     ),
     "gaming-kcp": dict(
-        desc="Resistant to packet-loss: KCP over UDP, fast recovery, best for lossy routes [BOTH servers]",
+        desc="Resistant to packet-loss: KCP over UDP, best for lossy routes [BOTH servers]",
         proto="kcp", mux=True, strict=True,
         mux_ka=15, tcp_ka=15, hb_iv=15, hb_to_c=40, hb_to_s=45,
         dial_to=10, pool=24, user_to=25, strikes=3,
@@ -77,23 +77,23 @@ PROFILES = {
         desc="Continuous high-bitrate media: large pool, tolerant timeouts to prevent buffering stalls",
         proto="tcp", mux=True, strict=False,
         mux_ka=30, tcp_ka=45, hb_iv=25, hb_to_c=75, hb_to_s=90,
-        dial_to=15, pool=24, user_to=45, strikes=5,
+        dial_to=15, pool=24, user_to=45, strikes=4,
     ),
     "speed": dict(
-        desc="Maximum throughput: mux OFF (bypasses Yamux buffer limits), massive pool=40 [BOTH servers]",
+        desc="Maximum throughput: mux OFF (no Yamux limits), massive pool=40 [BOTH servers]",
         proto="tcp", mux=False, strict=True,
         mux_ka=20, tcp_ka=30, hb_iv=20, hb_to_c=60, hb_to_s=90,
-        dial_to=20, pool=40, user_to=60, strikes=5,
+        dial_to=20, pool=40, user_to=60, strikes=4,
     ),
 }
 DEFAULT_PROFILE = "balanced"
 
 MAX_POOL = max(p["pool"] for p in PROFILES.values()) + 32
 
-WD_GRACE = 90
-WD_BACKOFF = 300
-WD_BACKOFF_MAX = 3600
-WD_HEALTHY_RESET = 1200
+WD_GRACE = 45
+WD_BACKOFF = 120
+WD_BACKOFF_MAX = 1800
+WD_HEALTHY_RESET = 900
 MONO = time.monotonic
 
 ROOT = Path("/root/frp")
@@ -101,7 +101,7 @@ STATE = Path("/etc/frp-manager")
 SELF = Path("/usr/local/libexec/frp-manager")
 RUNTIME = Path("/run/frp-manager")
 
-TAG = "# Managed by frp-manager-v5.4"
+TAG = "# Managed by frp-manager-v5.5"
 
 
 def say(text):
@@ -209,9 +209,7 @@ def parse_ports(value, reserved=()):
     for part in value.split(","):
         part = part.strip()
         if not re.fullmatch(r"[0-9]{1,5}(?:\s*-\s*[0-9]{1,5})?", part):
-            raise ValueError(
-                "Use decimal ports/ranges, e.g. 80,443,8000-8010; no empty entries."
-            )
+            raise ValueError("Use decimal ports/ranges, e.g. 80,443,8000-8010.")
         ends = [int(x.strip(), 10) for x in part.split("-")]
         start, end = ends[0], ends[-1]
         if not 1 <= start <= end <= 65535:
@@ -370,14 +368,18 @@ def proxy_counts(status):
     )
 
 
-def check_free(port, udp=False):
-    listeners = run(
-        ["ss", "-H", "-lunp" if udp else "-ltnp", f"sport = :{int(port)}"]
-    )
-    if listeners:
-        raise RuntimeError(
-            f"{'UDP' if udp else 'TCP'} port {port} is busy; cannot bind.\n{listeners}"
+def check_free(port, udp=False, retries=5):
+    for i in range(retries):
+        listeners = run(
+            ["ss", "-H", "-lunp" if udp else "-ltnp", f"sport = :{int(port)}"]
         )
+        if not listeners:
+            return
+        if i < retries - 1:
+            time.sleep(1)
+    raise RuntimeError(
+        f"{'UDP' if udp else 'TCP'} port {port} is occupied; cannot bind.\n{listeners}"
+    )
 
 
 def fetch(url, limit, tries=3):
@@ -499,13 +501,13 @@ def wd_name(side):
 
 
 def service_text(side, cfg):
+    # StartLimitIntervalSec=0 ensures systemd NEVER gives up restarting on crash/failure
     return f"""{TAG}
 [Unit]
 Description=FRP {side} ({PORT})
 After=network-online.target nss-lookup.target
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=10
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -516,6 +518,7 @@ RestartSec=3s
 TimeoutStopSec=15s
 LimitNOFILE=262144
 LimitNPROC=65535
+OOMScoreAdjust=-500
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
@@ -595,7 +598,7 @@ Description=FRP local watchdog ({side}, {PORT})
 [Service]
 Type=oneshot
 ExecStart={SELF} --port {PORT} --watchdog {side}
-TimeoutStartSec=90s
+TimeoutStartSec=60s
 UMask=0077
 """,
                 0o644,
@@ -607,7 +610,7 @@ UMask=0077
 Description=FRP watchdog timer ({side}, {PORT})
 
 [Timer]
-OnBootSec=90s
+OnBootSec=60s
 OnUnitActiveSec=60s
 AccuracySec=5s
 Unit={wd}.service
@@ -717,7 +720,7 @@ def post_install(side, c, profile):
         say(f"frps is active on {PORT}/tcp{kcp}.")
 
     timer = run(["systemctl", "is-active", wd + ".timer"], check=False)
-    code, _ = run_rc(["systemctl", "start", wd + ".service"], timeout=90)
+    run_rc(["systemctl", "start", wd + ".service"], timeout=60)
     verdict, msg = probe(side, c)
     say(f"Watchdog probe: {verdict} ({msg}); Timer: {timer}")
 
@@ -790,7 +793,6 @@ def probe(side, c):
         return "ok", "no proxies registered"
 
     seen = f"0/{total or expected} proxies active"
-    # Reachability test
     proto = c.get("transport", {}).get("protocol", "tcp")
     if proto == "tcp":
         try:
@@ -826,10 +828,10 @@ def watchdog(side):
         current = run(["systemctl", "is-active", unit], check=False)
         if current in ("activating", "deactivating"):
             return
-        wait = min(WD_BACKOFF * (2 ** min(max(state["restarts"] - 1, 0), 6)), WD_BACKOFF_MAX)
+        wait = min(WD_BACKOFF * (2 ** min(max(state["restarts"] - 1, 0), 4)), WD_BACKOFF_MAX)
         since = now - state["last"]
         if since < wait:
-            say(f"watchdog: restart suppressed; backoff cooling {int(wait - since)}s left")
+            say(f"watchdog: restart suppressed; cooling {int(wait - since)}s left")
             return
         state["last"] = now
         state["restarts"] += 1
@@ -842,9 +844,14 @@ def watchdog(side):
         run(["systemctl", "restart", unit])
 
     active = run(["systemctl", "is-active", unit], check=False)
-    if active == "failed":
-        restart("unit failed", reset_failed=True)
-        save()
+    enabled = run(["systemctl", "is-enabled", unit], check=False) == "enabled"
+
+    # CRITICAL FIX: If the unit is stopped/inactive but enabled, force revive it immediately!
+    if active in ("inactive", "failed"):
+        if enabled:
+            say(f"watchdog: {unit} is {active} but enabled; reviving service now...")
+            restart(f"unit was unexpectedly {active}", reset_failed=True)
+            save()
         return
 
     if active != "active":
@@ -972,7 +979,7 @@ def locked(action, nonblocking=False):
 
 def main():
     global PORT, TOKEN
-    parser = argparse.ArgumentParser(description="FRP v5.4 Safe Manager")
+    parser = argparse.ArgumentParser(description="FRP v5.5 Safe Auto-Reviving Manager")
     parser.add_argument("--port", type=int, default=2087)
     parser.add_argument("--watchdog", choices=["frps", "frpc"])
     parser.add_argument("--profile", choices=list(PROFILES))
@@ -997,7 +1004,7 @@ def main():
     if not sys.stdin.isatty():
         sys.stdin = open("/dev/tty")
 
-    say(f"FRP Manager v5.4 | FRP {VERSION} | Control Port: {PORT}")
+    say(f"FRP Manager v5.5 | FRP {VERSION} | Control Port: {PORT}")
 
     actions = {
         "1": lambda: configure("frps", args.profile),
