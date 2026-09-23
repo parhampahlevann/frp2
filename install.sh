@@ -71,8 +71,11 @@ MAX_POOL = 100    # frps accepts any client pool size up to this
 # the median game RTT was 1326 ms (mux on) vs 158 ms (mux off).
 #   mux_ka   yamux keepalive interval (s), only used when mux is on
 #   tcp_ka   TCP keepalive (s): frps accepted conns / frpc dial
-#   hb_iv    frpc heartbeat interval (s)
-#   hb_to_c  frpc heartbeat timeout (s)
+#   hb_iv    frpc heartbeat interval (s) - only used when mux is off. When mux is
+#            on, frpc gets heartbeatInterval=-1 instead: tcpMux already keeps the
+#            session alive via mux_ka, and frp skips heartbeat-timeout enforcement
+#            entirely while tcpMux is on, so a second heartbeat is pure overhead.
+#   hb_to_c  frpc heartbeat timeout (s) - only enforced when mux is off, same reason.
 #   hb_to_s  frps heartbeat timeout (s) - always > any frpc hb_iv
 #   dial_to  frpc dial timeout to frps (s)
 #   pool     frpc pre-established work-connection pool
@@ -302,23 +305,50 @@ def choose_profile(preset=None):
 
 def patch_transport(c, side, p):
     t = c.setdefault("transport", {})
-    t.update(
-        tcpMux=p["mux"],
-        heartbeatTimeout=(p["hb_to_s"] if side == "frps" else p["hb_to_c"]),
-    )
+    t["tcpMux"] = p["mux"]
     if p["mux"]:
         t["tcpMuxKeepaliveInterval"] = p["mux_ka"]
     if side == "frps":
-        t.update(tcpKeepalive=p["tcp_ka"], maxPoolCount=MAX_POOL)
+        # frps' own heartbeatTimeout is harmless to keep set even when the paired
+        # frpc runs tcpMux: frps then relies on the tcpMux keepalive instead, same
+        # as frpc does below, so this value only matters for a non-mux frpc.
+        t.update(heartbeatTimeout=p["hb_to_s"], tcpKeepalive=p["tcp_ka"], maxPoolCount=MAX_POOL)
         c["userConnTimeout"] = p["user_to"]
     else:
         t.update(
             poolCount=p["pool"],
-            heartbeatInterval=p["hb_iv"],
             dialServerTimeout=p["dial_to"],
             dialServerKeepalive=p["tcp_ka"],
         )
+        if p["mux"]:
+            # BUG FIX: previously this always sent heartbeatInterval=hb_iv, even
+            # with tcpMux on. Per frp's own v0.58.0 release notes/source, once
+            # tcpMux is enabled the client should NOT send an extra application
+            # heartbeat (tcpMux carries its own keepalive) and frp ignores
+            # heartbeatTimeout for session-liveness while tcpMux is on anyway - so
+            # the old values were pure wasted round trips, not a safety margin.
+            t.update(heartbeatInterval=-1, heartbeatTimeout=-1)
+        else:
+            # No mux: this pair IS the only liveness signal, so it must be real.
+            t.update(heartbeatInterval=p["hb_iv"], heartbeatTimeout=p["hb_to_c"])
         c["loginFailExit"] = False
+
+
+def dashboard_password(side):
+    """Reuse the current dashboard password across reinstalls/profile switches.
+
+    BUG FIX: base_config() used to call secrets.token_urlsafe() unconditionally,
+    so every reinstall (even just to switch a profile) silently rotated the
+    dashboard password - and the script never printed it anywhere, so the old
+    one became unrecoverable without manually reading the root-only config.
+    """
+    old = existing(side)
+    if not old:
+        return None
+    try:
+        return read_config(old).get("webServer", {}).get("password") or None
+    except (OSError, ValueError):
+        return None
 
 
 def base_config(side, token, p):
@@ -331,7 +361,7 @@ def base_config(side, token, p):
             "addr": "127.0.0.1",
             "port": 7500 if side == "frps" else 7400,
             "user": "admin",
-            "password": secrets.token_urlsafe(32),
+            "password": dashboard_password(side) or secrets.token_urlsafe(32),
         },
         "log": {
             "to": "console",
@@ -666,7 +696,12 @@ WantedBy=timers.target
             (RUNTIME / f"{side}-{PORT}.json").unlink(missing_ok=True)  # fresh watchdog history after a (re)install
             run(["systemctl", "start", wd + ".timer"])
             if old and old != cfg:
-                old.chmod(0o600)
+                # BUG FIX: previously just chmod'd 0600 and left it in place forever.
+                # It has already been migrated into cfg (JSON) and a copy already
+                # sits in this install's own backup snapshot, so keeping the live
+                # legacy file around only risked read_config() or a human picking
+                # up stale settings by mistake.
+                old.unlink(missing_ok=True)
 
             legacy_helper = Path("/usr/local/bin/frp-watchdog.sh")
             if legacy_helper.is_file() and not legacy_helper.is_symlink():
@@ -751,9 +786,14 @@ def post_install(side, c, profile):
                 say(f"WARNING: tunnel is not fully up yet ({running}/{total} proxies running).")
             else:
                 say("WARNING: tunnel is NOT up: frpc has no connection to frps yet.")
-            say("  Check: frps installed and running on the Iran server; its firewall allows "
-                f"{PORT}/tcp; the same token on both sides; then: journalctl -u {unit} -n 50 --no-pager")
             pr = PROFILES[profile]
+            # BUG FIX: this used to always say "{PORT}/tcp" even for the kcp profile,
+            # where frpc's control connection is UDP-only and the tcp port is irrelevant
+            # to ITS connectivity - misleading during exactly the troubleshooting moment
+            # precision matters most.
+            control = f"{PORT}/udp (KCP)" if pr["proto"] == "kcp" else f"{PORT}/tcp"
+            say("  Check: frps installed and running on the Iran server; its firewall allows "
+                f"{control}; the same token on both sides; then: journalctl -u {unit} -n 50 --no-pager")
             if pr["proto"] == "kcp":
                 say(f"  '{profile}' uses UDP: allow {PORT}/udp on the Iran server and its provider firewall, "
                     f"and install frps with '{profile}' too. If UDP is filtered on this route, use 'gaming' "
@@ -777,6 +817,15 @@ def post_install(side, c, profile):
     if timer != "active" or code != 0:
         say(f"WARNING: the watchdog is NOT working correctly: {out}")
         say(f"  See: journalctl -u {wd}.service -n 30 --no-pager")
+
+    if not PROFILES[profile]["mux"]:
+        say(f"NOTE ('{profile}' runs tcpMux off): frp {VERSION} has an open upstream report "
+            "(fatedier/frp PR #5539, not merged/released yet) where a stale control session's "
+            "heartbeat timer can close a healthy, just-reconnected non-mux session on the frps "
+            "side. frpc reconnects by itself within seconds when this happens (loginFailExit is "
+            "off), so in practice it looks like an occasional short blip rather than real downtime, "
+            "and the watchdog only restarts the service if it does NOT recover on its own. Worth "
+            "knowing if you ever see an unexplained brief reconnect on this profile.")
 
 
 def configure(side, preset=None):
@@ -810,7 +859,11 @@ def configure(side, preset=None):
     if ports:
         control = f"{PORT}/udp (KCP)" if prof["proto"] == "kcp" else f"{PORT}/tcp"
         say(f"Control: {control}; forwarded TCP+UDP ports: " + " ".join(map(str, ports)))
-    say("Dashboard stays on loopback. Credentials are in the root-only config; use an SSH tunnel.")
+    w = c["webServer"]
+    say(f"Dashboard (loopback only - reach it via an SSH tunnel): "
+        f"http://127.0.0.1:{w['port']}  user={w['user']}  password={w['password']}")
+    say("This password is kept across reinstalls/profile switches now; it only changes if you remove "
+        "this instance and set it up again.")
     post_install(side, c, profile)
 
 
