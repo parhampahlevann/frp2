@@ -1,150 +1,138 @@
 #!/usr/bin/env bash
-# FRP v5.2: safe local manager for FRP 0.71.0.
-# Requirements: Python >= 3.8, systemd Linux.
+# FRP v5.3 safe local manager (frp 0.71.0) - rebuilt from the v5.2 analysis notes.
+# frps = IRAN server, frpc = OUTSIDE server. Same control port / token on both.
+#
+# Verified against the real frp 0.71.0 binaries and source (not against your links):
+#  * frps ENFORCES an explicit heartbeatTimeout even with tcpMux on (only the DEFAULT becomes -1).
+#    A mux client sends no heartbeat, so an explicit value makes frps cut the session every N seconds.
+#    => with mux, heartbeatTimeout is -1 on both sides; the yamux keepalive does the liveness work.
+#  * yamux ping reply timeout is a fixed 10 s: dead-path detection in mux mode is 10..(ka+10) s.
+#  * transport.wireProtocol=v2 (new in 0.71) roughly halves CPU per UDP packet vs v1 (loopback test).
 set -Eeuo pipefail
 
 FRP_SOURCE="${BASH_SOURCE[0]:-$0}"
 if [[ -f "$FRP_SOURCE" ]]; then
-    export FRP_MANAGER_SOURCE="$(readlink -f -- "$FRP_SOURCE")"
+    FRP_MANAGER_SOURCE="$(readlink -f -- "$FRP_SOURCE")"
+    export FRP_MANAGER_SOURCE
 else
-    echo "ERROR: this script must be saved to a file and run directly - it cannot be piped into bash (curl ... | bash) or run via process substitution." >&2
-    echo "It needs its own bytes on disk to install a trusted copy for the watchdog service." >&2
-    echo "Fix: save it first, then run the saved file, e.g.:" >&2
-    echo "  nano frp-manager.sh   # paste the script, save" >&2
-    echo "  chmod +x frp-manager.sh" >&2
-    echo "  sudo ./frp-manager.sh" >&2
+    echo "ERROR: run this manager from a saved file, not from a pipe: sudo bash frp-manager.sh" >&2
     exit 1
 fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "ERROR: python3 is required. Install it first, e.g.: apt install -y python3" >&2
-    exit 1
-fi
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 (3.8+) is required." >&2; exit 1; }
 
 exec python3 - "$@" <<'PYTHON'
-import argparse
-import base64
-import fcntl
-import hashlib
-import http.client
-import ipaddress
-import json
-import os
+import argparse, base64, fcntl, hashlib, http.client, ipaddress, json, os, re, secrets
+import shutil, socket, subprocess, sys, tarfile, tempfile, time, urllib.error, urllib.request
 from pathlib import Path
-import re
-import secrets
-import shutil
-import socket
-import ssl
-import subprocess
-import sys
-import tarfile
-import tempfile
-import time
-import urllib.error
-import urllib.request
 
 if sys.version_info < (3, 8):
-    raise SystemExit("Python 3.8+ is required.")
-
+    raise SystemExit("ERROR: Python 3.8 or newer is required.")
 try:
-    import tomllib  # Python 3.11+; only needed to read legacy TOML configs
+    import tomllib  # only needed to migrate an old TOML config
 except ImportError:
     tomllib = None
 
 VERSION = "0.71.0"
-PORT = 2087
-DEFAULT_TOKEN = "123"
-TOKEN = DEFAULT_TOKEN
-MAX_POOL = 100    # frps accepts any client pool size up to this
-
-# Connection profiles. Timers, keepalives and pool size are per side, so frps and
-# frpc may use different profiles. Two fields change the TRANSPORT itself and must
-# therefore agree between the two servers ("strict" profiles - choose them on BOTH):
-#   mux     tcpMux on/off. frp requires the same value on frps and frpc.
-#           on  = every proxied flow shares ONE TCP connection (few sockets, but a
-#                 lost packet or a bulk download stalls every other flow, game UDP included)
-#           off = every flow gets its own TCP connection (no head-of-line blocking)
-#   proto   tcp | kcp. frpc dials it; frps opens the matching listener (kcp = UDP).
-# Measured (100 ms RTT, 1% loss each way, game UDP + bulk in one tunnel): mux on gave
-# 141 ms median / 273 ms p95, mux off 105 / 210, kcp 119 / 135; with a saturated link
-# the median game RTT was 1326 ms (mux on) vs 158 ms (mux off).
-#   mux_ka   yamux keepalive interval (s), only used when mux is on
-#   tcp_ka   TCP keepalive (s): frps accepted conns / frpc dial
-#   hb_iv    frpc heartbeat interval (s) - only used when mux is off. When mux is
-#            on, frpc gets heartbeatInterval=-1 instead: tcpMux already keeps the
-#            session alive via mux_ka, and frp skips heartbeat-timeout enforcement
-#            entirely while tcpMux is on, so a second heartbeat is pure overhead.
-#   hb_to_c  frpc heartbeat timeout (s) - only enforced when mux is off, same reason.
-#   hb_to_s  frps heartbeat timeout (s) - always > any frpc hb_iv
-#   dial_to  frpc dial timeout to frps (s)
-#   pool     frpc pre-established work-connection pool
-#   user_to  frps: how long a user connection waits for a free work conn (s)
-#   strikes  consecutive failed watchdog checks (1/min) before a restart
-PROFILES = {
-    "balanced": dict(
-        desc="recommended default: good speed, stable, low overhead",
-        proto="tcp", mux=True, strict=False,
-        mux_ka=20, tcp_ka=30, hb_iv=15, hb_to_c=60, hb_to_s=120,
-        dial_to=15, pool=10, user_to=30, strikes=5,
-    ),
-    # gaming heartbeat 5/15/45: with mux off, a 25 s path blackout took 8.8 s to recover
-    # with 10/40/80 but 1.9 s with 5/15/45 (kcp recovers in ~1.4 s with either).
-    "gaming": dict(
-        desc="lowest jitter over TCP: own connection per flow, bulk can't stall games [BOTH servers]",
-        proto="tcp", mux=False, strict=True,
-        mux_ka=10, tcp_ka=15, hb_iv=5, hb_to_c=15, hb_to_s=45,
-        dial_to=10, pool=16, user_to=10, strikes=3,
-    ),
-    "gaming-kcp": dict(
-        desc="best jitter tail if UDP passes (KCP); game ports only; +~15 ms base [BOTH servers]",
-        proto="kcp", mux=True, strict=True,
-        mux_ka=10, tcp_ka=15, hb_iv=10, hb_to_c=40, hb_to_s=80,
-        dial_to=10, pool=16, user_to=10, strikes=3,
-    ),
-    "streaming": dict(
-        desc="smooth long sessions: tolerant timeouts, big pool, no false drops",
-        proto="tcp", mux=True, strict=False,
-        mux_ka=30, tcp_ka=30, hb_iv=20, hb_to_c=90, hb_to_s=180,
-        dial_to=15, pool=16, user_to=45, strikes=5,
-    ),
-    "speed": dict(
-        desc="max throughput: biggest pool, timeouts tolerant of a saturated link",
-        proto="tcp", mux=True, strict=False,
-        mux_ka=30, tcp_ka=30, hb_iv=30, hb_to_c=120, hb_to_s=240,
-        dial_to=20, pool=32, user_to=30, strikes=5,
-    ),
-}
-DEFAULT_PROFILE = "balanced"
-
-# Watchdog tuning
-WD_GRACE = 120            # stay quiet this long after the service (re)starts
-WD_BACKOFF = 600          # min seconds between watchdog restarts; doubles after each unsuccessful one
-WD_BACKOFF_MAX = 6 * 3600
-WD_HEALTHY_RESET = 1800   # continuous health needed before the backoff counter resets
-MONO = time.monotonic     # same clock as systemd's *Monotonic timestamps (works in containers too)
-
+PORT = 2087                      # control port (TCP; UDP too for KCP) - the same on both servers
+DEFAULT_TOKEN = "123"            # public knowledge: pass --token for anything exposed
+MAX_POOL = 100                   # frps maxPoolCount: frps clamps the client's poolCount to this
 ROOT = Path("/root/frp")
 STATE = Path("/etc/frp-manager")
-SELF = Path("/usr/local/libexec/frp-manager")
 RUNTIME = Path("/run/frp-manager")
+SELF = Path("/usr/local/libexec/frp-manager")
+BINDIR = Path("/usr/local/bin")
+UNITDIR = Path("/etc/systemd/system")
+DASH = {"frps": 7500, "frpc": 7400}   # loopback-only dashboards
+KEEP_BACKUPS = 5
+WD_GRACE = 120                   # s after (re)start during which the watchdog does nothing
+WD_BACKOFF = 600                 # min gap between watchdog restarts; doubles each time
+WD_BACKOFF_MAX = 6 * 3600
+WD_HEALTHY_RESET = 1800          # healthy this long => restart counter back to 0
+MONO = time.monotonic
 
-TAG = "# Managed by frp-manager-v5"
+# sha256 of the official frp_0.71.0_linux_*.tar.gz release assets (pinned: a mirror / --tarball is safe)
+PINNED = {
+    "amd64": "84f27e39f11169f7adcef8e8b70c9329de17747b1f14dad9fb95eef5682ea716",
+    "arm": "f40a984f83e8d34a9241b0be4a9d5fbcfe513a4a5c022b84a02637ff6d36833b",
+    "arm64": "f33c293c275d8fc68c654b6fba8f10b2551d6463d09a9fc9cffb7227eae82266",
+    "arm_hf": "eab1ecb45b00e2f9cf2ebc458fde570ceecb50689c4c5c728677f44825bf3d88",
+    "loong64": "e5f4d7e25b677cca885f3db5cc958441bfa12e7214e05304601331ac3d84cebc",
+    "riscv64": "92b48d5e4d44d2f1415fde24489d3dfff5badbd52ddf7e816467cdcaa973aa5c",
+}
+ARCHES = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64",
+          "armv7l": "arm_hf", "armv7": "arm_hf", "armv6l": "arm", "armv5tel": "arm",
+          "riscv64": "riscv64", "loongarch64": "loong64"}
+
+# ---------------------------------------------------------------------------------------------
+# Profiles. Only knobs that really change behaviour are listed.
+#   mux / mux_ka : tcpMux and its yamux keepalive (s). Dead-path detection = 10 .. ka+10 s.
+#   hb           : (client interval, client timeout, server timeout) in s - NON-mux only.
+#                  Detection <= client timeout; the server cleans a stale session after its timeout.
+#   tcp_ka       : TCP keepalive on tunnel sockets (keeps NAT/firewall state alive).
+#   dial_to      : frpc dial timeout.   user_to: how long frps holds a user connection waiting
+#                  for a work connection.   pool: pre-opened work connections.
+#   strikes      : consecutive failed 1-minute watchdog probes before a restart.
+#   wire         : frp wire protocol (v2 = binary UDP codec, ~2x UDP packets per CPU second).
+# Measured on loopback + 100 ms emulated RTT, 60 simultaneous new connections (median connect):
+#   mux pool 16 = 220 ms, pool 32 = 119 ms | non-mux pool 16 = 366 ms, pool 32 = 238 ms, pool 48 = 236 ms.
+# These knobs change failure detection and connection set-up, NOT the raw link speed (that is TCP/kernel/path).
+# ---------------------------------------------------------------------------------------------
+DEFAULT_PROFILE = "balanced"
+PROFILES = {
+    "balanced": dict(
+        desc="recommended default: one multiplexed session, moderate timers, quick connection bursts",
+        proto="tcp", mux=True, mux_ka=20, hb=None, tcp_ka=30, dial_to=15, pool=16, user_to=30, strikes=5, wire="v2"),
+    "gaming": dict(
+        desc="lowest ping/jitter: one TCP connection per proxy (no head-of-line blocking), fast failover (<=15 s); same profile on BOTH servers",
+        proto="tcp", mux=False, mux_ka=None, hb=(5, 15, 45), tcp_ka=15, dial_to=8, pool=32, user_to=12, strikes=3, wire="v2"),
+    "gaming-kcp": dict(
+        desc="gaming over KCP (UDP transport, UDP control port must be open); measured +16 ms median on loopback, so only for lossy paths; same profile on BOTH servers",
+        proto="kcp", mux=True, mux_ka=10, hb=None, tcp_ka=15, dial_to=8, pool=16, user_to=12, strikes=3, wire="v2"),
+    "streaming": dict(
+        desc="steady video: tolerant timers (fewer false drops), multiplexed session",
+        proto="tcp", mux=True, mux_ka=30, hb=None, tcp_ka=30, dial_to=15, pool=16, user_to=30, strikes=5, wire="v2"),
+    "speed": dict(
+        desc="tolerant timers, large pool, one multiplexed session (raw speed is set by the path, not by these knobs)",
+        proto="tcp", mux=True, mux_ka=30, hb=None, tcp_ka=30, dial_to=20, pool=32, user_to=30, strikes=5, wire="v2"),
+    "speed-multi": dict(
+        desc="experimental A/B for speed: separate TCP connections (aggregate throughput on lossy paths - untested on your link); same profile on BOTH servers",
+        proto="tcp", mux=False, mux_ka=None, hb=(10, 40, 90), tcp_ka=30, dial_to=15, pool=48, user_to=20, strikes=5, wire="v2"),
+}
 
 
-def say(text):
-    print(text, flush=True)
+def validate_profiles():
+    for name, p in PROFILES.items():
+        bad = []
+        if p["proto"] not in ("tcp", "kcp"): bad.append("proto")
+        if p["wire"] not in ("v1", "v2"): bad.append("wire")
+        if p["proto"] == "kcp" and not p["mux"]: bad.append("kcp needs mux")
+        if p["mux"]:
+            if p["hb"] is not None or not p["mux_ka"] or p["mux_ka"] < 5: bad.append("mux: hb must be None, mux_ka >= 5")
+        else:
+            iv, tc, ts = p["hb"]
+            if p["mux_ka"] is not None or iv < 1 or tc < 3 * iv or ts < 2 * tc: bad.append("non-mux: need timeout >= 3*interval, server >= 2*timeout")
+            if p["user_to"] < p["dial_to"] + 2: bad.append("user_to must be >= dial_to + 2")
+        if not 1 <= p["pool"] <= MAX_POOL or p["dial_to"] < 5 or p["tcp_ka"] < 5 or p["strikes"] < 1: bad.append("range")
+        if bad:
+            raise RuntimeError(f"internal error: profile {name!r} invalid: {', '.join(bad)}")
 
 
-def _exec(args, timeout, data):
-    return subprocess.run(
-        [str(x) for x in args],
-        input=data,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
+def transport_key(p):
+    return (p["proto"], p["mux"])          # both servers must agree on these two
+
+
+# --------------------------------------------------------------------------------------------- helpers
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def warn(msg):
+    print(f"WARNING: {msg}", flush=True)
+
+
+def _exec(args, timeout, data=None):
+    return subprocess.run([str(a) for a in args], input=data, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=timeout)
 
 
 def run(args, *, check=True, timeout=40, data=None):
@@ -154,45 +142,34 @@ def run(args, *, check=True, timeout=40, data=None):
         if check:
             raise RuntimeError(f"{args[0]} timed out after {timeout}s")
         return ""
+    except OSError as e:
+        if check:
+            raise RuntimeError(f"cannot run {args[0]}: {e}")
+        return ""
     if check and p.returncode:
-        raise RuntimeError(
-            f"{args[0]} failed: {p.stderr.strip() or p.stdout.strip()}"
-        )
+        raise RuntimeError(f"{args[0]} failed: {(p.stderr or p.stdout).strip()}")
     return p.stdout.strip()
 
 
-def run_rc(args, timeout=60):
-    """Return (exit code, output); never raises for a failing command."""
-    try:
-        p = _exec(args, timeout, None)
-    except subprocess.TimeoutExpired:
-        return 124, f"timed out after {timeout}s"
-    return p.returncode, (p.stdout + p.stderr).strip()
+def ask(question, default=None):
+    value = input(f"{question}" + (f" [{default}]" if default is not None else "") + ": ").strip()
+    return value or (default if default is not None else "")
 
 
 def yes(question):
-    return input(question + " [y/N]: ").strip().lower() == "y"
-
-
-def ask(question, default=""):
-    value = input(
-        f"{question}" + (f" [{default}]" if default else "") + ": "
-    ).strip()
-    return value or default
+    return input(f"{question} [y/N]: ").strip().lower() in ("y", "yes")
 
 
 def atomic(path, content, mode=0o600):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-
     if path.is_symlink():
-        raise ValueError(f"Refusing symlink: {path}")
-
+        raise ValueError(f"refusing to write through a symlink: {path}")
     fd, name = tempfile.mkstemp(prefix=".frp-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as f:
             os.fchmod(f.fileno(), mode)
-            f.write(content.encode() if isinstance(content, str) else content)
+            f.write(content if isinstance(content, bytes) else content.encode("utf-8"))
             f.flush()
             os.fsync(f.fileno())
         os.replace(name, path)
@@ -202,77 +179,34 @@ def atomic(path, content, mode=0o600):
 
 
 def read_config(path):
-    text = Path(path).read_text()
+    path = Path(path)
+    text = path.read_text()
     if "{{" in text:
-        raise ValueError(
-            "Templated configs need manual migration; nothing changed."
-        )
-    if str(path).endswith(".json"):
-        value = json.loads(text)
-    elif tomllib:
-        value = tomllib.loads(text)
-    else:
-        raise ValueError(
-            "A legacy TOML config needs Python 3.11+ to be read; reinstall to migrate it to JSON."
-        )
-    if not isinstance(value, dict):
-        raise ValueError("Config root must be an object.")
-    return value
+        raise ValueError(f"{path} uses templates; migrate it by hand")
+    if path.suffix == ".json":
+        return json.loads(text)
+    if tomllib is None:
+        raise ValueError(f"{path} is TOML and this Python has no tomllib (need 3.11+)")
+    return tomllib.loads(text)
 
 
 def paths(side):
     role = "server" if side == "frps" else "client"
     name = f"{role}-{PORT}"
     unit = f"{side}@{name}.service"
-    return (
-        ROOT / role / f"{name}.json",
-        Path("/etc/systemd/system") / unit,
-        unit,
-    )
+    return ROOT / role / f"{name}.json", UNITDIR / unit, unit
 
 
 def existing(side):
     cfg = paths(side)[0]
-    if cfg.exists():
-        return cfg
-    old = cfg.with_suffix(".toml")
-    return old if old.exists() else None
+    for candidate in (cfg, cfg.with_suffix(".toml")):
+        if candidate.is_file():
+            return candidate
+    return None
 
 
-def parse_ports(value, reserved=()):
-    found = set()
-    for part in value.split(","):
-        part = part.strip()
-        if not re.fullmatch(r"[0-9]{1,5}(?:\s*-\s*[0-9]{1,5})?", part):
-            raise ValueError(
-                "Use decimal ports/ranges, e.g. 80,443,8000-8010; no empty entries."
-            )
-        ends = [int(x.strip(), 10) for x in part.split("-")]
-        start, end = ends[0], ends[-1]
-        if not 1 <= start <= end <= 65535:
-            raise ValueError("Ports must be in 1..65535, ascending ranges only.")
-        if end - start + 1 > 1024:
-            raise ValueError("Maximum 1024 unique ports per managed configuration.")
-        found.update(range(start, end + 1))
-
-    if len(found) > 1024:
-        raise ValueError("Maximum 1024 unique ports per managed configuration.")
-    if found.intersection(reserved):
-        raise ValueError("A selected port conflicts with a control/dashboard port.")
-    return sorted(found)
-
-
-def valid_host(host):
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        pass
-    if re.fullmatch(r"[0-9.]+", host):
-        return False  # looks like an IPv4 address but is not a valid one
-    return len(host) <= 253 and bool(
-        re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?", host)
-    )
+def wd_name(side):
+    return f"frp-v5-watchdog-{side}-{PORT}"
 
 
 def profile_file(side):
@@ -283,24 +217,73 @@ def load_profile(side):
     try:
         name = profile_file(side).read_text().strip()
     except OSError:
-        name = DEFAULT_PROFILE
+        return DEFAULT_PROFILE
     return name if name in PROFILES else DEFAULT_PROFILE
 
 
-def choose_profile(preset=None):
-    if preset:
-        return preset
-    names = list(PROFILES)
-    say("\nConnection profile ([BOTH servers] = must be the same profile on frps and frpc):")
-    for i, name in enumerate(names, 1):
-        say(f"  {i}) {name:<10} - {PROFILES[name]['desc']}")
-    while True:
-        raw = ask("Profile", "1").lower()
-        if raw in PROFILES:
-            return raw
-        if raw.isdigit() and 1 <= int(raw) <= len(names):
-            return names[int(raw) - 1]
-        say(f"Enter 1-{len(names)} or a profile name.")
+def parse_ports(value, reserved=()):
+    found = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not re.fullmatch(r"[0-9]{1,5}(?:\s*-\s*[0-9]{1,5})?", part):
+            raise ValueError(f"bad port entry {part!r} (use 80,443,2000-2010; no empty entries)")
+        ends = [int(x.strip(), 10) for x in part.split("-")]
+        start, end = ends[0], ends[-1]
+        if not 1 <= start <= end <= 65535:
+            raise ValueError(f"bad port range {part!r}")
+        if end - start + 1 > 1024:
+            raise ValueError(f"range {part!r} is larger than 1024 ports")
+        found.update(range(start, end + 1))
+    if len(found) > 1024:
+        raise ValueError("more than 1024 ports selected")
+    clash = found.intersection(reserved)
+    if clash:
+        raise ValueError(f"reserved by this manager: {sorted(clash)}")
+    return sorted(found)
+
+
+def valid_host(host):
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9.]+", host):
+        return False
+    return len(host) <= 253 and bool(re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?", host))
+
+
+# --------------------------------------------------------------------------------------------- config
+TOKEN_ARG = None      # --token (set by main)
+
+
+def existing_value(side, *keys):
+    old = existing(side)
+    if not old:
+        return None
+    try:
+        cur = read_config(old)
+        for k in keys:
+            cur = cur[k]
+        return cur
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def dashboard_password(side):
+    pw = existing_value(side, "webServer", "password")
+    return pw if isinstance(pw, str) and len(pw) >= 16 else secrets.token_urlsafe(24)
+
+
+def resolve_token(side):
+    """--token wins; otherwise KEEP the token of the existing config (a reinstall must not silently
+    fall back to the public default); otherwise the default."""
+    if TOKEN_ARG:
+        return TOKEN_ARG, "from --token"
+    old = existing_value(side, "auth", "token")
+    if isinstance(old, str) and old:
+        return old, "kept from the existing config"
+    return DEFAULT_TOKEN, "DEFAULT (public knowledge!)"
 
 
 def patch_transport(c, side, p):
@@ -309,258 +292,227 @@ def patch_transport(c, side, p):
     if p["mux"]:
         t["tcpMuxKeepaliveInterval"] = p["mux_ka"]
     if side == "frps":
-        # frps' own heartbeatTimeout is harmless to keep set even when the paired
-        # frpc runs tcpMux: frps then relies on the tcpMux keepalive instead, same
-        # as frpc does below, so this value only matters for a non-mux frpc.
-        t.update(heartbeatTimeout=p["hb_to_s"], tcpKeepalive=p["tcp_ka"], maxPoolCount=MAX_POOL)
+        t["tcpKeepalive"] = p["tcp_ka"]
+        t["maxPoolCount"] = MAX_POOL
+        # FIX (critical): with mux the client sends no heartbeat, so the server must not wait for one.
+        t["heartbeatTimeout"] = -1 if p["mux"] else p["hb"][2]
         c["userConnTimeout"] = p["user_to"]
     else:
-        t.update(
-            poolCount=p["pool"],
-            dialServerTimeout=p["dial_to"],
-            dialServerKeepalive=p["tcp_ka"],
-        )
+        t["poolCount"] = p["pool"]
+        t["dialServerTimeout"] = p["dial_to"]
+        t["dialServerKeepalive"] = p["tcp_ka"]
+        t["wireProtocol"] = p["wire"]
         if p["mux"]:
-            # BUG FIX: previously this always sent heartbeatInterval=hb_iv, even
-            # with tcpMux on. Per frp's own v0.58.0 release notes/source, once
-            # tcpMux is enabled the client should NOT send an extra application
-            # heartbeat (tcpMux carries its own keepalive) and frp ignores
-            # heartbeatTimeout for session-liveness while tcpMux is on anyway - so
-            # the old values were pure wasted round trips, not a safety margin.
-            t.update(heartbeatInterval=-1, heartbeatTimeout=-1)
+            t["heartbeatInterval"] = -1
+            t["heartbeatTimeout"] = -1
         else:
-            # No mux: this pair IS the only liveness signal, so it must be real.
-            t.update(heartbeatInterval=p["hb_iv"], heartbeatTimeout=p["hb_to_c"])
-        c["loginFailExit"] = False
+            t["heartbeatInterval"], t["heartbeatTimeout"] = p["hb"][0], p["hb"][1]
+        c["loginFailExit"] = False        # keep retrying if frps is down at start
 
 
-def dashboard_password(side):
-    """Reuse the current dashboard password across reinstalls/profile switches.
-
-    BUG FIX: base_config() used to call secrets.token_urlsafe() unconditionally,
-    so every reinstall (even just to switch a profile) silently rotated the
-    dashboard password - and the script never printed it anywhere, so the old
-    one became unrecoverable without manually reading the root-only config.
-    """
-    old = existing(side)
-    if not old:
-        return None
-    try:
-        return read_config(old).get("webServer", {}).get("password") or None
-    except (OSError, ValueError):
-        return None
-
-
-def base_config(side, token, p):
+def build_config(side, name, token, host=None, ports=(), wire=None):
+    p = dict(PROFILES[name])
+    if wire:
+        p["wire"] = wire
     c = {
-        "auth": {
-            "method": "token",
-            "token": token,
-        },
-        "webServer": {
-            "addr": "127.0.0.1",
-            "port": 7500 if side == "frps" else 7400,
-            "user": "admin",
-            "password": dashboard_password(side) or secrets.token_urlsafe(32),
-        },
-        "log": {
-            "to": "console",
-            "level": "info",
-            "disablePrintColor": True,
-        },
+        "auth": {"method": "token", "token": token},
+        "webServer": {"addr": "127.0.0.1", "port": DASH[side], "user": "admin", "password": dashboard_password(side)},
+        "log": {"to": "console", "level": "info", "disablePrintColor": True},
+        "transport": {"tls": {"force": True} if side == "frps" else {"enable": True}},
     }
     patch_transport(c, side, p)
-    c["transport"]["tls"] = {"force": True} if side == "frps" else {"enable": True}
-    if side == "frpc":
+    if side == "frps":
+        c.update(bindAddr="0.0.0.0", bindPort=PORT, proxyBindAddr="0.0.0.0", detailedErrorsToClient=False)
+        if p["proto"] == "kcp":
+            c["kcpBindPort"] = PORT
+    else:
         c["transport"]["protocol"] = p["proto"]
+        c.update(serverAddr=host, serverPort=PORT)
+        c["proxies"] = [{"name": f"{kind}-{n}", "type": kind, "localIP": "127.0.0.1", "localPort": n, "remotePort": n}
+                        for n in ports for kind in ("tcp", "udp")]
     return c
 
 
-def api(c, endpoint, timeout=3):
+# --------------------------------------------------------------------------------------------- health
+def api(c, endpoint, timeout=5):
     w = c.get("webServer", {})
     addr = w.get("addr", "127.0.0.1")
-    addr = "127.0.0.1" if addr == "0.0.0.0" else "::1" if addr == "::" else addr
+    addr = "127.0.0.1" if addr in ("", "0.0.0.0") else "::1" if addr == "::" else addr
     host = f"[{addr}]" if ":" in addr else addr
-    tls = w.get("tls", {})
-    scheme = "https" if tls.get("certFile") else "http"
-
-    request = urllib.request.Request(
-        f"{scheme}://{host}:{int(w['port'])}{endpoint}"
-    )
-    credentials = (str(w.get("user", "")) + ":" + str(w.get("password", ""))).encode()
-    request.add_header("Authorization", "Basic " + base64.b64encode(credentials).decode())
-
-    handlers = [urllib.request.ProxyHandler({})]
-    if scheme == "https":
-        handlers.append(
-            urllib.request.HTTPSHandler(context=ssl.create_default_context())
-        )
-    opener = urllib.request.build_opener(*handlers)
-
-    with opener.open(request, timeout=timeout) as r:
+    req = urllib.request.Request(f"http://{host}:{int(w['port'])}{endpoint}")
+    cred = base64.b64encode(f"{w.get('user', '')}:{w.get('password', '')}".encode()).decode()
+    req.add_header("Authorization", "Basic " + cred)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as r:
         if r.status != 200:
-            raise ValueError(f"Unexpected API status: {r.status}")
-        if endpoint == "/healthz":
-            return True
-        return json.load(r)
+            raise RuntimeError(f"HTTP {r.status} from {endpoint}")
+        body = r.read()
+    return True if endpoint == "/healthz" else json.loads(body)
 
 
 def proxy_counts(status):
-    rows = [
-        p
-        for group in status.values()
-        if isinstance(group, list)
-        for p in group
-        if isinstance(p, dict) and "status" in p
-    ]
-    return (
-        sum(p["status"] == "running" for p in rows),
-        len(rows),
-    )
+    rows = [x for group in status.values() if isinstance(group, list) for x in group if isinstance(x, dict)]
+    return sum(1 for x in rows if x.get("status") == "running"), len(rows)
 
 
 def check_free(port, udp=False):
-    listeners = run(
-        ["ss", "-H", "-lunp" if udp else "-ltnp", f"sport = :{int(port)}"]
-    )
-    if listeners:
-        raise RuntimeError(
-            f"{'UDP' if udp else 'TCP'} port {port} is busy; no process killed.\n{listeners}"
-        )
+    out = run(["ss", "-H", "-lunp" if udp else "-ltnp", f"sport = :{port}"], check=False)
+    if out.strip():
+        raise RuntimeError(f"{'UDP' if udp else 'TCP'} port {port} is already in use:\n{out}")
 
 
-def fetch(url, limit, tries=3):
-    if not url.startswith("https://"):
-        raise ValueError("HTTPS download required.")
-    last = None
-    for attempt in range(tries):
-        try:
-            request = urllib.request.Request(url, headers={"User-Agent": "frp-manager-v5"})
-            with urllib.request.urlopen(request, timeout=60) as response:
-                if not response.url.startswith("https://"):
-                    raise ValueError("Insecure download redirect.")
-                content = response.read(limit + 1)
-            if len(content) > limit:
-                raise ValueError("Download exceeds size limit.")
-            return content
-        except (OSError, http.client.HTTPException) as error:
-            last = error
-            if attempt + 1 < tries:
-                say(f"  download problem ({type(error).__name__}); retrying ...")
-                time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Download failed after {tries} attempts: {last}")
+def journal_tail(unit, n=12):
+    return run(["journalctl", "-u", unit, "-n", str(n), "--no-pager", "-o", "cat"], check=False, timeout=15)
 
 
-def download(side, directory):
-    arch = {
-        "x86_64": "amd64",
-        "aarch64": "arm64",
-        "arm64": "arm64",
-        "armv7l": "arm",
-        "i386": "386",
-        "i686": "386",
-    }.get(os.uname().machine)
-    if not arch:
-        raise ValueError("Unsupported architecture.")
-
-    pkg = f"frp_{VERSION}_linux_{arch}"
-    base = f"https://github.com/fatedier/frp/releases/download/v{VERSION}"
-    say(f"Downloading and SHA256-checking {side} {VERSION} ...")
-
-    sums = fetch(base + "/frp_sha256_checksums.txt", 1024 * 1024).decode()
-    expected = None
-    for line in sums.splitlines():
-        fields = line.split()
-        if len(fields) == 2 and Path(fields[1].lstrip("*")).name == pkg + ".tar.gz":
-            if expected is not None:
-                raise ValueError("Duplicate checksum entry.")
-            expected = fields[0]
-
-    if not expected or not re.fullmatch(r"[a-fA-F0-9]{64}", expected):
-        raise ValueError("Official SHA256 missing; refusing unverified download.")
-
-    archive = fetch(base + "/" + pkg + ".tar.gz", 100 * 1024 * 1024)
-    if hashlib.sha256(archive).hexdigest() != expected.lower():
-        raise ValueError("SHA256 mismatch.")
-
-    tarpath = directory / "frp.tar.gz"
-    tarpath.write_bytes(archive)
-    output = directory / side
-
-    with tarfile.open(tarpath, "r:gz") as tar:
-        member = tar.getmember(pkg + "/" + side)
-        if not member.isfile() or not 0 < member.size <= 100 * 1024 * 1024:
-            raise ValueError("Invalid binary archive entry.")
-        with tar.extractfile(member) as source:
-            output.write_bytes(source.read())
-
-    output.chmod(0o755)
-    if run([output, "-v"]) != VERSION:
-        raise ValueError("Unexpected FRP binary version.")
-    return output
-
-
-def binary_version(path):
-    if not Path(path).is_file():
-        return None
+def probe(side, c, unit):
+    """-> (verdict, text). verdict: ok | fail (restart may help) | wait (restart would not help) | skip."""
     try:
-        return run([path, "-v"], timeout=10)
-    except (RuntimeError, OSError):
-        return None
+        api(c, "/healthz", timeout=5)
+    except (urllib.error.HTTPError, ValueError, KeyError) as e:
+        return "skip", f"admin API answered oddly ({e}); not judging"
+    except (OSError, http.client.HTTPException) as e:
+        return "fail", f"admin API not answering: {e}"
+    if side == "frps":
+        port = int(c["bindPort"])
+        pid = int(run(["systemctl", "show", "-p", "MainPID", "--value", unit], check=False) or 0)
+        listeners = run(["ss", "-H", "-ltnp", f"sport = :{port}"], check=False)
+        if not listeners:
+            return "fail", f"nothing listens on TCP {port}"
+        if pid > 0 and "pid=" in listeners and f"pid={pid}," not in listeners:
+            return "fail", f"TCP {port} is held by another process"
+        if c.get("kcpBindPort") and not run(["ss", "-H", "-lunp", f"sport = :{int(c['kcpBindPort'])}"], check=False):
+            return "fail", f"nothing listens on UDP {c['kcpBindPort']} (KCP)"
+        return "ok", f"listening on {port}"
+    try:
+        running, total = proxy_counts(api(c, "/api/status"))
+    except (urllib.error.HTTPError, ValueError, KeyError) as e:
+        return "skip", f"status answered oddly ({e})"
+    except (OSError, http.client.HTTPException) as e:
+        return "fail", f"status not answering: {e}"
+    expected = len(c.get("proxies", []))
+    if running > 0:
+        return "ok", f"{running}/{total} proxies running"
+    if expected == 0 and total == 0:
+        return "ok", "no proxies configured"
+    if c.get("transport", {}).get("protocol", "tcp") == "kcp":
+        return "fail", "0 proxies running (KCP: reachability cannot be tested over TCP)"
+    try:
+        socket.create_connection((c["serverAddr"], int(c["serverPort"])), timeout=5).close()
+    except OSError as e:
+        return "wait", f"IRAN server unreachable ({e}); restarting frpc would not help"
+    return "fail", f"0/{expected} proxies running although the control port is reachable"
 
 
+# --------------------------------------------------------------------------------------------- download
+def binary_version(path):
+    return run([path, "-v"], check=False, timeout=10) if Path(path).is_file() else ""
+
+
+def arch_name():
+    m = os.uname().machine.lower()
+    a = ARCHES.get(m)
+    if not a or a not in PINNED:
+        raise RuntimeError(f"unsupported CPU architecture {m!r}: put frp {VERSION} in {BINDIR} yourself")
+    return a
+
+
+def fetch(url, limit):
+    last = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "frp-manager/5.3"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if not r.url.startswith("https://"):
+                    raise ValueError("redirected to a non-HTTPS URL")
+                data = r.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("download is larger than expected")
+            return data
+        except (OSError, http.client.HTTPException) as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"download failed ({last}). If github.com is blocked on this server, download the "
+                       f"tarball elsewhere, copy it here and run again with --tarball FILE")
+
+
+def obtain(side, tmp, tarball=None):
+    arch = arch_name()
+    pkg = f"frp_{VERSION}_linux_{arch}"
+    if tarball:
+        data = Path(tarball).read_bytes()
+        say(f"Using local tarball {tarball}")
+    else:
+        url = f"https://github.com/fatedier/frp/releases/download/v{VERSION}/{pkg}.tar.gz"
+        say(f"Downloading {url}")
+        data = fetch(url, 100 * 1024 * 1024)
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != PINNED[arch]:
+        raise RuntimeError(f"SHA-256 mismatch for {pkg}.tar.gz (got {digest}); refusing to install")
+    archive = tmp / "frp.tar.gz"
+    archive.write_bytes(data)
+    out = tmp / side
+    with tarfile.open(archive, "r:gz") as tar:
+        member = tar.getmember(f"{pkg}/{side}")
+        if not member.isfile():
+            raise RuntimeError("unexpected archive layout")
+        with tar.extractfile(member) as src:
+            out.write_bytes(src.read())
+    out.chmod(0o755)
+    got = binary_version(out)
+    if got != VERSION:
+        raise RuntimeError(f"{side} reports version {got!r}, expected {VERSION}")
+    return out
+
+
+# --------------------------------------------------------------------------------------------- snapshot
 def snapshot(files, folder):
     folder.mkdir(parents=True, mode=0o700)
     entries = []
     for i, path in enumerate(files):
+        path = Path(path)
         if path.is_symlink():
-            raise ValueError(f"Refusing symlink: {path}")
-        saved = folder / str(i)
+            raise ValueError(f"refusing to touch a symlink: {path}")
         if path.exists():
+            saved = folder / str(i)
             shutil.copy2(path, saved)
-        entries.append((path, saved if path.exists() else None))
-
-    atomic(
-        folder / "manifest.json",
-        json.dumps(
-            [
-                {"path": str(p), "backup": str(s) if s else None}
-                for p, s in entries
-            ],
-            indent=2,
-        ),
-    )
+            entries.append((path, saved))
+        else:
+            entries.append((path, None))
+    atomic(folder / "manifest.json", json.dumps([[str(a), str(b) if b else None] for a, b in entries], indent=2))
     return entries
 
 
 def restore(entries):
     for path, saved in entries:
-        if saved:
-            atomic(path, saved.read_bytes(), saved.stat().st_mode & 0o777)
+        if saved is None:
+            Path(path).unlink(missing_ok=True)
         else:
-            path.unlink(missing_ok=True)
+            atomic(path, Path(saved).read_bytes(), Path(saved).stat().st_mode & 0o777)
 
 
-def wd_name(side):
-    return f"frp-v5-watchdog-{side}-{PORT}"
+def prune_backups(side):
+    base = ROOT / "backups"
+    for prefix in (f"v5-{side}-", f"removed-{side}-"):
+        old = sorted(d for d in base.glob(prefix + "*") if d.is_dir())     # names carry time_ns
+        for d in old[:-KEEP_BACKUPS]:
+            shutil.rmtree(d, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------------------------- units
 def service_text(side, cfg):
-    # Restart=always: also revives the daemon after a plain SIGTERM/exit 0.
-    # A crash loop is bounded by the start limit; the watchdog then recovers the
-    # "failed" unit slowly (with exponential backoff) instead of a tight loop.
-    return f"""{TAG}
-[Unit]
-Description=FRP {side} ({PORT})
-After=network-online.target nss-lookup.target
+    who = "server (IRAN)" if side == "frps" else "client (OUTSIDE)"
+    return f"""[Unit]
+Description=FRP {who} {cfg.stem}
+After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
 [Service]
 Type=simple
-ExecStartPre=/usr/local/bin/{side} verify -c {cfg}
-ExecStart=/usr/local/bin/{side} -c {cfg}
+ExecStartPre={BINDIR}/{side} verify -c {cfg}
+ExecStart={BINDIR}/{side} -c {cfg}
 Restart=always
 RestartSec=5s
 TimeoutStopSec=20s
@@ -575,699 +527,456 @@ WantedBy=multi-user.target
 """
 
 
-def install(side, c, profile):
-    source = Path(os.environ.get("FRP_MANAGER_SOURCE", ""))
-    if not source.is_file():
-        raise ValueError("Save this script to a regular file before running it.")
-
-    cfg, unitfile, unit = paths(side)
-    executable = Path("/usr/local/bin") / side
-    unitdir = unitfile.parent
-
-    wd = wd_name(side)
-    ws = unitdir / (wd + ".service")
-    wt = unitdir / (wd + ".timer")
-    pfile = profile_file(side)
-
-    legacy = f"frp-watchdog@{side}.timer"
-    old = existing(side)
-
-    targets = [cfg, unitfile, ws, wt, executable, SELF, pfile]
-    if old and old != cfg:
-        targets.append(old)
-
-    with tempfile.TemporaryDirectory(prefix="frp-v5-") as tmp:
-        tmp = Path(tmp)
-        if binary_version(executable) == VERSION:
-            staged = executable
-            say(f"{side} {VERSION} is already installed; skipping download.")
-        else:
-            staged = download(side, tmp)
-
-        candidate = tmp / "candidate.json"
-        atomic(candidate, json.dumps(c, ensure_ascii=False, indent=2))
-        run([staged, "verify", "-c", candidate])
-
-        backupdir = ROOT / "backups" / f"v5-{side}-{time.time_ns()}"
-        saved = snapshot(targets, backupdir)
-
-        states = {
-            u: (
-                run(["systemctl", "is-active", u], check=False) == "active",
-                run(["systemctl", "is-enabled", u], check=False) == "enabled",
-            )
-            for u in (unit, wd + ".timer", legacy)
-        }
-
-        try:
-            for timer in (legacy, wd + ".timer"):
-                run(["systemctl", "disable", "--now", timer], check=False)
-
-            run(["systemctl", "stop", f"frp-watchdog@{side}.service"], check=False)
-            run(["systemctl", "stop", wd + ".service"], check=False)
-            run(["systemctl", "stop", unit], check=False)
-
-            check_free(c["webServer"]["port"])
-            if side == "frps":
-                check_free(c["bindPort"])
-                if c.get("kcpBindPort"):
-                    check_free(c["kcpBindPort"], udp=True)
-
-            if staged != executable:
-                atomic(executable, staged.read_bytes(), 0o755)
-
-            atomic(cfg, candidate.read_bytes())
-            atomic(pfile, profile + "\n")
-            atomic(SELF, source.read_bytes(), 0o700)
-            atomic(unitfile, service_text(side, cfg), 0o644)
-            atomic(
-                ws,
-                f"""{TAG}
-[Unit]
-Description=FRP local watchdog ({side}, {PORT})
+def watchdog_service_text(side):
+    return f"""[Unit]
+Description=FRP {side} watchdog {PORT}
+After=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart={SELF} --port {PORT} --watchdog {side}
 TimeoutStartSec=90s
-UMask=0077
-""",
-                0o644,
-            )
-            atomic(
-                wt,
-                f"""{TAG}
-[Unit]
-Description=FRP watchdog timer ({side}, {PORT})
+Nice=10
+"""
+
+
+def watchdog_timer_text(side):
+    return f"""[Unit]
+Description=FRP {side} watchdog timer {PORT}
 
 [Timer]
 OnBootSec=120s
 OnUnitActiveSec=60s
 AccuracySec=5s
-Unit={wd}.service
 
 [Install]
 WantedBy=timers.target
-""",
-                0o644,
-            )
+"""
 
+
+# --------------------------------------------------------------------------------------------- install
+def install(side, c, name, tarball=None):
+    cfg, unitfile, unit = paths(side)
+    executable = BINDIR / side
+    wd = wd_name(side)
+    ws, wt = UNITDIR / f"{wd}.service", UNITDIR / f"{wd}.timer"
+    pfile = profile_file(side)
+    legacy = f"frp-watchdog@{side}.timer"
+    old = existing(side)
+    source = Path(os.environ["FRP_MANAGER_SOURCE"])
+    targets = [cfg, unitfile, ws, wt, executable, SELF, pfile]
+    if old and old != cfg:
+        targets.append(old)
+    with tempfile.TemporaryDirectory(prefix="frp-v5-") as tmpname:
+        tmp = Path(tmpname)
+        if binary_version(executable) == VERSION:
+            staged = executable
+            say(f"{executable} is already frp {VERSION}")
+        else:
+            staged = obtain(side, tmp, tarball)
+        candidate = tmp / "candidate.json"
+        atomic(candidate, json.dumps(c, ensure_ascii=False, indent=2) + "\n")
+        run([staged, "verify", "-c", candidate])          # frp itself validates every key
+        backupdir = ROOT / "backups" / f"v5-{side}-{time.time_ns()}"
+        saved = snapshot(targets, backupdir)
+        states = {u: (run(["systemctl", "is-active", u], check=False) == "active",
+                      run(["systemctl", "is-enabled", u], check=False) == "enabled")
+                  for u in (unit, wd + ".timer", legacy)}
+        try:
+            for u in (legacy, wd + ".timer"):
+                run(["systemctl", "disable", "--now", u], check=False)
+            for u in (f"frp-watchdog@{side}.service", wd + ".service", unit):
+                run(["systemctl", "stop", u], check=False)
+            check_free(c["webServer"]["port"])
+            if side == "frps":
+                check_free(c["bindPort"])
+                if c.get("kcpBindPort"):
+                    check_free(c["kcpBindPort"], udp=True)
+            if staged != executable:
+                atomic(executable, staged.read_bytes(), 0o755)
+            atomic(cfg, candidate.read_bytes())
+            atomic(pfile, name + "\n")
+            atomic(SELF, source.read_bytes(), 0o700)
+            atomic(unitfile, service_text(side, cfg), 0o644)
+            atomic(ws, watchdog_service_text(side), 0o644)
+            atomic(wt, watchdog_timer_text(side), 0o644)
             run(["systemctl", "daemon-reload"])
             run(["systemctl", "enable", unit, wd + ".timer"])
-            run(["systemctl", "restart", unit])
-
+            run(["systemctl", "restart", unit], timeout=60)
             ready = False
             for _ in range(15):
                 time.sleep(1)
-                active = run(["systemctl", "is-active", unit], check=False)
-                if active == "active":
+                if run(["systemctl", "is-active", unit], check=False) == "active":
                     try:
                         api(c, "/healthz", timeout=1)
                         ready = True
                         break
-                    except (OSError, ValueError, http.client.HTTPException):
+                    except (OSError, http.client.HTTPException, ValueError):
                         pass
-
             if not ready:
-                raise RuntimeError(
-                    "Service/local health check failed. Inspect the journal."
-                )
-
-            (RUNTIME / f"{side}-{PORT}.json").unlink(missing_ok=True)  # fresh watchdog history after a (re)install
+                raise RuntimeError(f"{unit} did not become healthy:\n{journal_tail(unit)}")
             run(["systemctl", "start", wd + ".timer"])
             if old and old != cfg:
-                # BUG FIX: previously just chmod'd 0600 and left it in place forever.
-                # It has already been migrated into cfg (JSON) and a copy already
-                # sits in this install's own backup snapshot, so keeping the live
-                # legacy file around only risked read_config() or a human picking
-                # up stale settings by mistake.
                 old.unlink(missing_ok=True)
-
-            legacy_helper = Path("/usr/local/bin/frp-watchdog.sh")
-            if legacy_helper.is_file() and not legacy_helper.is_symlink():
-                legacy_helper.chmod(0o700)
-
         except BaseException:
-            say(f"Installation failed; restoring snapshot: {backupdir}")
+            say(f"Installation failed; restoring snapshot {backupdir}")
             for u in (wd + ".timer", unit):
                 run(["systemctl", "stop", u], check=False)
             restore(saved)
             run(["systemctl", "daemon-reload"], check=False)
             for u, (active, enabled) in states.items():
-                run(
-                    ["systemctl", "enable" if enabled else "disable", u],
-                    check=False,
-                )
+                run(["systemctl", "enable" if enabled else "disable", u], check=False)
                 if active:
                     run(["systemctl", "start", u], check=False)
             raise
-
-    say(f"Service installed [{profile}]; backup: {backupdir}\nConfig: {cfg}")
-    return backupdir
+    prune_backups(side)
 
 
-def build_config(side, profile, host=None, ports=()):
-    prof = PROFILES[profile]
-    c = base_config(side, TOKEN, prof)
+def post_install(side, c, name):
+    cfg, _, unit = paths(side)
+    p = PROFILES[name]
+    t = c["transport"]
+    say()
+    wire = f"wire {t.get('wireProtocol', 'v1')}" if side == "frpc" else "wire: the client decides (v1 and v2 accepted)"
+    say(f"=== {side} is running: profile '{name}' ({p['proto']}, {'mux' if p['mux'] else 'no mux'}, {wire}) ===")
+    say(f"Config {cfg} | unit {unit} | dashboard http://127.0.0.1:{c['webServer']['port']} "
+        f"(loopback) user {c['webServer']['user']} password {c['webServer']['password']}")
     if side == "frps":
-        c.update(
-            bindAddr="0.0.0.0",
-            bindPort=PORT,
-            proxyBindAddr="0.0.0.0",
-            detailedErrorsToClient=False,
-        )
-        if prof["proto"] == "kcp":
-            c["kcpBindPort"] = PORT  # UDP listener next to the TCP one
-        # No allowPorts restriction: whatever the client registers is accepted,
-        # so a forgotten server-side allow-list can never block the tunnel.
+        say(f"Open on the IRAN firewall: TCP {PORT}" + (f" and UDP {PORT}" if p["proto"] == "kcp" else "")
+            + " (no firewall was changed) + every port you forward from the outside server.")
     else:
-        c.update(serverAddr=host, serverPort=PORT)
-        # TLS stays encrypted but unauthenticated (frps uses its own automatic
-        # certificate, so there is nothing fixed to pin against).
-        c["proxies"] = [
-            {
-                "name": f"{kind}-{p}",
-                "type": kind,
-                "localIP": "127.0.0.1",
-                "localPort": p,
-                "remotePort": p,
-            }
-            for kind in ("tcp", "udp")
-            for p in ports
-        ]
-    return c
-
-
-def wait_tunnel(c, seconds):
-    running = total = 0
-    deadline = time.time() + seconds
-    while True:
-        try:
-            running, total = proxy_counts(api(c, "/api/status"))
-        except (OSError, ValueError, KeyError, http.client.HTTPException):
-            pass
-        if (total and running == total) or time.time() >= deadline:
-            return running, total
-        time.sleep(2)
-
-
-def post_install(side, c, profile):
-    """Non-fatal verification after a successful install; only prints."""
-    unit = paths(side)[2]
-    wd = wd_name(side)
-
-    if side == "frpc":
-        say("Waiting up to 30s for the tunnel to come up ...")
-        running, total = wait_tunnel(c, 30)
-        if total and running == total:
-            say(f"TUNNEL UP: {running}/{total} proxies running.")
+        say("Waiting for the tunnel ...")
+        verdict, text = "fail", "not checked"
+        for _ in range(15):
+            verdict, text = probe(side, c, unit)
+            if verdict == "ok":
+                break
+            time.sleep(2)
+        if verdict == "ok":
+            say(f"TUNNEL UP: {text}")
         else:
-            if total:
-                say(f"WARNING: tunnel is not fully up yet ({running}/{total} proxies running).")
-            else:
-                say("WARNING: tunnel is NOT up: frpc has no connection to frps yet.")
-            pr = PROFILES[profile]
-            # BUG FIX: this used to always say "{PORT}/tcp" even for the kcp profile,
-            # where frpc's control connection is UDP-only and the tcp port is irrelevant
-            # to ITS connectivity - misleading during exactly the troubleshooting moment
-            # precision matters most.
-            control = f"{PORT}/udp (KCP)" if pr["proto"] == "kcp" else f"{PORT}/tcp"
-            say("  Check: frps installed and running on the Iran server; its firewall allows "
-                f"{control}; the same token on both sides; then: journalctl -u {unit} -n 50 --no-pager")
-            if pr["proto"] == "kcp":
-                say(f"  '{profile}' uses UDP: allow {PORT}/udp on the Iran server and its provider firewall, "
-                    f"and install frps with '{profile}' too. If UDP is filtered on this route, use 'gaming' "
-                    "(TCP) on both servers instead.")
-            elif not pr["mux"]:
-                say(f"  '{profile}' turns tcpMux off: frps must ALSO be installed with '{profile}' "
-                    "(a tcpMux mismatch makes the login fail).")
-            else:
-                say("  If frps runs 'gaming' (tcpMux off) or 'gaming-kcp', use that same profile here.")
-    else:
-        kcp = f" and {PORT}/udp (KCP)" if c.get("kcpBindPort") else ""
-        same = f" and the same profile ('{profile}')" if PROFILES[profile]["strict"] else ""
-        say(f"frps is up and listening on {PORT}/tcp{kcp}. Install frpc on the foreign server "
-            f"with the same token{same}.")
-
-    timer = run(["systemctl", "is-active", wd + ".timer"], check=False)
-    code, out = run_rc(["systemctl", "start", wd + ".service"], timeout=90)
-    verdict, msg = probe(side, c)
-    say(f"Watchdog self-test: timer={timer}, service run={'OK' if code == 0 else 'FAILED'}, "
-        f"probe={verdict} ({msg})")
-    if timer != "active" or code != 0:
-        say(f"WARNING: the watchdog is NOT working correctly: {out}")
-        say(f"  See: journalctl -u {wd}.service -n 30 --no-pager")
-
-    if not PROFILES[profile]["mux"]:
-        say(f"NOTE ('{profile}' runs tcpMux off): frp {VERSION} has an open upstream report "
-            "(fatedier/frp PR #5539, not merged/released yet) where a stale control session's "
-            "heartbeat timer can close a healthy, just-reconnected non-mux session on the frps "
-            "side. frpc reconnects by itself within seconds when this happens (loginFailExit is "
-            "off), so in practice it looks like an occasional short blip rather than real downtime, "
-            "and the watchdog only restarts the service if it does NOT recover on its own. Worth "
-            "knowing if you ever see an unexplained brief reconnect on this profile.")
-
-
-def configure(side, preset=None):
-    # All questions are asked BEFORE taking the lock, so an idle prompt can never
-    # pause the watchdog.
-    host = None
-    ports = []
-
-    if side == "frpc":
-        host = ask("Server IP (Iran frps address, IPv4 or hostname)")
-        if not valid_host(host):
-            raise ValueError("Invalid hostname/IP.")
-        if ":" in host:
-            say("WARNING: frps of this manager listens on IPv4 only; an IPv6 address will not connect.")
-
-        ports = parse_ports(
-            ask("Ports to forward, comma-separated (ranges OK, e.g. 80,443,8000-8010)", "8080"),
-            {PORT, 7400, 7500},
-        )
-
-    profile = choose_profile(preset)
-    prof = PROFILES[profile]
-    if prof["strict"]:
-        say(f"NOTE: '{profile}' changes the transport, so the OTHER server must use '{profile}' as well.")
-    c = build_config(side, profile, host, ports)
-
-    locked(lambda: install(side, c, profile))
-    say("No firewall was changed. Allow ONLY required ports in the Iran host/provider firewall.")
-    if side == "frps" and c.get("kcpBindPort"):
-        say(f"KCP needs {PORT}/udp open in the Iran host/provider firewall (in addition to {PORT}/tcp).")
-    if ports:
-        control = f"{PORT}/udp (KCP)" if prof["proto"] == "kcp" else f"{PORT}/tcp"
-        say(f"Control: {control}; forwarded TCP+UDP ports: " + " ".join(map(str, ports)))
-    w = c["webServer"]
-    say(f"Dashboard (loopback only - reach it via an SSH tunnel): "
-        f"http://127.0.0.1:{w['port']}  user={w['user']}  password={w['password']}")
-    say("This password is kept across reinstalls/profile switches now; it only changes if you remove "
-        "this instance and set it up again.")
-    post_install(side, c, profile)
-
-
-# --------------------------------------------------------------------------
-# Watchdog
-# --------------------------------------------------------------------------
-
-def load_state(record):
-    state = {"fails": 0, "last": -1e9, "restarts": 0, "ok_since": None}
+            warn(f"tunnel is NOT up yet: {text}. Check that TCP {PORT}" + (f"/UDP {PORT}" if p["proto"] == "kcp" else "")
+                 + " is open on the IRAN server, the token matches and the IRAN server uses a compatible profile.")
+    wd = wd_name(side)
     try:
-        loaded = json.loads(Path(record).read_text())
-        if isinstance(loaded, dict):
-            state.update({k: loaded[k] for k in state if k in loaded})
+        r = _exec(["systemctl", "start", wd + ".service"], 90)
+        selftest = "self-test OK" if r.returncode == 0 else f"self-test FAILED: {(r.stderr or r.stdout).strip()}"
+    except subprocess.TimeoutExpired:
+        selftest = "self-test timed out"
+    say(f"Watchdog: {selftest} | timer {run(['systemctl', 'is-active', wd + '.timer'], check=False)}")
+    keys = [n for n, q in PROFILES.items() if transport_key(q) == transport_key(p)]
+    say(f"The OTHER server must use the same transport ({p['proto']}, {'mux' if p['mux'] else 'no mux'}): profiles {', '.join(keys)}.")
+
+
+# --------------------------------------------------------------------------------------------- watchdog
+def watchdog(side):
+    """One probe per minute (systemd timer). Restarts only after `strikes` consecutive failures, never
+    faster than the exponential backoff, never when the fault is the other server / the path."""
+    cfg, _, unit = paths(side)
+    if not cfg.is_file():
+        return
+    c = read_config(cfg)
+    strikes_needed = PROFILES[load_profile(side)]["strikes"]
+    RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    spath = RUNTIME / f"{side}-{PORT}.json"
+    state = {"fails": 0, "restarts": 0, "last": -1e9, "ok_since": None}
+    try:
+        state.update(json.loads(spath.read_text()))
     except (OSError, ValueError):
         pass
-    return state
-
-
-def probe(side, c):
-    """One health probe -> (verdict, message).
-
-    ok    healthy
-    fail  unhealthy and a restart may help (counts as a strike)
-    wait  unhealthy but a restart cannot help (peer/network down); never counted
-    skip  config/API problem on our side; never restart because of it
-    """
-    unit = paths(side)[2]
-    try:
-        api(c, "/healthz")
-        if side == "frps":
-            port = int(c["bindPort"])
-            try:
-                pid = int(run(["systemctl", "show", "-p", "MainPID", "--value", unit],
-                              check=False) or 0)
-            except ValueError:
-                pid = 0
-            listeners = run(["ss", "-H", "-ltnp", f"sport = :{port}"], check=False)
-            if not listeners:
-                return "fail", f"nothing is listening on {port}/tcp"
-            if pid > 0 and "pid=" in listeners and f"pid={pid}," not in listeners:
-                return "fail", f"{port}/tcp is held by a process other than the service"
-            return "ok", f"API healthy, listening on {port}/tcp"
-
-        running, total = proxy_counts(api(c, "/api/status"))
-    except (urllib.error.HTTPError, ssl.SSLError, ValueError, KeyError) as error:
-        return "skip", f"admin API/config error ({type(error).__name__}); not restarting"
-    except (OSError, http.client.HTTPException) as error:
-        return "fail", f"admin API not responding ({type(error).__name__})"
-
-    if running > 0:
-        return "ok", f"{running}/{total} proxies running"
-
-    expected = len(c.get("proxies") or [])
-    if total == 0 and expected == 0:
-        return "ok", "no proxies configured"
-
-    # Nothing is running. NOTE: while frpc has no connection to frps, its API
-    # returns an EMPTY list (total == 0), not "stopped" proxies - so total == 0
-    # with proxies configured means "tunnel down", exactly like 0/N running.
-    # Is the server even reachable from here?
-    seen = f"0/{total or expected} proxies running"
-    try:
-        socket.create_connection((c["serverAddr"], int(c["serverPort"])), timeout=5).close()
-    except OSError as error:
-        return "wait", (f"{seen} and the server is unreachable ({type(error).__name__}); "
-                        "frpc keeps retrying by itself, a restart would not help")
-    return "fail", f"{seen} although the server port is reachable"
-
-
-def watchdog(side):
-    path = existing(side)
-    if not path:
-        return
-
-    unit = paths(side)[2]
-    c = read_config(path)
-    strikes_needed = PROFILES[load_profile(side)]["strikes"]
-
-    record = RUNTIME / f"{side}-{PORT}.json"
-    state = load_state(record)
     now = MONO()
-    if state["last"] > now:  # stale record from before a reboot
-        state["last"] = -1e9
-    state["fails"] = int(state["fails"])
-    state["restarts"] = int(state["restarts"])
+    if state["last"] > now:                                   # stale record from before a reboot
+        state.update(fails=0, restarts=0, last=-1e9, ok_since=None)
 
     def save():
-        atomic(record, json.dumps(state))
+        atomic(spath, json.dumps(state))
 
     def restart(reason, reset_failed=False):
-        # 1st automatic restart: immediate; 2nd: >=10 min later; 3rd: >=20 min; ... capped
         wait = min(WD_BACKOFF * 2 ** min(max(state["restarts"] - 1, 0), 10), WD_BACKOFF_MAX)
         since = now - state["last"]
         if since < wait:
-            say(f"watchdog: {unit}: {reason}; restart suppressed, backoff {int(wait - since)}s left")
+            say(f"watchdog: {reason}; restart suppressed by backoff ({int(wait - since)}s left)")
             return
-        state["last"] = now
-        state["restarts"] += 1
-        state["fails"] = 0
-        state["ok_since"] = None
-        save()  # persist first, so a failing restart can never turn into a retry loop
-        say(f"watchdog: restarting {unit}: {reason} (automatic restart #{state['restarts']})")
+        say(f"watchdog: {reason}; restarting {unit}")
+        state.update(restarts=state["restarts"] + 1, last=now, fails=0, ok_since=None)
+        save()
         if reset_failed:
             run(["systemctl", "reset-failed", unit], check=False)
-        run(["systemctl", "restart", unit])
+        run(["systemctl", "restart", unit], timeout=60)
 
     active = run(["systemctl", "is-active", unit], check=False)
-
-    if active == "failed":  # crashed and hit the start limit: systemd gave up
+    if active == "failed":
         restart("unit is in the failed state", reset_failed=True)
         save()
         return
-
     if active != "active":
-        # "inactive" = stopped on purpose (leave it alone); "activating" /
-        # "deactivating" = systemd is already handling it.
-        state["fails"] = 0
-        save()
+        say(f"watchdog: {unit} is {active or 'unknown'}; leaving it alone")
         return
-
-    entered = int(
-        run(["systemctl", "show", "-p", "ActiveEnterTimestampMonotonic", "--value", unit],
-            check=False) or 0
-    ) / 1e6
+    raw = run(["systemctl", "show", "-p", "ActiveEnterTimestampMonotonic", "--value", unit], check=False)
+    entered = int(raw) / 1e6 if raw.isdigit() else 0
     if entered and now - entered < WD_GRACE:
         return
-
-    verdict, msg = probe(side, c)
-
+    verdict, text = probe(side, c, unit)
     if verdict == "ok":
-        if state["fails"] or state["restarts"]:
-            say(f"watchdog: {unit}: healthy again ({msg})")
         state["fails"] = 0
         if state["ok_since"] is None:
             state["ok_since"] = now
         elif state["restarts"] and now - state["ok_since"] >= WD_HEALTHY_RESET:
             state["restarts"] = 0
-    elif verdict == "fail":
+    elif verdict in ("wait", "skip"):
+        state.update(fails=0, ok_since=None)
+        say(f"watchdog: {text}")
+    else:
         state["ok_since"] = None
         state["fails"] += 1
-        say(f"watchdog: {unit}: strike {state['fails']}/{strikes_needed}: {msg}")
+        say(f"watchdog: probe failed ({state['fails']}/{strikes_needed}): {text}")
         if state["fails"] >= strikes_needed:
-            restart(msg)
-    else:  # wait / skip
-        state["ok_since"] = None
-        state["fails"] = 0
-        say(f"watchdog: {unit}: {msg}")
-
+            restart(text)
     save()
 
 
-# --------------------------------------------------------------------------
-# Status / removal
-# --------------------------------------------------------------------------
-
-def transport_summary(c, side):
-    t = c.get("transport", {})
-    if side == "frpc":
-        proto = t.get("protocol", "tcp")
-    else:
-        proto = "tcp+kcp" if c.get("kcpBindPort") else "tcp"
-    return f"{proto}, tcpMux {'on' if t.get('tcpMux', True) else 'off'}"
-
-
-def status():
-    found = False
-    for side in ("frps", "frpc"):
-        path = existing(side)
-        if not path:
-            continue
-        found = True
-        c = read_config(path)
-        unit = paths(side)[2]
-        profile = load_profile(side)
-        say(f"\n{unit}  [profile: {profile}; transport: {transport_summary(c, side)}]")
-        say(run(["systemctl", "status", "--no-pager", "--lines=5", unit], check=False))
-        try:
-            data = api(
-                c,
-                "/api/serverinfo" if side == "frps" else "/api/status",
-            )
-            if side == "frpc":
-                running, total = proxy_counts(data)
-                if total == 0:
-                    say("Tunnel is DOWN: frpc has no active connection to frps (it keeps retrying by itself)")
-                else:
-                    say(f"Registered running proxies: {running}/{total} (not a backend reachability test)")
-                rows = [p for g in data.values() if isinstance(g, list)
-                        for p in g if isinstance(p, dict)]
-                bad = [p for p in rows if p.get("status") != "running"]
-                for p in bad[:20]:
-                    say(f"  {p.get('name', '?')}: {p.get('status', '?')} {p.get('err', '')}")
-                if len(bad) > 20:
-                    say(f"  ... and {len(bad) - 20} more not running")
-            else:
-                say(f"Server API reachable; connected clients: {data.get('clientCounts', 'unknown')}")
-        except (OSError, ValueError, KeyError, http.client.HTTPException) as error:
-            say(f"Admin API unavailable: {type(error).__name__}")
-
-        if side == "frpc":
-            try:
-                with socket.create_connection((c["serverAddr"], c["serverPort"]), timeout=5):
-                    say("Tunnel to Iran server: control port TCP connect OK")
-            except OSError as error:
-                say(f"Tunnel to Iran server: control TCP connect FAILED ({error})")
-
-            proxies = [p for p in c.get("proxies", []) if p.get("type") == "tcp" and "localPort" in p]
-            ok = 0
-            for p in proxies[:20]:
-                try:
-                    with socket.create_connection(
-                        (p.get("localIP", "127.0.0.1"), p["localPort"]), timeout=2
-                    ):
-                        ok += 1
-                except OSError:
-                    say(f"  Backend {p['name']}: TCP FAILED")
-            if proxies:
-                say(f"Backends reachable: {ok}/{min(len(proxies), 20)}"
-                    + (" (first 20 checked)" if len(proxies) > 20 else ""))
-
-        timer = run(["systemctl", "is-active", wd_name(side) + ".timer"], check=False)
-        st = load_state(RUNTIME / f"{side}-{PORT}.json")
-        say(f"Watchdog: timer {timer}; strikes {st['fails']}/{PROFILES[profile]['strikes']}; "
-            f"automatic restarts so far: {st['restarts']}")
-
-    if not found:
-        say("Nothing is installed yet.")
-
-
-def remove():
-    side = ask("Remove which instance: frps or frpc")
-    if side not in ("frps", "frpc") or not existing(side):
-        raise ValueError("No such managed configuration.")
-
-    cfg, unitfile, unit = paths(side)
-
-    if not yes(f"Stop and remove ONLY {unit}? Backups and shared binaries will remain"):
-        return
-
-    def do_remove():
-        wd = wd_name(side)
-        files = [
-            cfg,
-            cfg.with_suffix(".toml"),
-            unitfile,
-            unitfile.parent / (wd + ".timer"),
-            unitfile.parent / (wd + ".service"),
-            profile_file(side),
-        ]
-        backup = ROOT / "backups" / f"removed-{side}-{time.time_ns()}"
-        snapshot(files, backup)
-
-        run(["systemctl", "disable", "--now", wd + ".timer"], check=False)
-        run(["systemctl", "stop", wd + ".service"], check=False)
-        run(["systemctl", "disable", "--now", unit], check=False)
-        for path in files:
-            path.unlink(missing_ok=True)
-        (RUNTIME / f"{side}-{PORT}.json").unlink(missing_ok=True)
-        run(["systemctl", "daemon-reload"], check=False)
-
-        say(f"Instance removed; backup: {backup}")
-        say("Shared binaries/templates and journal were retained.")
-
-    locked(do_remove)
-
-
-def uninstall_all():
-    if not yes("Are you sure you want to COMPLETELY UNINSTALL FRP and all components?"):
-        return False
-
-    def do_uninstall():
-        say("Stopping and removing services...")
-        for side in ("frps", "frpc"):
-            _, unitfile, unit = paths(side)
-            wd = wd_name(side)
-            for target in (wd + ".timer", wd + ".service", unit,
-                           f"frp-watchdog@{side}.timer", f"frp-watchdog@{side}.service"):
-                run(["systemctl", "disable", "--now", target], check=False)
-                run(["systemctl", "stop", target], check=False)
-            (unitfile.parent / (wd + ".timer")).unlink(missing_ok=True)
-            (unitfile.parent / (wd + ".service")).unlink(missing_ok=True)
-            unitfile.unlink(missing_ok=True)
-
-        run(["systemctl", "daemon-reload"], check=False)
-
-        say("Removing binaries, configurations, and state...")
-        Path("/usr/local/bin/frps").unlink(missing_ok=True)
-        Path("/usr/local/bin/frpc").unlink(missing_ok=True)
-        Path("/usr/local/bin/frp-watchdog.sh").unlink(missing_ok=True)
-        SELF.unlink(missing_ok=True)
-
-        shutil.rmtree(ROOT, ignore_errors=True)
-        shutil.rmtree(STATE, ignore_errors=True)
-        shutil.rmtree(RUNTIME, ignore_errors=True)
-
-        say("FRP and all related components have been successfully uninstalled.")
-
-    locked(do_uninstall)
-    return True
-
-
-def locked(action, nonblocking=False):
-    RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
+def locked(fn, nonblocking=False):
+    RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
     with open(RUNTIME / "manager.lock", "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             if nonblocking:
-                return
-            raise RuntimeError("Another FRP manager action is running.")
-        return action()
+                return None
+            raise RuntimeError("another manager operation is running; try again in a minute")
+        return fn()
+
+
+# --------------------------------------------------------------------------------------------- menu actions
+def installed_sides():
+    return [s for s in ("frps", "frpc") if existing(s)]
+
+
+def pick_side(prompt):
+    sides = installed_sides()
+    if not sides:
+        raise ValueError("nothing is installed yet")
+    if len(sides) == 1:
+        return sides[0]
+    side = ask(f"{prompt} (frps or frpc)")
+    if side not in sides:
+        raise ValueError("no such instance")
+    return side
+
+
+def status():
+    sides = installed_sides()
+    if not sides:
+        say("Nothing is installed yet.")
+    for side in sides:
+        cfg, _, unit = paths(side)
+        name = load_profile(side)
+        p = PROFILES[name]
+        wd = wd_name(side)
+        say(f"--- {side} | profile {name} | {unit} ---")
+        say(f"unit {run(['systemctl', 'is-active', unit], check=False)}/{run(['systemctl', 'is-enabled', unit], check=False)}"
+            f" | watchdog timer {run(['systemctl', 'is-active', wd + '.timer'], check=False)}"
+            f" | transport {p['proto']}, {'mux' if p['mux'] else 'no mux'}")
+        try:
+            c = read_config(cfg)
+        except (OSError, ValueError) as e:
+            say(f"config unreadable: {e}")
+            continue
+        verdict, text = probe(side, c, unit)
+        say(f"health: {verdict} - {text}")
+        if side == "frpc":
+            if c.get("transport", {}).get("protocol", "tcp") != "kcp":
+                try:
+                    socket.create_connection((c["serverAddr"], int(c["serverPort"])), timeout=5).close()
+                    say(f"control port {c['serverAddr']}:{c['serverPort']} reachable")
+                except OSError as e:
+                    say(f"control port {c['serverAddr']}:{c['serverPort']} NOT reachable: {e}")
+            tcp_ports = [x["localPort"] for x in c.get("proxies", []) if x.get("type") == "tcp"][:20]
+            okc = 0
+            for port in tcp_ports:
+                try:
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                    okc += 1
+                except OSError:
+                    pass
+            say(f"local backends answering: {okc}/{len(tcp_ports)}" + (" (first 20)" if len(tcp_ports) == 20 else ""))
+        else:
+            try:
+                info = api(c, "/api/serverinfo")
+                say(f"clients {info.get('clientCounts')} | current connections {info.get('curConns')}")
+            except (OSError, ValueError, http.client.HTTPException) as e:
+                say(f"serverinfo unavailable: {e}")
+        say(f"dashboard http://127.0.0.1:{c['webServer']['port']}  user {c['webServer']['user']}  password {c['webServer']['password']}")
+
+
+def logs():
+    side = pick_side("Logs of which instance")
+    unit = paths(side)[2]
+    say(f"journalctl -u {unit} -f   (Ctrl-C returns to the menu)")
+    subprocess.run(["journalctl", "-u", unit, "-f", "-n", "50", "--no-pager"], check=False)
+
+
+def remove():
+    side = pick_side("Remove which instance")
+    if not yes(f"Remove the {side} instance on port {PORT}?"):
+        say("Cancelled.")
+        return
+
+    def go():
+        cfg, unitfile, unit = paths(side)
+        wd = wd_name(side)
+        files = [cfg, cfg.with_suffix(".toml"), unitfile, UNITDIR / f"{wd}.service", UNITDIR / f"{wd}.timer", profile_file(side)]
+        backup = ROOT / "backups" / f"removed-{side}-{time.time_ns()}"
+        snapshot(files, backup)
+        for u in (wd + ".timer", wd + ".service", unit):
+            run(["systemctl", "disable", "--now", u], check=False)
+        for f in files:
+            f.unlink(missing_ok=True)
+        run(["systemctl", "daemon-reload"], check=False)
+        run(["systemctl", "reset-failed"], check=False)
+        (RUNTIME / f"{side}-{PORT}.json").unlink(missing_ok=True)
+        prune_backups(side)
+        say(f"Removed. Backup of the old files: {backup} (frp binaries and the manager copy are kept).")
+    locked(go)
+
+
+def uninstall_all():
+    say("This removes EVERY frps/frpc instance of this manager (all ports), the frp binaries, "
+        f"{ROOT} (configs AND backups), {STATE} and the manager copy.")
+    if input("Type UNINSTALL to continue: ").strip() != "UNINSTALL":
+        say("Cancelled.")
+        return
+
+    def go():
+        names = set()
+        for pat in ("frps@server-*.service", "frpc@client-*.service", "frp-v5-watchdog-*.service",
+                    "frp-v5-watchdog-*.timer", "frp-watchdog@*.service", "frp-watchdog@*.timer"):
+            names.update(x.name for x in UNITDIR.glob(pat))
+        ordered = sorted(names, key=lambda n: (not n.endswith(".timer"), n))     # timers first
+        for n in ordered:
+            run(["systemctl", "disable", "--now", n], check=False)
+        for n in ordered:
+            (UNITDIR / n).unlink(missing_ok=True)
+        run(["systemctl", "daemon-reload"], check=False)
+        run(["systemctl", "reset-failed"], check=False)
+        for exe in ("frps", "frpc"):
+            (BINDIR / exe).unlink(missing_ok=True)
+        for d in (ROOT, STATE):
+            shutil.rmtree(d, ignore_errors=True)
+        for f in RUNTIME.glob("*.json"):
+            f.unlink(missing_ok=True)
+        SELF.unlink(missing_ok=True)
+        say(f"Everything removed ({len(ordered)} unit files).")
+    locked(go)
+
+
+def choose_profile(preset=None):
+    if preset:
+        return preset
+    names = list(PROFILES)
+    say("Profiles:")
+    for i, n in enumerate(names, 1):
+        say(f"  {i}) {n:12s} {PROFILES[n]['desc']}")
+    while True:
+        pick = ask("Profile (number or name)", str(names.index(DEFAULT_PROFILE) + 1))
+        if pick in PROFILES:
+            return pick
+        if pick.isdigit() and 1 <= int(pick) <= len(names):
+            return names[int(pick) - 1]
+        say("Invalid choice.")
+
+
+def configure(side, preset=None, tarball=None, wire=None):
+    host, ports = None, []
+    if side == "frpc":
+        host = ask("IRAN server IP or hostname")
+        if not valid_host(host):
+            raise ValueError("that is not a valid IP address or hostname")
+        if ":" in host:
+            warn("the frps of this manager listens on IPv4 only (0.0.0.0)")
+        ports = parse_ports(ask("Ports to forward, TCP+UDP (e.g. 80,443,2000-2010)", "8080"),
+                            {PORT, DASH["frps"], DASH["frpc"]})
+    name = choose_profile(preset)
+    token, source = resolve_token(side)
+    say(f"Token: {source}")
+    if token == DEFAULT_TOKEN:
+        warn("the default token is public knowledge - anyone could register ports on your IRAN server. Use --token.")
+    c = build_config(side, name, token, host, ports, wire)
+    locked(lambda: install(side, c, name, tarball))
+    post_install(side, c, name)
 
 
 def main():
-    global PORT, TOKEN
-    parser = argparse.ArgumentParser(description="FRP v5.2 safe local manager")
-    parser.add_argument("--port", type=int, default=2087)
-    parser.add_argument("--watchdog", choices=["frps", "frpc"])
-    parser.add_argument("--profile", choices=list(PROFILES),
-                        help="skip the profile question when installing")
-    parser.add_argument("--token", default=DEFAULT_TOKEN,
-                        help="auth token; must be identical on both servers (default: 123)")
-    args = parser.parse_args()
+    global PORT, TOKEN_ARG
+    ap = argparse.ArgumentParser(prog="frp-manager", description="FRP v5.3 safe local manager")
+    ap.add_argument("--port", type=int, default=PORT, help="control port, same on both servers (default 2087)")
+    ap.add_argument("--token", help="auth token (default: keep the existing one, else the public default)")
+    ap.add_argument("--profile", choices=list(PROFILES), help="skip the profile menu")
+    ap.add_argument("--wire", choices=("v1", "v2"), help="override the profile's frp wire protocol")
+    ap.add_argument("--tarball", metavar="FILE", help="use a local frp tarball (checked against the pinned SHA-256)")
+    ap.add_argument("--watchdog", choices=("frps", "frpc"), help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    validate_profiles()
     PORT = args.port
-    TOKEN = args.token
-
-    if not 1 <= PORT <= 65535 or PORT in (7400, 7500):
-        raise ValueError("Invalid/conflicting FRP control port.")
-
-    if not re.fullmatch(r"[A-Za-z0-9._~+=-]{3,128}", TOKEN):
-        raise ValueError("Token must be 3-128 characters from A-Z a-z 0-9 . _ ~ + = -")
-
+    if not 1 <= PORT <= 65535 or PORT in DASH.values():
+        raise SystemExit(f"ERROR: --port must be 1-65535 and not {DASH['frpc']}/{DASH['frps']} (dashboards)")
+    if args.token is not None and not re.fullmatch(r"[A-Za-z0-9._~+=-]{1,128}", args.token):
+        raise SystemExit("ERROR: --token may only contain letters, digits and . _ ~ + = - (max 128)")
+    TOKEN_ARG = args.token
     if os.geteuid() != 0:
-        raise ValueError("Run as root.")
-
+        raise SystemExit("ERROR: run as root: sudo bash frp-manager.sh")
     os.umask(0o077)
-    for command in ("systemctl", "ss"):
-        if not shutil.which(command):
-            raise ValueError(f"Missing required command: {command}")
-
-    if not Path("/run/systemd/system").is_dir():
-        raise ValueError("A running systemd Linux host is required.")
-
+    for tool in ("systemctl", "ss"):
+        if not shutil.which(tool):
+            raise SystemExit(f"ERROR: {tool} is required")
     if args.watchdog:
         locked(lambda: watchdog(args.watchdog), nonblocking=True)
         return
-
     if not sys.stdin.isatty():
-        sys.stdin = open("/dev/tty")
-
-    say(f"FRP manager v5.2 / FRP {VERSION} / control port {PORT}")
-    if TOKEN == DEFAULT_TOKEN:
-        say("WARNING: default token '123' is public knowledge. Anyone who can reach the control port")
-        say("         can register ports on the Iran server. Use --token <secret> on BOTH servers.")
-    else:
-        say("Custom token in use (must be identical on both servers).")
-
-    actions = {
-        "1": lambda: configure("frps", args.profile),
-        "2": lambda: configure("frpc", args.profile),
-        "3": status,
-        "5": remove,
-    }
-
+        try:
+            sys.stdin = open("/dev/tty")
+        except OSError:
+            raise SystemExit("ERROR: this manager is interactive and needs a terminal (use 'ssh -t' or a real shell)")
     while True:
-        say("\n1) Install IRAN frps\n2) Install OUTSIDE frpc\n3) Status\n4) Live logs")
-        say("5) Remove one instance\n6) Exit\n7) Complete Uninstall")
+        say()
+        say(f"=== FRP v5.3 manager | frp {VERSION} | control port {PORT} ===")
+        say(" 1) Install IRAN server (frps)      2) Install OUTSIDE server (frpc)")
+        say(" 3) Status                          4) Live logs")
+        say(" 5) Remove one instance             6) Exit")
+        say(" 7) Complete uninstall")
+        choice = ""
         try:
             choice = ask("Select", "6")
-        except (KeyboardInterrupt, EOFError):
-            say("")
-            return
-        if choice == "6":
-            return
-
-        try:
-            if choice == "7":
-                if uninstall_all():
-                    return
+            if choice == "1":
+                configure("frps", args.profile, args.tarball, args.wire)
+            elif choice == "2":
+                configure("frpc", args.profile, args.tarball, args.wire)
+            elif choice == "3":
+                status()
             elif choice == "4":
-                side = ask("frps or frpc", "frpc")
-                if side not in ("frps", "frpc"):
-                    raise ValueError("Invalid side.")
-                subprocess.run(
-                    ["journalctl", "-u", paths(side)[2], "-f", "--no-pager"],
-                    check=False,
-                )
-            elif choice in actions:
-                actions[choice]()
+                logs()
+            elif choice == "5":
+                remove()
+            elif choice == "7":
+                uninstall_all()
+            elif choice == "6":
+                return
             else:
-                say("Invalid menu option.")
-        except KeyboardInterrupt:
-            say("Cancelled.")
-        except Exception as error:
-            say(f"ERROR: {error}")
+                say("Invalid choice.")
+        except (KeyboardInterrupt, EOFError):
+            say("\nCancelled.")
+            if choice in ("", "6"):
+                return
+        except Exception as e:                                # keep the menu alive
+            print(f"ERROR: {e}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        say("Cancelled.")
         sys.exit(130)
-    except Exception as error:
-        say(f"ERROR: {error}")
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
 PYTHON
