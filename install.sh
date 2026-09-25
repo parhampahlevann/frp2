@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FRP v5.3: safe local manager for FRP 0.71.0.
+# FRP v5.3: safe local manager for FRP 0.58.0.
 # Requirements: Python >= 3.8, systemd Linux.
 set -Eeuo pipefail
 
@@ -52,7 +52,7 @@ try:
 except ImportError:
     tomllib = None
 
-VERSION = "0.71.0"
+VERSION = "0.58.0"
 PORT = 2087
 DEFAULT_TOKEN = "123"
 TOKEN = DEFAULT_TOKEN
@@ -128,6 +128,37 @@ PROFILES = {
         proto="tcp", mux=True, strict=False,
         mux_ka=30, tcp_ka=30, hb_iv=30, hb_to_c=120, hb_to_s=240,
         dial_to=20, pool=32, user_to=30, strikes=5,
+    ),
+    # For a lossy/high-latency path: every timer here is deliberately loose so a
+    # single slow beat or a brief blackout is absorbed instead of read as a failure.
+    # strikes=8 (vs 5 for "balanced") means the watchdog waits ~8 straight unhealthy
+    # checks (~8 min, checks run every 60s) before it restarts anything - a restart
+    # on a link that is merely slow just adds a second outage on top of the first.
+    "stable": dict(
+        desc="for lossy/unstable links: patient timeouts, watchdog won't restart on brief blips",
+        proto="tcp", mux=True, strict=False,
+        mux_ka=25, tcp_ka=45, hb_iv=20, hb_to_c=80, hb_to_s=180,
+        dial_to=25, pool=12, user_to=45, strikes=8,
+    ),
+    # The mirror image of "stable": every timer is as tight as "gaming"'s, but mux
+    # stays ON (unlike "gaming") since this is for ordinary mixed traffic, not game
+    # ports that need a dedicated connection per flow. Reacts fast; assumes a link
+    # that is clean enough that a fast timer won't misfire on normal jitter.
+    "fast": dict(
+        desc="low-latency general traffic: quick failure detection, fast reconnects, mux stays on",
+        proto="tcp", mux=True, strict=False,
+        mux_ka=8, tcp_ka=15, hb_iv=5, hb_to_c=15, hb_to_s=45,
+        dial_to=8, pool=10, user_to=12, strikes=3,
+    ),
+    # General-purpose KCP - unlike "gaming-kcp" this is NOT restricted to game ports:
+    # timeouts sit between "balanced" and "gaming-kcp" so ordinary KCP retransmission
+    # delay under bulk/streaming traffic isn't mistaken by the watchdog for a failure.
+    # Same proto as "gaming-kcp", so it is just as strict: install it on BOTH servers.
+    "kcp": dict(
+        desc="general UDP/KCP transport, not game-only: worth trying if TCP is throttled on the path [BOTH servers]",
+        proto="kcp", mux=True, strict=True,
+        mux_ka=20, tcp_ka=30, hb_iv=15, hb_to_c=60, hb_to_s=120,
+        dial_to=15, pool=16, user_to=30, strikes=5,
     ),
 }
 DEFAULT_PROFILE = "balanced"
