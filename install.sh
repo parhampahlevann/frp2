@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
-# FRP v5.3: safe local manager for FRP 0.58.0.
+# FRP v5.4: safe local manager for FRP 0.58.0.
 # Requirements: Python >= 3.8, systemd Linux.
+#
+# v5.4 changes (on top of v5.3):
+#   * install(): frpc is now considered "ready" once the service has stayed up for
+#     8 s, instead of requiring its admin API (/healthz) to answer. frpc only opens
+#     that API after a successful login, so a frps that is down / on another profile
+#     used to make the installer roll back a perfectly running service.
+#     The real tunnel state is still reported (non-fatally) by post_install().
+#   * probe(): when frpc's admin API is not answering, the watchdog first checks
+#     whether frps is reachable. If it is not, the verdict is "wait" (no strike,
+#     no pointless restart) instead of "fail".
 set -Eeuo pipefail
 
 FRP_SOURCE="${BASH_SOURCE[0]:-$0}"
@@ -169,6 +179,10 @@ WD_BACKOFF = 600          # min seconds between watchdog restarts; doubles after
 WD_BACKOFF_MAX = 6 * 3600
 WD_HEALTHY_RESET = 1800   # continuous health needed before the backoff counter resets
 MONO = time.monotonic     # same clock as systemd's *Monotonic timestamps (works in containers too)
+
+# frpc install-time readiness: it opens its admin API only after a successful login,
+# so "the service stayed up this long" is the install-time success criterion.
+FRPC_STABLE_SECONDS = 8
 
 ROOT = Path("/root/frp")
 STATE = Path("/etc/frp-manager")
@@ -463,6 +477,20 @@ def proxy_counts(status):
     )
 
 
+def server_unreachable(c):
+    """None if frps' TCP control port accepts a connection, else the OSError.
+
+    frps always keeps its plain TCP bindPort open (even under a kcp profile), so
+    this is a valid "is the server host/port reachable from here" test for every
+    profile.
+    """
+    try:
+        socket.create_connection((c["serverAddr"], int(c["serverPort"])), timeout=5).close()
+    except OSError as error:
+        return error
+    return None
+
+
 def check_free(port, udp=False):
     listeners = run(
         ["ss", "-H", "-lunp" if udp else "-ltnp", f"sport = :{int(port)}"]
@@ -721,17 +749,35 @@ WantedBy=timers.target
             run(["systemctl", "enable", unit, wd + ".timer"])
             run(["systemctl", "restart", unit])
 
+            # Readiness check.
+            #  frps: its admin API answers right after start-up -> /healthz must pass.
+            #  frpc: its admin API only comes up after the FIRST SUCCESSFUL LOGIN to
+            #        frps. If frps is down / unreachable / on another profile, frpc
+            #        keeps retrying and /healthz never answers, even though the
+            #        service itself is perfectly fine. Rolling back there would
+            #        undo a correct install, so for frpc "the service stayed up for
+            #        FRPC_STABLE_SECONDS in a row" counts as ready; the real tunnel
+            #        state is reported (non-fatally) by post_install() afterwards.
             ready = False
+            stable_since = None
             for _ in range(15):
                 time.sleep(1)
                 active = run(["systemctl", "is-active", unit], check=False)
-                if active == "active":
-                    try:
-                        api(c, "/healthz", timeout=1)
+                if active != "active":
+                    stable_since = None  # restarting/crashing -> not stable
+                    continue
+                try:
+                    api(c, "/healthz", timeout=1)
+                    ready = True
+                    break
+                except (OSError, ValueError, http.client.HTTPException):
+                    pass
+                if side == "frpc":
+                    if stable_since is None:
+                        stable_since = time.time()
+                    if time.time() - stable_since >= FRPC_STABLE_SECONDS:
                         ready = True
                         break
-                    except (OSError, ValueError, http.client.HTTPException):
-                        pass
 
             if not ready:
                 raise RuntimeError(
@@ -846,6 +892,9 @@ def post_install(side, c, profile):
                     "(a tcpMux mismatch makes the login fail).")
             else:
                 say("  If frps runs 'gaming' (tcpMux off) or 'gaming-kcp', use that same profile here.")
+            say("  A bare 'connect to server error: EOF' in the frpc log almost always means the "
+                "frps side closed the connection right after connecting: compare the profile on both "
+                f"servers (cat {profile_file('frps')} on the Iran server) and read the frps journal.")
     else:
         kcp = f" and {PORT}/udp (KCP)" if c.get("kcpBindPort") else ""
         same = f" and the same profile ('{profile}')" if PROFILES[profile]["strict"] else ""
@@ -958,6 +1007,15 @@ def probe(side, c):
     except (urllib.error.HTTPError, ssl.SSLError, ValueError, KeyError) as error:
         return "skip", f"admin API/config error ({type(error).__name__}); not restarting"
     except (OSError, http.client.HTTPException) as error:
+        if side == "frpc":
+            # (v5.4) frpc only opens its admin API after a successful login to frps,
+            # so "API not answering" usually just means "not logged in". If the
+            # server is not even reachable, a restart cannot help -> do not strike.
+            unreachable = server_unreachable(c)
+            if unreachable is not None:
+                return "wait", (f"admin API not responding and the server is unreachable "
+                                f"({type(unreachable).__name__}); frpc keeps retrying by itself, "
+                                "a restart would not help")
         return "fail", f"admin API not responding ({type(error).__name__})"
 
     if running > 0:
@@ -972,10 +1030,9 @@ def probe(side, c):
     # with proxies configured means "tunnel down", exactly like 0/N running.
     # Is the server even reachable from here?
     seen = f"0/{total or expected} proxies running"
-    try:
-        socket.create_connection((c["serverAddr"], int(c["serverPort"])), timeout=5).close()
-    except OSError as error:
-        return "wait", (f"{seen} and the server is unreachable ({type(error).__name__}); "
+    unreachable = server_unreachable(c)
+    if unreachable is not None:
+        return "wait", (f"{seen} and the server is unreachable ({type(unreachable).__name__}); "
                         "frpc keeps retrying by itself, a restart would not help")
     return "fail", f"{seen} although the server port is reachable"
 
@@ -1118,7 +1175,11 @@ def status():
             else:
                 say(f"Server API reachable; connected clients: {data.get('clientCounts', 'unknown')}")
         except (OSError, ValueError, KeyError, http.client.HTTPException) as error:
-            say(f"Admin API unavailable: {type(error).__name__}")
+            if side == "frpc":
+                say(f"Admin API unavailable ({type(error).__name__}): frpc opens it only after a "
+                    "successful login to frps, so this normally means the tunnel is not up yet.")
+            else:
+                say(f"Admin API unavailable: {type(error).__name__}")
 
         if side == "frpc":
             try:
@@ -1236,7 +1297,7 @@ def locked(action, nonblocking=False):
 
 def main():
     global PORT, TOKEN
-    parser = argparse.ArgumentParser(description="FRP v5.3 safe local manager")
+    parser = argparse.ArgumentParser(description="FRP v5.4 safe local manager")
     parser.add_argument("--port", type=int, default=2087)
     parser.add_argument("--watchdog", choices=["frps", "frpc"])
     parser.add_argument("--profile", choices=list(PROFILES),
@@ -1271,7 +1332,7 @@ def main():
     if not sys.stdin.isatty():
         sys.stdin = open("/dev/tty")
 
-    say(f"FRP manager v5.3 / FRP {VERSION} / control port {PORT}")
+    say(f"FRP manager v5.4 / FRP {VERSION} / control port {PORT}")
     if TOKEN == DEFAULT_TOKEN:
         say("WARNING: default token '123' is public knowledge. Anyone who can reach the control port")
         say("         can register ports on the Iran server. Use --token <secret> on BOTH servers.")
